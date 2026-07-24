@@ -1,6 +1,6 @@
 {
   "name": "@recursiveintell/agent-graph-mcp",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "MCP server for graph-orchestrated LLM workflows — 25 typed tools, daemon/proxy architecture, checkpoint/resume, HITL approvals, and HMAC receipts.",
   "bin": {
     "agent-graph-mcp": "bin/agent-graph-mcp.js"

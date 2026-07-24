@@ -15,7 +15,7 @@ const fs = require("fs");
 
 const PLATFORM = os.platform();
 const ARCH = os.arch();
-const VERSION = "1.0.1";
+const VERSION = "1.0.2";
 
 const binaryName = "agent-graph-mcp";
 const binDir = path.join(__dirname, "..", ".bin-cache");
