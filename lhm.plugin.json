@@ -1,6 +1,6 @@
 {
   "description": "MCP server for graph-orchestrated LLM workflows — 25 typed tools, daemon/proxy architecture, checkpoint/resume, human-in-the-loop approvals, HMAC-authenticated execution receipts, and SQLite-backed durable persistence. Compile declarative workflow specs to the ri-agent-graph runtime engine. Supports parallel fan-out with JoinSet-backed concurrency, conditional routing, 5 join modes, state transforms, subgraph composition, and 5 built-in templates (council_deliberation, parallel_council, plan_critique_refine, analysis_pipeline, classifier_router). Ships as a daemon (agent-graph-mcpd) with file-lock ownership and crash recovery, plus a stateless stdin/stdout proxy that bridges MCP clients to the daemon over a Unix socket. All integrity-sensitive operations use HMAC-SHA256. Built in Rust on Tokio + rmcp.",
-  "homepage": "https://github.com/RecursiveIntell/ri-agent-graph",
+  "homepage": "https://github.com/RecursiveIntell/agent-graph-mcp",
   "identifier": "recursiveintell-agent-graph-mcp",
   "name": "Agent Graph MCP",
   "tags": [

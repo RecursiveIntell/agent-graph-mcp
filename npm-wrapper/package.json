@@ -1,6 +1,6 @@
 {
   "name": "@recursiveintell/agent-graph-mcp",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "MCP server for graph-orchestrated LLM workflows — 25 typed tools, daemon/proxy architecture, checkpoint/resume, HITL approvals, and HMAC receipts.",
   "bin": {
     "agent-graph-mcp": "bin/agent-graph-mcp.js"
@@ -19,8 +19,8 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/RecursiveIntell/ri-agent-graph.git"
+    "url": "https://github.com/RecursiveIntell/agent-graph-mcp.git"
   },
-  "homepage": "https://github.com/RecursiveIntell/ri-agent-graph",
+  "homepage": "https://github.com/RecursiveIntell/agent-graph-mcp",
   "dependencies": {}
 }
