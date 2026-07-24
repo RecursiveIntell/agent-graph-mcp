@@ -1,0 +1,24 @@
+{
+  "candidate_binary": {
+    "path": "/home/sikmindz/Coding/Libraries/target/release/agent-graph-mcp",
+    "sha256": "0e1d389936be133a4616e4e555cb6392b64d9d99f7cf8a0844801b80056521fe"
+  },
+  "claim_boundary": "Candidate only; not installed; Agent Graph remains disabled.",
+  "installed_binary": {
+    "path": "/home/sikmindz/.cargo/bin/agent-graph-mcp",
+    "sha256": "bc20380149484aa9f273d0668e0880584c1baa2b1c7623f57a5246b5f8a1f3ca"
+  },
+  "observed_at_utc": "2026-07-22T03:50:20.952074+00:00",
+  "schema": "agent-graph-mcp-phase0-v2-manifest-v1",
+  "source_files": {
+    "README.md": "ab3a09123093aae71797c5683db594d6bdec173e3641cfd63d6e5ab6591bb264",
+    "src/run_manager.rs": "ba8c7687dc93580d1f84f0cc8fd80760b671f150c5b50f0a6337ca5a449baf8f",
+    "src/server.rs": "904f03ab13afa1cc6018354a752e2b2418a232efddb169256f6fae85f9609c18",
+    "src/store.rs": "53eecc69d4cfbf58a59600a6b2370f7b618775f5c2cbd1a7e0f01d517f26a581",
+    "tests/mcp_integration.rs": "6f84c5466345f6182f393cdb825deddfc46968342c6558647d88d92f0de15501"
+  },
+  "source_root": "/home/sikmindz/Coding/Libraries/agent-graph-mcp",
+  "target_status": [
+    "?? agent-graph-mcp/"
+  ]
+}

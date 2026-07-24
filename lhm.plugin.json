@@ -1,0 +1,127 @@
+{
+  "description": "MCP server for graph-orchestrated LLM workflows — 25 typed tools, daemon/proxy architecture, checkpoint/resume, human-in-the-loop approvals, HMAC-authenticated execution receipts, and SQLite-backed durable persistence. Compile declarative workflow specs to the ri-agent-graph runtime engine. Supports parallel fan-out with JoinSet-backed concurrency, conditional routing, 5 join modes, state transforms, subgraph composition, and 5 built-in templates (council_deliberation, parallel_council, plan_critique_refine, analysis_pipeline, classifier_router). Ships as a daemon (agent-graph-mcpd) with file-lock ownership and crash recovery, plus a stateless stdin/stdout proxy that bridges MCP clients to the daemon over a Unix socket. All integrity-sensitive operations use HMAC-SHA256. Built in Rust on Tokio + rmcp.",
+  "homepage": "https://github.com/RecursiveIntell/ri-agent-graph",
+  "identifier": "recursiveintell-agent-graph-mcp",
+  "name": "Agent Graph MCP",
+  "tags": [
+    "mcp",
+    "agent-orchestration",
+    "graph-workflow",
+    "llm-pipeline",
+    "rust",
+    "langgraph",
+    "parallel-execution",
+    "checkpointing",
+    "human-in-the-loop",
+    "workflow-engine",
+    "fan-out",
+    "template-engine",
+    "council",
+    "sqlite",
+    "deterministic-resume"
+  ],
+  "version": "1.0.0",
+  "capabilities": {
+    "tools": true,
+    "prompts": false,
+    "resources": false
+  },
+  "tools": [
+    {
+      "name": "graph_create",
+      "description": "Create, validate, or delete a graph-orchestrated workflow from a JSON spec. Supports template instantiation and idempotency keys.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "action": { "type": "string", "description": "Action: 'create', 'validate', or 'delete'" },
+          "spec": { "type": "object", "description": "JSON graph specification" },
+          "template": { "type": "object", "description": "Template instantiation: { 'id': 'council', 'name': 'my-council' }" },
+          "graph_id": { "type": "string", "description": "Graph ID for delete action" },
+          "idempotency_key": { "type": "string", "description": "Optional idempotency key" },
+          "overwrite": { "type": "boolean", "description": "Overwrite existing graph" }
+        }
+      }
+    },
+    {
+      "name": "graph_execute",
+      "description": "Execute a registered graph. Sync mode blocks until completion; async mode returns immediately with a run_id.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "graph_id": { "type": "string", "description": "The graph ID to execute" },
+          "input": { "type": "object", "description": "Input value to pass to the graph's entry node" },
+          "mode": { "type": "string", "description": "'sync' blocks until completion, 'async' returns immediately" },
+          "idempotency_key": { "type": "string", "description": "Optional idempotency key" }
+        },
+        "required": ["graph_id"]
+      }
+    },
+    {
+      "name": "graph_run_start",
+      "description": "Start an async graph run. Returns run_id immediately. Supports optional max_wall_clock_ms and max_nodes budgets.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "graph_id": { "type": "string", "description": "Graph ID to execute" },
+          "input": { "type": "object", "description": "Input value" },
+          "budgets": { "type": "object", "description": "Optional budgets with max_wall_clock_ms or max_nodes" },
+          "checkpoint": { "type": "boolean", "description": "When true, persist a pre-execution checkpoint" }
+        },
+        "required": ["graph_id"]
+      }
+    },
+    {
+      "name": "graph_run_wait",
+      "description": "Wait for an async run to complete, with optional timeout.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "run_id": { "type": "string" },
+          "timeout_ms": { "type": "integer" }
+        },
+        "required": ["run_id"]
+      }
+    },
+    {
+      "name": "graph_run_receipt",
+      "description": "Fetch the canonical HMAC-SHA256 authenticated execution receipt for a run.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "run_id": { "type": "string" }
+        },
+        "required": ["run_id"]
+      }
+    },
+    {
+      "name": "graph_template_list",
+      "description": "List available built-in graph templates: council_deliberation, parallel_council, plan_critique_refine, analysis_pipeline, classifier_router.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "graph_inspect",
+      "description": "Get a graph's full topology: nodes, edges, Mermaid diagram, and topology hash.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "graph_id": { "type": "string" }
+        },
+        "required": ["graph_id"]
+      }
+    },
+    {
+      "name": "graph_list",
+      "description": "List all registered graphs with metadata (name, node count, edge count, version).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "limit": { "type": "integer" },
+          "query": { "type": "string" }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+[Unit]
+Description=Agent Graph MCP daemon
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/agent-graph-mcpd --data-dir /var/lib/agent-graph-mcp --socket %t/agent-graph-mcp/mcp.sock
+Restart=on-failure
+RestartSec=2
+User=agent-graph
+Group=agent-graph
+RuntimeDirectory=agent-graph-mcp
+StateDirectory=agent-graph-mcp
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/agent-graph-mcp %t/agent-graph-mcp
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

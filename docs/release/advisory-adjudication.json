@@ -1,0 +1,139 @@
+{
+  "schema_version": 1,
+  "policy": "deny reachable vulnerabilities; unknown blocks release",
+  "adjudication_timestamp": "2026-07-23T20:30:00Z",
+  "advisories": {
+    "RUSTSEC-2026-0190": {
+      "package": "anyhow",
+      "affected_version": "1.0.102",
+      "classification": "reachable",
+      "resolution": "upgraded to anyhow >= 1.0.103",
+      "evidence": "cargo tree -i anyhow -p agent-graph-mcp shows agent-graph-mcp and llm-pipeline depend on anyhow",
+      "status": "fixed"
+    },
+    "RUSTSEC-2026-0204": {
+      "package": "crossbeam-epoch",
+      "affected_version": "0.9.18",
+      "classification": "target-unreachable",
+      "resolution": "not in agent-graph-mcp dependency tree; workspace-level only",
+      "evidence": "cargo tree -i crossbeam-epoch -p agent-graph-mcp: package ID did not match any packages",
+      "status": "waived",
+      "waiver": {
+        "reason": "crossbeam-epoch is not a dependency of agent-graph-mcp or agent-graph",
+        "owner": "controller",
+        "expires": "2026-10-21T00:00:00Z"
+      }
+    },
+    "RUSTSEC-2026-0194": {
+      "package": "quick-xml",
+      "affected_version": "0.39.4",
+      "classification": "target-unreachable",
+      "resolution": "not in agent-graph-mcp dependency tree; workspace-level only",
+      "evidence": "cargo tree -i quick-xml -p agent-graph-mcp: package ID did not match any packages",
+      "status": "waived",
+      "waiver": {
+        "reason": "quick-xml is not a dependency of agent-graph-mcp or agent-graph",
+        "owner": "controller",
+        "expires": "2026-10-21T00:00:00Z"
+      }
+    },
+    "RUSTSEC-2026-0195": {
+      "package": "quick-xml",
+      "affected_version": "0.39.4",
+      "classification": "target-unreachable",
+      "resolution": "not in agent-graph-mcp dependency tree; workspace-level only",
+      "evidence": "same as RUSTSEC-2026-0194",
+      "status": "waived",
+      "waiver": {
+        "reason": "quick-xml is not a dependency of agent-graph-mcp or agent-graph",
+        "owner": "controller",
+        "expires": "2026-10-21T00:00:00Z"
+      }
+    },
+    "RUSTSEC-2026-0185": {
+      "package": "quinn-proto",
+      "affected_version": "0.11.14",
+      "classification": "target-unreachable",
+      "resolution": "not in agent-graph-mcp dependency tree; workspace-level only",
+      "evidence": "cargo tree -i quinn-proto -p agent-graph-mcp: package ID did not match any packages",
+      "status": "waived",
+      "waiver": {
+        "reason": "quinn-proto is not a dependency of agent-graph-mcp or agent-graph",
+        "owner": "controller",
+        "expires": "2026-10-21T00:00:00Z"
+      }
+    },
+    "RUSTSEC-2026-0049": {
+      "package": "rustls-webpki",
+      "affected_version": "0.103.9",
+      "classification": "target-unreachable",
+      "resolution": "not in agent-graph-mcp dependency tree; workspace-level only",
+      "evidence": "cargo tree -i rustls-webpki -p agent-graph-mcp: nothing to print",
+      "status": "waived",
+      "waiver": {
+        "reason": "rustls-webpki is not a dependency of agent-graph-mcp or agent-graph",
+        "owner": "controller",
+        "expires": "2026-10-21T00:00:00Z"
+      }
+    },
+    "RUSTSEC-2026-0098": {
+      "package": "rustls-webpki",
+      "affected_version": "0.103.9",
+      "classification": "target-unreachable",
+      "resolution": "same as RUSTSEC-2026-0049",
+      "evidence": "same as RUSTSEC-2026-0049",
+      "status": "waived",
+      "waiver": {
+        "reason": "rustls-webpki is not a dependency of agent-graph-mcp or agent-graph",
+        "owner": "controller",
+        "expires": "2026-10-21T00:00:00Z"
+      }
+    },
+    "RUSTSEC-2026-0099": {
+      "package": "rustls-webpki",
+      "affected_version": "0.103.9",
+      "classification": "target-unreachable",
+      "resolution": "same as RUSTSEC-2026-0049",
+      "evidence": "same as RUSTSEC-2026-0049",
+      "status": "waived",
+      "waiver": {
+        "reason": "rustls-webpki is not a dependency of agent-graph-mcp or agent-graph",
+        "owner": "controller",
+        "expires": "2026-10-21T00:00:00Z"
+      }
+    },
+    "RUSTSEC-2026-0104": {
+      "package": "rustls-webpki",
+      "affected_version": "0.103.9",
+      "classification": "target-unreachable",
+      "resolution": "same as RUSTSEC-2026-0049",
+      "evidence": "same as RUSTSEC-2026-0049",
+      "status": "waived",
+      "waiver": {
+        "reason": "rustls-webpki is not a dependency of agent-graph-mcp or agent-graph",
+        "owner": "controller",
+        "expires": "2026-10-21T00:00:00Z"
+      }
+    },
+    "RUSTSEC-2026-0097": {
+      "package": "rand",
+      "affected_version": "0.9.2",
+      "classification": "target-unreachable",
+      "resolution": "not in agent-graph-mcp dependency tree; workspace-level only",
+      "evidence": "cargo tree -i rand -p agent-graph-mcp: package ID did not match any packages",
+      "status": "waived",
+      "waiver": {
+        "reason": "rand is not a dependency of agent-graph-mcp or agent-graph",
+        "owner": "controller",
+        "expires": "2026-10-21T00:00:00Z"
+      }
+    }
+  },
+  "summary": {
+    "total_advisories": 11,
+    "reachable_fixed": 1,
+    "target_unreachable_waived": 10,
+    "remaining_unknown": 0,
+    "blocking_release": false
+  }
+}

@@ -1,0 +1,4 @@
+{
+ "$schema":"https://json-schema.org/draft/2020-12/schema","title":"Agent Graph Release Manifest v2","type":"object","required":["manifest_version","source","toolchain","artifacts","receipts","sbom","advisory_policy"],
+ "properties":{"manifest_version":{"const":2},"source":{"type":"object","required":["commit","dirty","lockfiles"],"properties":{"commit":{"type":"string","pattern":"^[0-9a-f]{40}$"},"dirty":{"const":false},"lockfiles":{"type":"array","minItems":1}}},"toolchain":{"type":"object"},"artifacts":{"type":"array","minItems":1,"items":{"type":"object","required":["path","sha256","size_bytes"]}},"receipts":{"type":"array"},"sbom":{"type":"object","required":["path","sha256"]},"advisory_policy":{"type":"object"}}
+}

@@ -1,0 +1,1 @@
+{"rust":{"msrv":"1.75.0","channel":"stable"},"commands":{"cargo-audit":"cargo audit --json","cargo-deny":"cargo deny check"},"lockfile":"../Cargo.lock"}

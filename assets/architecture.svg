@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 420" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="900" y2="420">
+      <stop offset="0%" stop-color="#0d1117"/>
+      <stop offset="100%" stop-color="#161b22"/>
+    </linearGradient>
+    <filter id="glow"><feGaussianBlur stdDeviation="3"/><feMerge><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#58a6ff"/></marker>
+  </defs>
+  <rect width="900" height="420" fill="url(#bg)"/>
+
+  <!-- Hermes -->
+  <rect x="30" y="160" width="130" height="55" rx="10" fill="#da3633" filter="url(#glow)"/>
+  <text x="95" y="185" text-anchor="middle" fill="#fff" font-family="monospace" font-size="15" font-weight="bold">Hermes</text>
+  <text x="95" y="203" text-anchor="middle" fill="#f85149" font-family="monospace" font-size="10">Desktop App</text>
+
+  <!-- Proxy -->
+  <rect x="250" y="90" width="130" height="55" rx="10" fill="#d29922"/>
+  <text x="315" y="112" text-anchor="middle" fill="#fff" font-family="monospace" font-size="14" font-weight="bold">Proxy</text>
+  <text x="315" y="130" text-anchor="middle" fill="#d29922" font-family="monospace" font-size="10">agent-graph-mcp</text>
+
+  <!-- Direct mode (bypass) -->
+  <line x1="315" y1="90" x2="315" y2="50" stroke="#484f58" stroke-width="1" stroke-dasharray="4"/>
+  <text x="315" y="42" text-anchor="middle" fill="#484f58" font-family="monospace" font-size="9">--direct mode bypasses proxy</text>
+
+  <!-- Unix Socket -->
+  <rect x="500" y="40" width="230" height="30" rx="6" fill="#1f6feb33" stroke="#1f6feb" stroke-width="1"/>
+  <text x="615" y="60" text-anchor="middle" fill="#58a6ff" font-family="monospace" font-size="11">Unix socket (framed JSON-RPC 2.0)</text>
+
+  <!-- Daemon -->
+  <rect x="500" y="110" width="230" height="55" rx="10" fill="#238636"/>
+  <text x="615" y="132" text-anchor="middle" fill="#fff" font-family="monospace" font-size="14" font-weight="bold">Daemon</text>
+  <text x="615" y="150" text-anchor="middle" fill="#3fb950" font-family="monospace" font-size="10">agent-graph-mcpd</text>
+
+  <!-- SQLite -->
+  <rect x="500" y="200" width="230" height="50" rx="10" fill="#a371f7" filter="url(#glow)"/>
+  <text x="615" y="222" text-anchor="middle" fill="#fff" font-family="monospace" font-size="14" font-weight="bold">SQLite</text>
+  <text x="615" y="238" text-anchor="middle" fill="#a371f7" font-family="monospace" font-size="10">graphs · executions · checkpoints · events</text>
+
+  <!-- Arrows -->
+  <line x1="160" y1="187" x2="245" y2="117" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)"/>
+  <text x="180" y="145" text-anchor="middle" fill="#58a6ff" font-family="monospace" font-size="9">stdin/stdout</text>
+
+  <line x1="380" y1="117" x2="495" y2="55" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)"/>
+  <line x1="615" y1="110" x2="615" y2="195" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)"/>
+
+  <!-- Models -->
+  <rect x="250" y="280" width="180" height="55" rx="8" fill="#1f6feb33" stroke="#1f6feb" stroke-width="1"/>
+  <text x="340" y="305" text-anchor="middle" fill="#58a6ff" font-family="monospace" font-size="12">Ollama</text>
+  <text x="340" y="323" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="10">GLM · DeepSeek · Mistral</text>
+
+  <line x1="365" y1="145" x2="340" y2="275" stroke="#8b949e" stroke-width="1" stroke-dasharray="4"/>
+
+  <!-- Stats -->
+  <rect x="500" y="280" width="230" height="55" rx="8" fill="#1f6feb33" stroke="#1f6feb" stroke-width="1"/>
+  <text x="615" y="302" text-anchor="middle" fill="#58a6ff" font-family="monospace" font-size="12">25 MCP Tools</text>
+  <text x="615" y="320" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="10">create · execute · checkpoint · approve · witness</text>
+
+  <!-- Footer -->
+  <text x="450" y="380" text-anchor="middle" fill="#484f58" font-family="monospace" font-size="11">Daemon enforces file lock · crash recovery · startup mode enforcement · 0600 socket perms</text>
+  <text x="450" y="400" text-anchor="middle" fill="#484f58" font-family="monospace" font-size="11">Proxy is stateless · can restart independently · supports --direct for in-process mode</text>
+</svg>

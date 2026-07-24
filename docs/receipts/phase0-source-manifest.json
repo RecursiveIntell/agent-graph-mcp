@@ -1,0 +1,18 @@
+{
+  "files": {
+    "Cargo.toml": "4638487c5b68d652ca104b308728ea90c3adf04413b692377fd9bf0c254303ef",
+    "README.md": "19283b52294582b773c170ad0281498c47c0588a731f9e2cc35fdfc77f6f496e",
+    "src/evidence.rs": "90859635709f0df4ceacd0d81f23afe8055713caf837ccb89d4f1968eec32adb",
+    "src/nodes.rs": "aedf5c1be4fe2a36506c5e20e0e73c9ea08a94a8a57003553b62dc3e05a18679",
+    "src/run_manager.rs": "d0d378a70b0343ce994960fd80d3aa8e4c158a73cc72ff70027ceb571d962259",
+    "src/server.rs": "96587a73b2b51d3b0690e5eae2dc57212b15f21e66d9429528476626995589cc",
+    "src/spec.rs": "93ee009f619ecb4b3234e71f5d565d542204a780b874a1c858fe40d5735bf7c0",
+    "src/store.rs": "3b6160f13640ae45d156dcf1a7947555cf34c715482b9d59f4ba9078fb16caa9",
+    "tests/mcp_integration.rs": "2ecd56132f18323b16585832d1b41dfc73514d6604b6b5abe907560e961f433e"
+  },
+  "installed_binary": "/home/sikmindz/.cargo/bin/agent-graph-mcp",
+  "installed_binary_sha256": "bc20380149484aa9f273d0668e0880584c1baa2b1c7623f57a5246b5f8a1f3ca",
+  "observed_at": "2026-07-22T02:59:39.747498+00:00",
+  "parent_scoped_status": "?? agent-graph-mcp/\n",
+  "repo": "/home/sikmindz/Coding/Libraries/agent-graph-mcp"
+}
