@@ -1,10 +1,10 @@
 [package]
 name = "agent-graph-mcp"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 rust-version = "1.75"
 license = "MIT"
-description = "MCP server for graph-orchestrated LLM workflows — 25 typed tools, daemon/proxy architecture, checkpoint/resume, HITL approvals, HMAC receipts"
+description = "Run 9 agents at once — MCP server for graph-orchestrated LLM workflows with parallel fan-out (up to 16 nodes), checkpoint/resume, HITL approvals, HMAC receipts"
 repository = "https://github.com/RecursiveIntell/agent-graph-mcp"
 homepage = "https://github.com/RecursiveIntell/agent-graph-mcp"
 documentation = "https://docs.rs/agent-graph-mcp"

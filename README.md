@@ -1,6 +1,6 @@
 # agent-graph-mcp
 
-**MCP server for graph-orchestrated LLM workflows** — 25 typed tools, daemon/proxy architecture, checkpoint/resume, human-in-the-loop approvals, and HMAC-authenticated execution receipts.
+**Run 9 agents at once.** MCP server for graph-orchestrated LLM workflows — dispatch up to 16 LLM nodes in parallel fan-out with typed joins, checkpoint/resume, human-in-the-loop approvals, and HMAC-authenticated execution receipts. 25 typed tools.
 
 [![Crates.io](https://img.shields.io/crates/v/agent-graph-mcp)](https://crates.io/crates/agent-graph-mcp)
 [![docs.rs](https://img.shields.io/docsrs/agent-graph-mcp)](https://docs.rs/agent-graph-mcp)
@@ -48,6 +48,47 @@ mcp_servers:
 ```json
 {"mcpServers": {"agent-graph": {"command": "npx", "args": ["-y", "@recursiveintell/agent-graph-mcp", "--direct", "--base-url", "http://127.0.0.1:11434", "--model", "glm-5.2:cloud"]}}}
 ```
+
+## 9 agents at once
+
+Fan out to 9 LLM nodes in parallel, then join results into one synthesis:
+
+```json
+{
+  "name": "9-agent-research-sweep",
+  "entry": "fanout",
+  "nodes": [
+    {"id": "fanout", "type": "passthrough"},
+    {"id": "agent_0", "type": "llm", "prompt": "Research topic A: {input}"},
+    {"id": "agent_1", "type": "llm", "prompt": "Research topic B: {input}"},
+    {"id": "agent_2", "type": "llm", "prompt": "Research topic C: {input}"},
+    {"id": "agent_3", "type": "llm", "prompt": "Analyze dimension 1: {input}"},
+    {"id": "agent_4", "type": "llm", "prompt": "Analyze dimension 2: {input}"},
+    {"id": "agent_5", "type": "llm", "prompt": "Analyze dimension 3: {input}"},
+    {"id": "agent_6", "type": "llm", "prompt": "Critique from angle X: {input}"},
+    {"id": "agent_7", "type": "llm", "prompt": "Critique from angle Y: {input}"},
+    {"id": "agent_8", "type": "llm", "prompt": "Synthesize findings: {collected}"},
+    {"id": "join", "type": "join", "config": {"inputs": ["agent_0","agent_1","agent_2","agent_3","agent_4","agent_5","agent_6","agent_7","agent_8"], "output": "collected", "mode": "collect_array"}},
+    {"id": "report", "type": "llm", "prompt": "Produce final report from: {collected}"}
+  ],
+  "edges": [
+    {"from": "fanout", "to": "agent_0"}, {"from": "fanout", "to": "agent_1"},
+    {"from": "fanout", "to": "agent_2"}, {"from": "fanout", "to": "agent_3"},
+    {"from": "fanout", "to": "agent_4"}, {"from": "fanout", "to": "agent_5"},
+    {"from": "fanout", "to": "agent_6"}, {"from": "fanout", "to": "agent_7"},
+    {"from": "fanout", "to": "agent_8"},
+    {"from": "agent_0", "to": "join"}, {"from": "agent_1", "to": "join"},
+    {"from": "agent_2", "to": "join"}, {"from": "agent_3", "to": "join"},
+    {"from": "agent_4", "to": "join"}, {"from": "agent_5", "to": "join"},
+    {"from": "agent_6", "to": "join"}, {"from": "agent_7", "to": "join"},
+    {"from": "agent_8", "to": "join"},
+    {"from": "join", "to": "report"}, {"from": "report", "to": "END"}
+  ],
+  "max_parallelism": 9
+}
+```
+
+All 9 LLM calls execute concurrently via Tokio `JoinSet`. The join node collects results, then the report node synthesizes. Scale up to 16 branches per parallel node.
 
 ## Architecture
 
