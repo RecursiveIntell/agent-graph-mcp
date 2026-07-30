@@ -10,7 +10,7 @@
 
 ![Architecture](assets/architecture.svg)
 
-> **Expose the `ri-agent-graph` runtime engine over MCP.** Compile declarative JSON workflow specs, execute synchronously or asynchronously, checkpoint/resume, request human approval, capture source witnesses, and get cryptographic receipts — all through 25 typed MCP tools.
+> **Expose the `ri-agent-graph` runtime engine over MCP.** Compile declarative JSON workflow specs, execute synchronously or asynchronously, checkpoint/resume, request human approval, capture source witnesses, and get cryptographic receipts — all through 25 typed MCP tools. Normal execution is synchronous. Durable approval is supported only as a SQLite-backed decision.
 
 ## Quick start
 

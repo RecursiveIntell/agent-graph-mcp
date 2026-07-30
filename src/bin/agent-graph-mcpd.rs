@@ -3,16 +3,32 @@ use rmcp::ServiceExt;
 use std::{os::unix::fs::PermissionsExt, path::PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
+fn validate_provider_config(base_url: &str, model: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+        return Err("base URL must use http or https".into());
+    }
+    if model.trim().is_empty() {
+        return Err("model must not be empty".into());
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut data = PathBuf::from("/tmp/agent-graph");
     let mut socket = PathBuf::from("/tmp/agent-graph/mcp.sock");
+    let mut base_url = std::env::var("AGENT_GRAPH_BASE_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string());
+    let mut model =
+        std::env::var("AGENT_GRAPH_MODEL").unwrap_or_else(|_| "glm-5.2:cloud".to_string());
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--data-dir" => data = PathBuf::from(args.next().ok_or("missing data dir")?),
             "--socket" => socket = PathBuf::from(args.next().ok_or("missing socket")?),
+            "--base-url" => base_url = args.next().ok_or("missing base URL")?,
+            "--model" => model = args.next().ok_or("missing model")?,
             "--help" => {
-                println!("agent-graph-mcpd --data-dir PATH --socket PATH");
+                println!("agent-graph-mcpd --data-dir PATH --socket PATH [--base-url URL] [--model NAME]");
                 return Ok(());
             }
             "--version" => {
@@ -22,17 +38,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => return Err("unknown daemon argument".into()),
         }
     }
+    validate_provider_config(&base_url, &model)?;
     std::fs::create_dir_all(&data)?;
-    // Bootstrap the application schema before daemon identity/recovery queries.
-    // The daemon migration layer only owns daemon-specific tables; the store
-    // migration owns graphs/executions and must run first on a fresh data dir.
     let key_path = std::env::var_os("AGENT_GRAPH_INTEGRITY_KEY_PATH").map(PathBuf::from);
-    let _store = agent_graph_mcp::store::PersistentStore::open_with_integrity_key(
+
+    // The exclusive daemon lock is acquired before any SQLite open or migration.
+    // This prevents a losing contender from mutating the durable store.
+    let (_lock, conn) = daemon::open_owned(&data, "daemon")?;
+
+    // Bootstrap graph/execution schema only after ownership is established, then
+    // close the bootstrap connection; request servers open their own scoped store.
+    let bootstrap_store = agent_graph_mcp::store::PersistentStore::open_with_integrity_key(
         &data,
         key_path.as_deref(),
     )
     .map_err(std::io::Error::other)?;
-    let (_lock, conn) = daemon::open_owned(&data, "daemon")?;
+    drop(bootstrap_store);
+
     daemon::enforce_startup_mode(&conn, key_path.is_some())
         .map_err(|e| format!("daemon startup rejected: {e}"))?;
     let id = daemon::identity(&conn)?;
@@ -40,6 +62,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(conn);
     let rt = tokio::runtime::Runtime::new()?;
     let data_dir = data.clone();
+    let provider_url = base_url.clone();
+    let default_model = model.clone();
     let accept_result: std::result::Result<(), Box<dyn std::error::Error>> =
         rt.block_on(async move {
             if socket.exists() {
@@ -57,8 +81,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 let data_dir = data_dir.clone();
                 let key_path = key_path.clone();
+                let provider_url = provider_url.clone();
+                let default_model = default_model.clone();
                 tokio::spawn(async move {
-                    let _ = serve_connection(stream, &data_dir, key_path.as_deref()).await;
+                    let _ = serve_connection(
+                        stream,
+                        &data_dir,
+                        key_path.as_deref(),
+                        &provider_url,
+                        &default_model,
+                    )
+                    .await;
                 });
             }
         });
@@ -70,6 +103,8 @@ async fn serve_connection(
     stream: tokio::net::UnixStream,
     data_dir: &std::path::Path,
     key_path: Option<&std::path::Path>,
+    provider_url: &str,
+    default_model: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (mut sock_rx, mut sock_tx) = stream.into_split();
 
@@ -134,8 +169,8 @@ async fn serve_connection(
 
     // Create server and serve on rmcp_side of the duplex
     let server = AgentGraphServer::new(
-        "http://127.0.0.1:11434".into(),
-        "glm-5.2:cloud".into(),
+        provider_url.to_string(),
+        default_model.to_string(),
         Some(data_dir.to_path_buf()),
         key_path.map(|p| p.to_path_buf()),
     )
