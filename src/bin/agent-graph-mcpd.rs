@@ -4,8 +4,11 @@ use std::{os::unix::fs::PermissionsExt, path::PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
 fn validate_provider_config(base_url: &str, model: &str) -> Result<(), Box<dyn std::error::Error>> {
-    if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
-        return Err("base URL must use http or https".into());
+    if base_url != "codex-app-server://"
+        && !base_url.starts_with("http://")
+        && !base_url.starts_with("https://")
+    {
+        return Err("base URL must use http, https, or codex-app-server://".into());
     }
     if model.trim().is_empty() {
         return Err("model must not be empty".into());

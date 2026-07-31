@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod cli;
+pub mod codex_app_server;
 pub mod compiler;
 pub mod daemon;
 pub mod evidence;

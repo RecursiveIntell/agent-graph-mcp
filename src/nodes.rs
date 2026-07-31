@@ -4,14 +4,14 @@ use std::sync::{
     Arc,
 };
 
+use async_trait::async_trait;
+use llm_pipeline::payload::Payload;
+use llm_pipeline::{ExecCtx, LlmCall, LlmConfig};
 use ri_agent_graph::command::{Command, Navigation, NodeOutput};
 use ri_agent_graph::config::GraphConfig;
 use ri_agent_graph::error::{AgentGraphError, Result};
 use ri_agent_graph::node::Node;
 use ri_agent_graph::state::AgentState;
-use async_trait::async_trait;
-use llm_pipeline::payload::Payload;
-use llm_pipeline::{ExecCtx, LlmCall, LlmConfig};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use tokio::sync::Notify;
@@ -87,19 +87,39 @@ impl Node for LlmNode {
         if let Some(tokens) = self.max_tokens {
             config = config.with_max_tokens(tokens as u32);
         }
-        let call = LlmCall::new(&self.id, rendered)
-            .with_model(model)
-            .with_timeout(std::time::Duration::from_millis(self.timeout_ms))
-            .with_config(config);
-        let exec_ctx = ExecCtx::builder(&self.base_url).build();
-        let output = tokio::select! {
-            result = call.invoke(&exec_ctx, input) => result
-                .map_err(|e| AgentGraphError::PayloadError(e.to_string()))?
-                .value,
-            _ = cancellation_requested(self.ctx.cancelled.clone(), self.ctx.cancellation.clone()) => {
-                // Dropping the boxed future stops waiting for this call. The
-                // provider may still observe a request already sent on the wire.
-                return Err(AgentGraphError::Cancelled);
+        let output = if self.base_url == "codex-app-server://" {
+            let model = model.to_owned();
+            let prompt = rendered.clone();
+            let timeout = std::time::Duration::from_millis(self.timeout_ms);
+            let cwd = std::env::current_dir().map_err(|e| {
+                AgentGraphError::PayloadError(format!("codex working directory unavailable: {e}"))
+            })?;
+            tokio::select! {
+                result = tokio::task::spawn_blocking(move || {
+                    crate::codex_app_server::run_turn("codex", &model, &cwd, &prompt, timeout)
+                }) => {
+                    let text = result
+                        .map_err(|e| AgentGraphError::PayloadError(format!("codex app-server task failed: {e}")))?
+                        .map_err(AgentGraphError::PayloadError)?;
+                    Value::String(text)
+                }
+                _ = cancellation_requested(self.ctx.cancelled.clone(), self.ctx.cancellation.clone()) => {
+                    return Err(AgentGraphError::Cancelled);
+                }
+            }
+        } else {
+            let call = LlmCall::new(&self.id, rendered)
+                .with_model(model)
+                .with_timeout(std::time::Duration::from_millis(self.timeout_ms))
+                .with_config(config);
+            let exec_ctx = ExecCtx::builder(&self.base_url).build();
+            tokio::select! {
+                result = call.invoke(&exec_ctx, input) => result
+                    .map_err(|e| AgentGraphError::PayloadError(e.to_string()))?
+                    .value,
+                _ = cancellation_requested(self.ctx.cancelled.clone(), self.ctx.cancellation.clone()) => {
+                    return Err(AgentGraphError::Cancelled);
+                }
             }
         };
         self.ctx.check()?;
