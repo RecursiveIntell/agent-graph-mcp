@@ -444,13 +444,44 @@ impl Node for ToolNode {
     async fn execute(&self, state: &AgentState, _: &GraphConfig) -> Result<NodeOutput> {
         self.ctx.check()?;
 
+        // Resolve lease: use config-provided lease or generate a minimal default.
+        let lease_value = if self.lease.is_null() {
+            let now = chrono::Utc::now();
+            let expires = now + chrono::Duration::hours(1);
+            serde_json::json!({
+                "protocol": "agent_graph.tool_lease.v1",
+                "lease_id": format!("auto-{}", self.id),
+                "lineage_id": format!("lineage-{}", self.id),
+                "graph_id": "auto",
+                "graph_version": "auto",
+                "run_id": "auto",
+                "node_id": self.id,
+                "issued_at": now.to_rfc3339(),
+                "expires_at": expires.to_rfc3339(),
+                "tool_allowlist": ["*"],
+                "effect_allowlist": ["read_only"],
+                "max_tool_calls": 20,
+                "max_recursive_calls": 0,
+                "max_agent_depth": 1,
+                "max_graph_depth": 1,
+                "max_children": 0,
+                "agent_depth": 1,
+                "graph_depth": 1,
+                "active_stack": [],
+                "counters": {"tool_calls": 0, "recursive_calls": 0, "children": 0},
+                "parent_receipt_digest": null
+            })
+        } else {
+            self.lease.clone()
+        };
+
         // Write lease to a temp file the broker can read.
         let lease_path = format!("{}/lease.json", self.receipt_dir);
         std::fs::create_dir_all(&self.receipt_dir)
             .map_err(|e| AgentGraphError::PayloadError(format!("receipt dir: {e}")))?;
         std::fs::write(
             &lease_path,
-            serde_json::to_string(&self.lease)
+            serde_json::to_string_pretty(&lease_value)
                 .map_err(|e| AgentGraphError::PayloadError(format!("lease serialize: {e}")))?,
         )
         .map_err(|e| AgentGraphError::PayloadError(format!("lease write: {e}")))?;

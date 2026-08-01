@@ -395,6 +395,13 @@ fn receipt_unsigned(receipt: &ToolCallReceipt) -> Result<Value, ToolPolicyError>
 }
 
 impl ToolCallReceipt {
+    pub fn compute_digest(&self) -> String {
+        // Digest the receipt unsigned (signature excluded).
+        receipt_unsigned(self)
+            .map(|v| digest(&v))
+            .unwrap_or_else(|_| "sha256:invalid".into())
+    }
+
     pub fn complete(
         intent: &ToolCallIntent,
         outcome: ReceiptOutcome,

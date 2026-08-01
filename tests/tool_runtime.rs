@@ -247,14 +247,20 @@ fn budget_exhaustion_blocks_further_calls() {
 
     // First two calls succeed.
     let r1 = reserve_call(
-        &signed, &key(), Utc::now(), binding(),
+        &signed,
+        &key(),
+        Utc::now(),
+        binding(),
         invocation("read_file", ToolEffect::ReadOnly),
     )
     .expect("call 1");
     assert_eq!(r1.updated_lease.lease.counters.tool_calls, 1);
 
     let r2 = reserve_call(
-        &r1.updated_lease, &key(), Utc::now(), binding(),
+        &r1.updated_lease,
+        &key(),
+        Utc::now(),
+        binding(),
         invocation("search_files", ToolEffect::ReadOnly),
     )
     .expect("call 2");
@@ -263,7 +269,10 @@ fn budget_exhaustion_blocks_further_calls() {
     // Third call must fail.
     assert_eq!(
         reserve_call(
-            &r2.updated_lease, &key(), Utc::now(), binding(),
+            &r2.updated_lease,
+            &key(),
+            Utc::now(),
+            binding(),
             invocation("web_search", ToolEffect::ReadOnly),
         )
         .unwrap_err(),
@@ -279,7 +288,10 @@ fn tool_not_in_allowlist_is_denied() {
 
     // Allowed.
     reserve_call(
-        &signed, &key(), Utc::now(), binding(),
+        &signed,
+        &key(),
+        Utc::now(),
+        binding(),
         invocation("read_file", ToolEffect::ReadOnly),
     )
     .expect("allowed");
@@ -287,7 +299,10 @@ fn tool_not_in_allowlist_is_denied() {
     // Denied — not in allowlist.
     assert_eq!(
         reserve_call(
-            &signed, &key(), Utc::now(), binding(),
+            &signed,
+            &key(),
+            Utc::now(),
+            binding(),
             invocation("web_search", ToolEffect::ReadOnly),
         )
         .unwrap_err(),
@@ -330,7 +345,10 @@ fn effect_classification_mismatch_is_denied() {
     // Claim read_only but classify_tool says write_file is LocalMutation.
     assert_eq!(
         reserve_call(
-            &signed, &key(), Utc::now(), binding(),
+            &signed,
+            &key(),
+            Utc::now(),
+            binding(),
             invocation("write_file", ToolEffect::ReadOnly),
         )
         .unwrap_err(),
@@ -342,7 +360,10 @@ fn effect_classification_mismatch_is_denied() {
 fn receipt_chain_rejects_wrong_parent() {
     let signed = issue_lease(lease(), &key()).expect("signed");
     let r1 = reserve_call(
-        &signed, &key(), Utc::now(), binding(),
+        &signed,
+        &key(),
+        Utc::now(),
+        binding(),
         invocation("read_file", ToolEffect::ReadOnly),
     )
     .expect("reservation 1");
@@ -350,7 +371,10 @@ fn receipt_chain_rejects_wrong_parent() {
     let mut r2_invocation = invocation("search_files", ToolEffect::ReadOnly);
     r2_invocation.parent_receipt_digest = Some("sha256:correct-parent".into());
     let r2 = reserve_call(
-        &r1.updated_lease, &key(), Utc::now(), binding(),
+        &r1.updated_lease,
+        &key(),
+        Utc::now(),
+        binding(),
         r2_invocation,
     )
     .expect("reservation 2");
@@ -395,7 +419,10 @@ fn replay_detection_requires_exact_idempotency() {
 fn receipt_summary_too_large_is_rejected() {
     let signed = issue_lease(lease(), &key()).expect("signed");
     let reserved = reserve_call(
-        &signed, &key(), Utc::now(), binding(),
+        &signed,
+        &key(),
+        Utc::now(),
+        binding(),
         invocation("read_file", ToolEffect::ReadOnly),
     )
     .expect("reservation");
@@ -432,7 +459,10 @@ fn concurrent_counters_are_atomic_per_reservation() {
             ("write_file", ToolEffect::LocalMutation)
         };
         current = reserve_call(
-            &current, &key(), Utc::now(), binding(),
+            &current,
+            &key(),
+            Utc::now(),
+            binding(),
             invocation(tool.0, tool.1),
         )
         .expect("call")
@@ -441,4 +471,273 @@ fn concurrent_counters_are_atomic_per_reservation() {
         assert_eq!(current.lease.counters.tool_calls, total);
     }
     assert_eq!(current.lease.counters.tool_calls, 5);
+}
+
+#[test]
+fn agent_depth_exceeded_rejected_at_issue_time() {
+    let mut deep = lease();
+    deep.agent_depth = 3;
+    deep.max_agent_depth = 2;
+    assert_eq!(
+        issue_lease(deep, &key()).unwrap_err(),
+        ToolPolicyError::AgentDepthExceeded
+    );
+}
+
+#[test]
+fn graph_depth_exceeded_rejected_at_issue_time() {
+    let mut deep = lease();
+    deep.graph_depth = 5;
+    deep.max_graph_depth = 3;
+    assert_eq!(
+        issue_lease(deep, &key()).unwrap_err(),
+        ToolPolicyError::GraphDepthExceeded
+    );
+}
+
+#[test]
+fn children_budget_exhausted_blocks_child_spawn() {
+    // Lease with counters.children > max_children is rejected at issue time.
+    let mut over_children = lease();
+    over_children.max_children = 1;
+    over_children.counters.children = 2;
+    assert_eq!(
+        issue_lease(over_children, &key()).unwrap_err(),
+        ToolPolicyError::LeaseScopeInvalid
+    );
+}
+
+#[test]
+fn lease_not_yet_valid_rejected() {
+    let mut future = lease();
+    future.issued_at = Utc::now() + Duration::minutes(5);
+    future.expires_at = future.issued_at + Duration::minutes(10);
+    let signed = issue_lease(future, &key()).expect("signed");
+    assert_eq!(
+        verify_lease(&signed, &key(), Utc::now(), binding()).unwrap_err(),
+        ToolPolicyError::LeaseNotYetValid
+    );
+}
+
+#[test]
+fn wrong_protocol_rejected() {
+    let mut bad = lease();
+    bad.protocol = "agent_graph.tool_lease.v999".into();
+    assert_eq!(
+        issue_lease(bad, &key()).unwrap_err(),
+        ToolPolicyError::LeaseProtocolUnsupported
+    );
+}
+
+#[test]
+fn empty_identity_fields_rejected() {
+    let mut bad = lease();
+    bad.lineage_id = String::new();
+    assert_eq!(
+        issue_lease(bad, &key()).unwrap_err(),
+        ToolPolicyError::LeaseIdentityInvalid
+    );
+}
+
+#[test]
+fn empty_allowlist_or_zero_budget_rejected() {
+    let mut bad = lease();
+    bad.tool_allowlist = vec![];
+    assert_eq!(
+        issue_lease(bad, &key()).unwrap_err(),
+        ToolPolicyError::LeaseScopeInvalid
+    );
+
+    let mut bad2 = lease();
+    bad2.max_tool_calls = 0;
+    assert_eq!(
+        issue_lease(bad2, &key()).unwrap_err(),
+        ToolPolicyError::LeaseScopeInvalid
+    );
+}
+
+#[test]
+fn multiple_effects_in_allowlist_allows_either() {
+    let mut wide = lease();
+    wide.effect_allowlist = vec![ToolEffect::ReadOnly, ToolEffect::LocalMutation];
+    let signed = issue_lease(wide, &key()).expect("signed");
+
+    // Both read and write are permitted.
+    reserve_call(
+        &signed,
+        &key(),
+        Utc::now(),
+        binding(),
+        invocation("read_file", ToolEffect::ReadOnly),
+    )
+    .expect("read allowed");
+
+    reserve_call(
+        &signed,
+        &key(),
+        Utc::now(),
+        binding(),
+        invocation("write_file", ToolEffect::LocalMutation),
+    )
+    .expect("write allowed");
+}
+
+#[test]
+fn intent_signature_is_verified_during_receipt_chain_check() {
+    let signed = issue_lease(lease(), &key()).expect("signed");
+    let reserved = reserve_call(
+        &signed,
+        &key(),
+        Utc::now(),
+        binding(),
+        invocation("read_file", ToolEffect::ReadOnly),
+    )
+    .expect("reservation");
+
+    let receipt = ToolCallReceipt::complete(
+        &reserved.intent,
+        ReceiptOutcome::Succeeded,
+        &json!({"ok": true}),
+        "done",
+        Utc::now(),
+        &key(),
+    )
+    .expect("receipt");
+
+    // Verify with correct intent passes.
+    verify_receipt_chain(&reserved.intent, &receipt, &key()).expect("valid");
+
+    // Forge intent signature — intent verification fails.
+    let mut forged_intent = reserved.intent.clone();
+    forged_intent.signature = "hmac-sha256:deadbeef".into();
+    assert_eq!(
+        verify_receipt_chain(&forged_intent, &receipt, &key()).unwrap_err(),
+        ToolPolicyError::IntentSignatureInvalid
+    );
+}
+
+#[test]
+fn three_deep_receipt_chain_is_fully_verifiable() {
+    let signed = issue_lease(lease(), &key()).expect("signed");
+
+    // Call 1: read_file
+    let r1 = reserve_call(
+        &signed,
+        &key(),
+        Utc::now(),
+        binding(),
+        invocation("read_file", ToolEffect::ReadOnly),
+    )
+    .expect("call 1");
+    let receipt1 = ToolCallReceipt::complete(
+        &r1.intent,
+        ReceiptOutcome::Succeeded,
+        &json!({"path": "/a"}),
+        "file a",
+        Utc::now(),
+        &key(),
+    )
+    .expect("receipt 1");
+    verify_receipt_chain(&r1.intent, &receipt1, &key()).expect("chain 1 ok");
+
+    // Call 2: search_files, parent is receipt1
+    let mut inv2 = invocation("search_files", ToolEffect::ReadOnly);
+    inv2.parent_receipt_digest = Some(receipt1.compute_digest());
+    let r2 = reserve_call(&r1.updated_lease, &key(), Utc::now(), binding(), inv2).expect("call 2");
+    let receipt2 = ToolCallReceipt::complete(
+        &r2.intent,
+        ReceiptOutcome::Succeeded,
+        &json!({"matches": 3}),
+        "3 matches",
+        Utc::now(),
+        &key(),
+    )
+    .expect("receipt 2");
+    verify_receipt_chain(&r2.intent, &receipt2, &key()).expect("chain 2 ok");
+
+    // Call 3: web_search, parent is receipt2
+    let mut inv3 = invocation("web_search", ToolEffect::ReadOnly);
+    inv3.parent_receipt_digest = Some(receipt2.compute_digest());
+    let r3 = reserve_call(&r2.updated_lease, &key(), Utc::now(), binding(), inv3).expect("call 3");
+    let receipt3 = ToolCallReceipt::complete(
+        &r3.intent,
+        ReceiptOutcome::Succeeded,
+        &json!({"results": 5}),
+        "5 results",
+        Utc::now(),
+        &key(),
+    )
+    .expect("receipt 3");
+    verify_receipt_chain(&r3.intent, &receipt3, &key()).expect("chain 3 ok");
+
+    // Tamper middle receipt — breaks chain.
+    let mut forged_receipt2 = receipt2.clone();
+    forged_receipt2.result_digest = "sha256:broken".into();
+    // Receipt2's own signature is now invalid. Re-sign with a forged signature
+    // won't match the intent either.
+    assert!(verify_receipt_chain(&r2.intent, &forged_receipt2, &key()).is_err());
+}
+
+#[test]
+fn all_authority_change_tools_correctly_classified() {
+    assert_eq!(
+        classify_tool("mcp__semantic_memory__sm_delete_namespace", &json!({})),
+        ToolEffect::AuthorityChange
+    );
+    assert_eq!(
+        classify_tool("mcp__semantic_memory__sm_delete_fact", &json!({})),
+        ToolEffect::AuthorityChange
+    );
+    // Approval-bearing names.
+    assert_eq!(
+        classify_tool("graph_approval_request", &json!({})),
+        ToolEffect::AuthorityChange
+    );
+}
+
+#[test]
+fn unknown_tool_in_restricted_allowlist_fails_closed() {
+    // "*" wildcard allows everything, but a specific allowlist + unknown tool
+    // must fail with ToolNotGranted, not fall through to effect check.
+    let mut restricted = lease();
+    restricted.tool_allowlist = vec!["read_file".into(), "web_search".into()];
+    let signed = issue_lease(restricted, &key()).expect("signed");
+
+    let classified = classify_tool("browser_navigate", &json!({}));
+    // browser_navigate is ExternalEffect, not in allowlist.
+    assert_eq!(classified, ToolEffect::ExternalEffect);
+
+    assert_eq!(
+        reserve_call(
+            &signed,
+            &key(),
+            Utc::now(),
+            binding(),
+            invocation("browser_navigate", ToolEffect::ExternalEffect),
+        )
+        .unwrap_err(),
+        ToolPolicyError::ToolNotGranted
+    );
+}
+
+#[test]
+fn effect_allowlist_must_contain_exact_classification() {
+    // A lease with ReadOnly + RecursiveOrchestration should NOT allow
+    // a tool classified as LocalMutation even if the caller claims ReadOnly.
+    let mut wide = lease();
+    wide.effect_allowlist = vec![ToolEffect::ReadOnly, ToolEffect::RecursiveOrchestration];
+    let signed = issue_lease(wide, &key()).expect("signed");
+
+    // write_file is classified as LocalMutation, not ReadOnly.
+    assert_eq!(
+        reserve_call(
+            &signed,
+            &key(),
+            Utc::now(),
+            binding(),
+            invocation("write_file", ToolEffect::ReadOnly),
+        )
+        .unwrap_err(),
+        ToolPolicyError::EffectClassificationMismatch
+    );
 }
