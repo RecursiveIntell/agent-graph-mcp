@@ -6,6 +6,8 @@
 
 use std::path::PathBuf;
 
+use crate::spec::{validate_max_graphs, DEFAULT_MAX_GRAPHS};
+
 /// Parsed CLI configuration.
 #[derive(Debug, Clone)]
 pub struct CliConfig {
@@ -15,6 +17,7 @@ pub struct CliConfig {
     pub integrity_key_path: Option<PathBuf>,
     pub require_integrity_key: bool,
     pub ephemeral: bool,
+    pub max_graphs: usize,
 }
 
 impl Default for CliConfig {
@@ -26,6 +29,7 @@ impl Default for CliConfig {
             integrity_key_path: None,
             require_integrity_key: false,
             ephemeral: false,
+            max_graphs: DEFAULT_MAX_GRAPHS,
         }
     }
 }
@@ -73,13 +77,13 @@ pub fn parse_proxy_args(args: &[String]) -> Result<ProxyConfig, CliError> {
                 return Err(CliError {
                     message: "agent-graph-mcp [--socket PATH] [--connect-timeout-ms N]".into(),
                     exit_code: 0,
-                })
+                });
             }
             "--version" => {
                 return Err(CliError {
                     message: env!("CARGO_PKG_VERSION").into(),
                     exit_code: 0,
-                })
+                });
             }
             "--socket" => {
                 i += 1;
@@ -96,8 +100,8 @@ pub fn parse_proxy_args(args: &[String]) -> Result<ProxyConfig, CliError> {
                     .parse()
                     .map_err(|_| CliError::new("invalid timeout"))?;
             }
-            "--data-dir" | "--integrity-key" | "--base-url" | "--model" => {
-                return Err(CliError::new("LEGACY_DIRECT_DURABLE_UNSUPPORTED"))
+            "--data-dir" | "--integrity-key" | "--base-url" | "--model" | "--max-graphs" => {
+                return Err(CliError::new("LEGACY_DIRECT_DURABLE_UNSUPPORTED"));
             }
             other => return Err(CliError::new(format!("unknown argument: '{other}'"))),
         }
@@ -161,6 +165,15 @@ pub fn parse_args(args: &[String]) -> Result<CliConfig, CliError> {
             "--ephemeral" => {
                 config.ephemeral = true;
             }
+            "--max-graphs" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| CliError::new("--max-graphs requires a value"))?;
+                let max_graphs = value
+                    .parse::<usize>()
+                    .map_err(|_| CliError::new("--max-graphs must be an integer"))?;
+                config.max_graphs = validate_max_graphs(max_graphs).map_err(CliError::new)?;
+            }
             "--help" => {
                 eprintln!("agent-graph-mcp [OPTIONS]");
                 eprintln!();
@@ -168,11 +181,18 @@ pub fn parse_args(args: &[String]) -> Result<CliConfig, CliError> {
                 eprintln!(
                     "  --base-url <url>         Provider URL (default: http://127.0.0.1:11434)"
                 );
-                eprintln!("  --model <name>           Default model for LLM nodes (default: glm-5.2:cloud)");
+                eprintln!(
+                    "  --model <name>           Default model for LLM nodes (default: glm-5.2:cloud)"
+                );
                 eprintln!("  --data-dir <path>        Persistent storage directory");
                 eprintln!("  --integrity-key <path>   Integrity key file for durable mode");
-                eprintln!("  --require-integrity-key  Fail startup if integrity key is missing/unreadable");
+                eprintln!(
+                    "  --require-integrity-key  Fail startup if integrity key is missing/unreadable"
+                );
                 eprintln!("  --ephemeral              Explicit in-memory mode (no persistence)");
+                eprintln!(
+                    "  --max-graphs <n>         Registered graph capacity (1-1024; default: 64)"
+                );
                 eprintln!("  --help                   Show this help message");
                 return Err(CliError {
                     message: String::new(),
@@ -388,5 +408,23 @@ mod tests {
             config.integrity_key_path,
             Some(PathBuf::from("/tmp/my-key"))
         );
+    }
+
+    #[test]
+    fn test_max_graphs_records_configured_value() {
+        let config = parse_args(&args(&["--max-graphs", "256"])).expect("valid limit");
+        assert_eq!(config.max_graphs, 256);
+    }
+
+    #[test]
+    fn test_zero_max_graphs_is_rejected() {
+        let error = parse_args(&args(&["--max-graphs", "0"])).expect_err("zero is invalid");
+        assert!(error.message.contains("between 1 and"));
+    }
+
+    #[test]
+    fn test_excessive_max_graphs_is_rejected() {
+        let error = parse_args(&args(&["--max-graphs", "1025"])).expect_err("hard cap");
+        assert!(error.message.contains("between 1 and"));
     }
 }

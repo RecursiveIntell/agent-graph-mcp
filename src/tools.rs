@@ -69,6 +69,36 @@ pub struct GraphInspectParams {
     pub graph_id: String,
 }
 
+/// Read-only durable lifecycle inventory. Existing graphs without a record appear as `unclassified`.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GraphRetentionReviewParams {
+    /// Restrict the report to a specific graph ID.
+    #[serde(default)]
+    pub graph_id: Option<String>,
+    /// Optional lifecycle-state filter.
+    #[serde(default)]
+    pub state: Option<String>,
+    /// Maximum report entries (default 100, maximum 256).
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// Set one explicit lifecycle state. Deletion requires delete_candidate followed by delete_approved.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GraphRetentionSetParams {
+    /// Graph ID to classify.
+    pub graph_id: String,
+    /// One of active, pinned, archived, delete_candidate, or delete_approved.
+    pub state: String,
+    /// Why this lifecycle transition is appropriate.
+    pub reason: String,
+    /// Operator or service principal recording the decision.
+    pub actor: String,
+    /// Optional ISO-8601 review deadline.
+    #[serde(default)]
+    pub review_after: Option<String>,
+}
+
 /// Parameters for deleting a graph.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GraphDeleteParams {

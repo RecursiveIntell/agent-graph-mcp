@@ -3,7 +3,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const MAX_GRAPHS: usize = 64;
+/// Historical default for registered graphs when no explicit capacity is configured.
+pub const DEFAULT_MAX_GRAPHS: usize = 64;
+/// Absolute bound for a single daemon instance. This prevents a configuration typo
+/// from silently admitting an unbounded graph registry.
+pub const MAX_GRAPHS_HARD_LIMIT: usize = 1024;
 pub const MAX_GRAPH_BYTES: usize = 64 * 1024;
 pub const MAX_NODES: usize = 128;
 pub const MAX_EDGES: usize = 512;
@@ -11,6 +15,16 @@ pub const MAX_ITERATIONS: usize = 64;
 pub const MAX_INPUT_BYTES: usize = 64 * 1024;
 pub const MAX_OUTPUT_BYTES: usize = 128 * 1024;
 pub const MAX_STATE_BYTES: usize = 2 * 1024 * 1024;
+
+pub fn validate_max_graphs(max_graphs: usize) -> Result<usize, String> {
+    if (1..=MAX_GRAPHS_HARD_LIMIT).contains(&max_graphs) {
+        Ok(max_graphs)
+    } else {
+        Err(format!(
+            "--max-graphs must be between 1 and {MAX_GRAPHS_HARD_LIMIT}"
+        ))
+    }
+}
 
 fn default_version() -> String {
     "1".into()
@@ -123,7 +137,7 @@ impl GraphSpec {
             NodeType::Subgraph => Ok("subgraph"),
             NodeType::HumanApproval => Ok("human_approval"),
             NodeType::External => Err("UNSUPPORTED_NODE_TYPE: external".into()),
-            NodeType::Tool => Err("UNSUPPORTED_NODE_TYPE: tool".into()),
+            NodeType::Tool => Ok("tool"),
             NodeType::Loop => Err("UNSUPPORTED_NODE_TYPE: loop".into()),
         }
     }
@@ -198,10 +212,10 @@ impl GraphSpec {
                 NodeType::Parallel => return Err(format!("node '{}' is parallel", node.id)),
                 NodeType::Subgraph => return Err(format!("node '{}' is a subgraph", node.id)),
                 NodeType::HumanApproval => {
-                    return Err(format!("node '{}' is an approval node", node.id))
+                    return Err(format!("node '{}' is an approval node", node.id));
                 }
                 NodeType::External => {
-                    return Err(format!("node '{}' is an external node", node.id))
+                    return Err(format!("node '{}' is an external node", node.id));
                 }
                 NodeType::Tool => return Err(format!("node '{}' is a tool node", node.id)),
                 NodeType::Loop => return Err(format!("node '{}' is a loop node", node.id)),

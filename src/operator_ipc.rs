@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL: &str = "agent_graph.operator.v1";
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperatorFrame {
     pub protocol: String,
@@ -19,7 +19,7 @@ pub struct OperatorFrame {
     pub decision_material: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperatorResponse {
     pub protocol: String,

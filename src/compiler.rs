@@ -9,9 +9,10 @@ use tokio::sync::Notify;
 
 use crate::nodes::{
     legacy_router, HumanApprovalNode, LlmNode, PassthroughNode, RouterConfig, RouterNode,
-    RunContext, TransformConfig, TransformNode,
+    RunContext, ToolNode, TransformConfig, TransformNode,
 };
 use crate::spec::{GraphSpec, NodeType, ReducerKind};
+use serde_json::Value;
 
 pub struct CompileContext {
     pub base_url: String,
@@ -243,11 +244,46 @@ pub fn compile(spec: &GraphSpec, cx: CompileContext) -> Result<AgentGraph, Strin
                     ctx: run.clone(),
                 })
             }
-            NodeType::External | NodeType::Tool | NodeType::Loop => {
+            NodeType::External | NodeType::Loop => {
                 return Err(format!(
                     "node '{}' is not executable by this local runtime",
                     node.id
                 ));
+            }
+            NodeType::Tool => {
+                let python = node
+                    .config
+                    .get("python")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("python3")
+                    .to_owned();
+                let hermes_source = node
+                    .config
+                    .get("hermes_source")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("/home/sikmindz/.hermes/hermes-agent")
+                    .to_owned();
+                let lease = node.config.get("lease").cloned().unwrap_or(Value::Null);
+                let receipt_dir = node
+                    .config
+                    .get("receipt_dir")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("/tmp/agent-graph-tool-receipts")
+                    .to_owned();
+                let timeout_ms = node
+                    .config
+                    .get("timeout_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(120_000);
+                Box::new(ToolNode {
+                    id: node.id.clone(),
+                    python,
+                    hermes_source,
+                    lease,
+                    receipt_dir,
+                    timeout_ms,
+                    ctx: run.clone(),
+                })
             }
         };
         if let Some(retry) = node.config.get("retry") {
