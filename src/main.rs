@@ -73,10 +73,15 @@ fn run_direct(args: &[String]) {
     });
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async move {
-        let server =
-            AgentGraphServer::new(config.base_url, config.default_model, config.data_dir, key)
-                .map_err(anyhow::Error::msg)
-                .unwrap();
+        let server = AgentGraphServer::new_with_max_graphs(
+            config.base_url,
+            config.default_model,
+            config.data_dir,
+            key,
+            config.max_graphs,
+        )
+        .map_err(anyhow::Error::msg)
+        .unwrap();
         let service = server.serve(rmcp::transport::stdio()).await.unwrap();
         service.waiting().await.unwrap();
     });

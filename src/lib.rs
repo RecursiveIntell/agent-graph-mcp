@@ -8,8 +8,10 @@ pub mod fs_security;
 pub mod lifecycle;
 pub mod migrations;
 pub mod nodes;
+pub mod operator;
 pub mod operator_auth;
 pub mod operator_ipc;
+
 pub mod owner_lock;
 pub mod policy;
 pub mod promotion;
@@ -19,6 +21,7 @@ pub mod server;
 pub mod spec;
 pub mod store;
 pub mod templates;
+pub mod tool_runtime;
 pub mod tools;
 pub mod transport;
 

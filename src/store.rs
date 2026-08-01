@@ -7,6 +7,7 @@ use crate::evidence::{
     digest, hmac_sha256, validate_witness_capture_with_key, verify_witness_record_with_key,
     WitnessCapture, WitnessError, WitnessRecord,
 };
+use crate::operator_auth::OperatorAction;
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
@@ -432,6 +433,81 @@ pub enum GraphDeleteResult {
     Deleted,
     NotFound,
     Referenced,
+    RetentionApprovalRequired,
+    ReferencedBySubgraph,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphRetentionError {
+    NotFound,
+    InvalidState,
+    InvalidTransition,
+    Referenced,
+    ReferencedBySubgraph,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphRetentionRecord {
+    pub graph_id: String,
+    pub state: String,
+    pub reason: String,
+    pub actor: String,
+    pub review_after: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphRetentionReport {
+    pub graph_id: String,
+    pub state: String,
+    pub reason: Option<String>,
+    pub actor: Option<String>,
+    pub review_after: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub version_count: u64,
+    pub execution_count: u64,
+    pub last_execution_at: Option<String>,
+    pub inbound_subgraph_refs: Vec<String>,
+    pub deletion_eligible: bool,
+    pub state_digest: String,
+    pub tombstoned: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct OperatorRetentionRequest {
+    pub request_digest: String,
+    pub action: OperatorAction,
+    pub graph_id: String,
+    pub expected_state_digest: String,
+    pub nonce: String,
+    pub operator_uid: u32,
+    pub daemon_instance_id: String,
+    pub issued_at: String,
+    pub expires_at: String,
+    pub state: Option<String>,
+    pub reason: Option<String>,
+    pub review_after: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperatorRetentionResult {
+    Applied { receipt_id: String },
+    Replayed { receipt_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperatorRetentionError {
+    NotFound,
+    StaleState,
+    NonceReplayed,
+    InvalidAction,
+    InvalidState,
+    InvalidTransition,
+    Referenced,
+    ReferencedBySubgraph,
+    Tombstoned,
+    Persistence,
 }
 
 impl Clone for PersistentStore {
@@ -532,6 +608,40 @@ impl PersistentStore {
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
+
+            CREATE TABLE IF NOT EXISTS graph_retention (
+                graph_name TEXT PRIMARY KEY,
+                state TEXT NOT NULL CHECK(state IN ('active', 'pinned', 'archived', 'delete_candidate', 'delete_approved')),
+                reason TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                review_after TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS graph_tombstones (
+                graph_name TEXT PRIMARY KEY,
+                topology_hash TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                deleted_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS operator_receipts (
+                receipt_id TEXT PRIMARY KEY,
+                request_digest TEXT NOT NULL,
+                action TEXT NOT NULL,
+                resource_kind TEXT NOT NULL,
+                resource_id TEXT NOT NULL,
+                state_digest TEXT NOT NULL,
+                operator_uid INTEGER NOT NULL,
+                daemon_instance_id TEXT NOT NULL,
+                nonce TEXT NOT NULL UNIQUE,
+                issued_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                consumed_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_operator_receipts_nonce ON operator_receipts(nonce);
 
             CREATE TABLE IF NOT EXISTS graph_versions (
                 graph_name TEXT NOT NULL,
@@ -848,6 +958,18 @@ impl PersistentStore {
         overwrite: bool,
     ) -> Result<(), String> {
         let conn = self.conn.lock().map_err(|e| format!("lock error: {e}"))?;
+        let tombstoned: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM graph_tombstones WHERE graph_name = ?1)",
+                params![name],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("graph tombstone check error: {e}"))?;
+        if tombstoned {
+            return Err(format!(
+                "graph '{name}' has a retention tombstone; choose a new graph ID"
+            ));
+        }
         let current: Option<String> = conn
             .query_row(
                 "SELECT topology_hash FROM graphs WHERE name = ?1",
@@ -885,6 +1007,13 @@ impl PersistentStore {
             params![name, spec_json, topology_hash],
         )
         .map_err(|e| format!("save_graph error: {e}"))?;
+        conn.execute(
+            "INSERT INTO graph_retention (graph_name, state, reason, actor)
+             VALUES (?1, 'active', 'created', 'system')
+             ON CONFLICT(graph_name) DO NOTHING",
+            params![name],
+        )
+        .map_err(|e| format!("save graph retention state error: {e}"))?;
         Ok(())
     }
 
@@ -904,7 +1033,9 @@ impl PersistentStore {
     pub fn list_graphs(&self) -> Result<Vec<(String, String, String)>, String> {
         let conn = self.conn.lock().map_err(|e| format!("lock error: {e}"))?;
         let mut stmt = conn
-            .prepare("SELECT name, topology_hash, created_at FROM graphs ORDER BY name")
+            .prepare("SELECT g.name, g.topology_hash, g.created_at FROM graphs AS g
+                      WHERE NOT EXISTS (SELECT 1 FROM graph_tombstones AS t WHERE t.graph_name = g.name)
+                      ORDER BY g.name")
             .map_err(|e| format!("list_graphs error: {e}"))?;
         let rows = stmt
             .query_map([], |row| {
@@ -920,8 +1051,471 @@ impl PersistentStore {
         Ok(rows)
     }
 
+    pub fn graph_is_tombstoned(&self, graph_id: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().map_err(|e| format!("lock error: {e}"))?;
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM graph_tombstones WHERE graph_name = ?1)",
+            params![graph_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("graph tombstone query error: {e}"))
+    }
+
+    fn inbound_subgraph_refs(conn: &Connection, name: &str) -> Result<Vec<String>, String> {
+        let mut stmt = conn
+            .prepare("SELECT name, spec_json FROM graphs WHERE name != ?1")
+            .map_err(|e| format!("subgraph reference query error: {e}"))?;
+        let rows = stmt
+            .query_map(params![name], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| format!("subgraph reference query error: {e}"))?;
+        let mut refs = Vec::new();
+        for row in rows {
+            let (graph_name, spec_json) =
+                row.map_err(|e| format!("subgraph reference row error: {e}"))?;
+            let Ok(spec) = serde_json::from_str::<Value>(&spec_json) else {
+                continue;
+            };
+            let references_target =
+                spec.get("nodes")
+                    .and_then(Value::as_array)
+                    .is_some_and(|nodes| {
+                        nodes.iter().any(|node| {
+                            node.get("type").and_then(Value::as_str) == Some("subgraph")
+                                && node
+                                    .get("config")
+                                    .and_then(|config| config.get("graph_name"))
+                                    .and_then(Value::as_str)
+                                    == Some(name)
+                        })
+                    });
+            if references_target {
+                refs.push(graph_name);
+            }
+        }
+        refs.sort();
+        Ok(refs)
+    }
+
+    pub fn graph_retention_review(
+        &self,
+        graph_id: Option<&str>,
+        state: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<GraphRetentionReport>, String> {
+        let conn = self.conn.lock().map_err(|e| format!("lock error: {e}"))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT g.name, g.created_at, g.updated_at,
+                        r.state, r.reason, r.actor, r.review_after,
+                        COUNT(DISTINCT gv.topology_hash), COUNT(DISTINCT e.run_id),
+                        MAX(COALESCE(e.finished_at, e.started_at))
+                 FROM graphs AS g
+                 LEFT JOIN graph_retention AS r ON r.graph_name = g.name
+                 LEFT JOIN graph_versions AS gv ON gv.graph_name = g.name
+                 LEFT JOIN executions AS e ON e.graph_name = g.name
+                 WHERE (?1 IS NULL OR g.name = ?1)
+                   AND (?2 IS NULL OR COALESCE(r.state, 'unclassified') = ?2)
+                 GROUP BY g.name
+                 ORDER BY g.updated_at ASC, g.name ASC
+                 LIMIT ?3",
+            )
+            .map_err(|e| format!("graph retention review query error: {e}"))?;
+        let rows = stmt
+            .query_map(params![graph_id, state, limit as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                ))
+            })
+            .map_err(|e| format!("graph retention review query error: {e}"))?;
+        let mut reports = Vec::new();
+        for row in rows {
+            let (
+                graph_id,
+                created_at,
+                updated_at,
+                state,
+                reason,
+                actor,
+                review_after,
+                versions,
+                executions,
+                last_execution_at,
+            ) = row.map_err(|e| format!("graph retention review row error: {e}"))?;
+            let inbound_subgraph_refs = Self::inbound_subgraph_refs(&conn, &graph_id)?;
+            let tombstoned: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM graph_tombstones WHERE graph_name = ?1)",
+                    params![&graph_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("graph retention tombstone query error: {e}"))?;
+            let state = state.unwrap_or_else(|| "unclassified".into());
+            let state_digest = digest(&serde_json::json!({
+                "graph_id": graph_id,
+                "state": state,
+                "reason": reason,
+                "actor": actor,
+                "review_after": review_after,
+                "topology_hashes": versions,
+                "execution_count": executions,
+                "last_execution_at": last_execution_at,
+                "inbound_subgraph_refs": inbound_subgraph_refs,
+                "tombstoned": tombstoned,
+            }));
+            reports.push(GraphRetentionReport {
+                graph_id,
+                state,
+                reason,
+                actor,
+                review_after,
+                created_at,
+                updated_at,
+                version_count: versions as u64,
+                execution_count: executions as u64,
+                last_execution_at,
+                deletion_eligible: executions == 0 && inbound_subgraph_refs.is_empty(),
+                inbound_subgraph_refs,
+                state_digest,
+                tombstoned,
+            });
+        }
+        Ok(reports)
+    }
+
+    /// Apply one OS-authenticated retention mutation and its receipt atomically.
+    /// The caller must have already validated peer credentials and the time window.
+    pub fn apply_operator_retention(
+        &self,
+        request: &OperatorRetentionRequest,
+    ) -> Result<OperatorRetentionResult, OperatorRetentionError> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| OperatorRetentionError::Persistence)?;
+
+        let prior: Option<(String, String)> = conn
+            .query_row(
+                "SELECT request_digest, receipt_id FROM operator_receipts WHERE nonce = ?1",
+                params![request.nonce],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|_| OperatorRetentionError::Persistence)?;
+        if let Some((digest, receipt_id)) = prior {
+            if digest == request.request_digest {
+                return Ok(OperatorRetentionResult::Replayed { receipt_id });
+            }
+            return Err(OperatorRetentionError::NonceReplayed);
+        }
+
+        let snapshot: Option<(
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+            i64,
+        )> = conn
+            .query_row(
+                "SELECT COALESCE(r.state, 'unclassified'), r.reason, r.actor, r.review_after,
+                        COUNT(DISTINCT gv.topology_hash), COUNT(DISTINCT e.run_id)
+                 FROM graphs AS g
+                 LEFT JOIN graph_retention AS r ON r.graph_name = g.name
+                 LEFT JOIN graph_versions AS gv ON gv.graph_name = g.name
+                 LEFT JOIN executions AS e ON e.graph_name = g.name
+                 WHERE g.name = ?1
+                 GROUP BY g.name",
+                params![request.graph_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| OperatorRetentionError::Persistence)?;
+        let Some((
+            current_state,
+            current_reason,
+            current_actor,
+            current_review_after,
+            versions,
+            executions,
+        )) = snapshot
+        else {
+            return Err(OperatorRetentionError::NotFound);
+        };
+        let inbound = Self::inbound_subgraph_refs(&conn, &request.graph_id)
+            .map_err(|_| OperatorRetentionError::Persistence)?;
+        let tombstoned: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM graph_tombstones WHERE graph_name = ?1)",
+                params![request.graph_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| OperatorRetentionError::Persistence)?;
+        if tombstoned {
+            return Err(OperatorRetentionError::Tombstoned);
+        }
+        let current_digest = digest(&serde_json::json!({
+            "graph_id": request.graph_id,
+            "state": current_state,
+            "reason": current_reason,
+            "actor": current_actor,
+            "review_after": current_review_after,
+            "topology_hashes": versions,
+            "execution_count": executions,
+            "last_execution_at": serde_json::Value::Null,
+            "inbound_subgraph_refs": inbound,
+            "tombstoned": tombstoned,
+        }));
+        if current_digest != request.expected_state_digest {
+            return Err(OperatorRetentionError::StaleState);
+        }
+        if executions > 0 {
+            return Err(OperatorRetentionError::Referenced);
+        }
+        if !inbound.is_empty() {
+            return Err(OperatorRetentionError::ReferencedBySubgraph);
+        }
+
+        let action = serde_json::to_string(&request.action)
+            .map_err(|_| OperatorRetentionError::InvalidAction)?;
+        let actor = format!("uid:{}", request.operator_uid);
+        let tx = conn
+            .transaction()
+            .map_err(|_| OperatorRetentionError::Persistence)?;
+        match request.action {
+            OperatorAction::SetGraphRetention => {
+                let state = request
+                    .state
+                    .as_deref()
+                    .ok_or(OperatorRetentionError::InvalidState)?;
+                if !matches!(state, "active" | "pinned" | "archived" | "delete_candidate") {
+                    return Err(OperatorRetentionError::InvalidState);
+                }
+                tx.execute(
+                    "INSERT INTO graph_retention (graph_name, state, reason, actor, review_after)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(graph_name) DO UPDATE SET state=excluded.state,
+                       reason=excluded.reason, actor=excluded.actor,
+                       review_after=excluded.review_after, updated_at=datetime('now')",
+                    params![
+                        request.graph_id,
+                        state,
+                        request.reason.as_deref().unwrap_or("operator decision"),
+                        actor,
+                        request.review_after
+                    ],
+                )
+                .map_err(|_| OperatorRetentionError::Persistence)?;
+            }
+            OperatorAction::ApproveGraphDeletion => {
+                if current_state != "delete_candidate" {
+                    return Err(OperatorRetentionError::InvalidTransition);
+                }
+                tx.execute(
+                    "UPDATE graph_retention SET state='delete_approved', updated_at=datetime('now'), actor=?2, reason=?3 WHERE graph_name=?1",
+                    params![request.graph_id, actor, request.reason.as_deref().unwrap_or("operator approval")],
+                )
+                .map_err(|_| OperatorRetentionError::Persistence)?;
+            }
+            OperatorAction::DeleteGraph => {
+                if current_state != "delete_approved" {
+                    return Err(OperatorRetentionError::InvalidTransition);
+                }
+                let topology_hash: String = tx
+                    .query_row(
+                        "SELECT topology_hash FROM graphs WHERE name=?1",
+                        params![request.graph_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| OperatorRetentionError::NotFound)?;
+                tx.execute(
+                    "INSERT INTO graph_tombstones (graph_name, topology_hash, reason, actor)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        request.graph_id,
+                        topology_hash,
+                        request.reason.as_deref().unwrap_or("operator deletion"),
+                        actor
+                    ],
+                )
+                .map_err(|_| OperatorRetentionError::Persistence)?;
+            }
+            _ => return Err(OperatorRetentionError::InvalidAction),
+        }
+
+        let receipt_id = format!(
+            "operator-{}",
+            request.request_digest.trim_start_matches("sha256:")
+        );
+        tx.execute(
+            "INSERT INTO operator_receipts
+             (receipt_id, request_digest, action, resource_kind, resource_id, state_digest,
+              operator_uid, daemon_instance_id, nonce, issued_at, expires_at)
+             VALUES (?1, ?2, ?3, 'graph', ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                receipt_id,
+                request.request_digest,
+                action,
+                request.graph_id,
+                request.expected_state_digest,
+                request.operator_uid,
+                request.daemon_instance_id,
+                request.nonce,
+                request.issued_at,
+                request.expires_at
+            ],
+        )
+        .map_err(|_| OperatorRetentionError::Persistence)?;
+        tx.commit()
+            .map_err(|_| OperatorRetentionError::Persistence)?;
+        Ok(OperatorRetentionResult::Applied { receipt_id })
+    }
+
+    pub fn set_graph_retention(
+        &self,
+        graph_id: &str,
+        state: &str,
+        reason: &str,
+        actor: &str,
+        review_after: Option<&str>,
+    ) -> Result<GraphRetentionRecord, GraphRetentionError> {
+        if !matches!(
+            state,
+            "active" | "pinned" | "archived" | "delete_candidate" | "delete_approved"
+        ) {
+            return Err(GraphRetentionError::InvalidState);
+        }
+        if reason.trim().is_empty() || actor.trim().is_empty() {
+            return Err(GraphRetentionError::InvalidState);
+        }
+        let reports = self
+            .graph_retention_review(Some(graph_id), None, 1)
+            .map_err(|_| GraphRetentionError::NotFound)?;
+        let Some(report) = reports.into_iter().next() else {
+            return Err(GraphRetentionError::NotFound);
+        };
+        if matches!(state, "delete_candidate" | "delete_approved") {
+            if report.execution_count > 0 {
+                return Err(GraphRetentionError::Referenced);
+            }
+            if !report.inbound_subgraph_refs.is_empty() {
+                return Err(GraphRetentionError::ReferencedBySubgraph);
+            }
+        }
+        if state == "delete_approved" && report.state != "delete_candidate" {
+            return Err(GraphRetentionError::InvalidTransition);
+        }
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| GraphRetentionError::NotFound)?;
+        conn.execute(
+            "INSERT INTO graph_retention (graph_name, state, reason, actor, review_after)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(graph_name) DO UPDATE SET
+                 state = excluded.state,
+                 reason = excluded.reason,
+                 actor = excluded.actor,
+                 review_after = excluded.review_after,
+                 updated_at = datetime('now')",
+            params![graph_id, state, reason, actor, review_after],
+        )
+        .map_err(|_| GraphRetentionError::NotFound)?;
+        let updated_at = conn
+            .query_row(
+                "SELECT updated_at FROM graph_retention WHERE graph_name = ?1",
+                params![graph_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| GraphRetentionError::NotFound)?;
+        Ok(GraphRetentionRecord {
+            graph_id: graph_id.into(),
+            state: state.into(),
+            reason: reason.into(),
+            actor: actor.into(),
+            review_after: review_after.map(str::to_owned),
+            updated_at,
+        })
+    }
+
+    pub fn graph_execution_allowed(&self, graph_id: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().map_err(|e| format!("lock error: {e}"))?;
+        let tombstoned: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM graph_tombstones WHERE graph_name = ?1)",
+                params![graph_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("graph tombstone execution check error: {e}"))?;
+        if tombstoned {
+            return Ok(false);
+        }
+        let state: Option<String> = conn
+            .query_row(
+                "SELECT state FROM graph_retention WHERE graph_name = ?1",
+                params![graph_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("graph retention execution check error: {e}"))?;
+        Ok(matches!(
+            state.as_deref(),
+            None | Some("active") | Some("pinned")
+        ))
+    }
+
     pub fn delete_graph(&self, name: &str) -> Result<GraphDeleteResult, String> {
         let mut conn = self.conn.lock().map_err(|e| format!("lock error: {e}"))?;
+        let graph: Option<String> = conn
+            .query_row(
+                "SELECT topology_hash FROM graphs WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("delete_graph graph lookup error: {e}"))?;
+        let Some(topology_hash) = graph else {
+            return Ok(GraphDeleteResult::NotFound);
+        };
+        if !Self::inbound_subgraph_refs(&conn, name)?.is_empty() {
+            return Ok(GraphDeleteResult::ReferencedBySubgraph);
+        }
+        let retention: Option<(String, String, String)> = conn
+            .query_row(
+                "SELECT state, reason, actor FROM graph_retention WHERE graph_name = ?1",
+                params![name],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|e| format!("delete_graph retention lookup error: {e}"))?;
+        if !matches!(
+            retention.as_ref().map(|record| record.0.as_str()),
+            Some("delete_approved")
+        ) {
+            return Ok(GraphDeleteResult::RetentionApprovalRequired);
+        }
+        let (reason, actor) = retention
+            .map(|(_, reason, actor)| (reason, actor))
+            .expect("approved retention state exists");
         let tx = conn
             .transaction()
             .map_err(|e| format!("delete_graph transaction begin error: {e}"))?;
@@ -935,9 +1529,19 @@ impl PersistentStore {
         if referenced {
             return Ok(GraphDeleteResult::Referenced);
         }
-        let affected = tx
-            .execute("DELETE FROM graphs WHERE name = ?1", params![name])
-            .map_err(|e| format!("delete_graph error: {e}"))?;
+        tx.execute(
+            "INSERT INTO graph_tombstones (graph_name, topology_hash, reason, actor)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![name, topology_hash, reason, actor],
+        )
+        .map_err(|e| format!("delete_graph tombstone error: {e}"))?;
+        let affected: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM graphs WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("delete_graph graph presence error: {e}"))?;
         if affected == 0 {
             return Ok(GraphDeleteResult::NotFound);
         }
@@ -948,11 +1552,6 @@ impl PersistentStore {
         {
             return Err("injected graph deletion failure after graph row removal".into());
         }
-        tx.execute(
-            "DELETE FROM graph_versions WHERE graph_name = ?1",
-            params![name],
-        )
-        .map_err(|e| format!("delete_graph versions error: {e}"))?;
         tx.commit()
             .map_err(|e| format!("delete_graph transaction commit error: {e}"))?;
         Ok(GraphDeleteResult::Deleted)
@@ -1973,6 +2572,24 @@ mod tests {
         store
             .save_graph("atomic-delete", "{\"name\":\"atomic-delete\"}", "v1", false)
             .expect("graph");
+        store
+            .set_graph_retention(
+                "atomic-delete",
+                "delete_candidate",
+                "test deletion rollback",
+                "unit-test",
+                None,
+            )
+            .expect("candidate");
+        store
+            .set_graph_retention(
+                "atomic-delete",
+                "delete_approved",
+                "test deletion rollback approved",
+                "unit-test",
+                None,
+            )
+            .expect("approval");
         store.fail_graph_delete_after_graph_row();
         assert!(store.delete_graph("atomic-delete").is_err());
         assert!(store.load_graph("atomic-delete").unwrap().is_some());

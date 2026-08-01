@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Command as StdCommand, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -420,5 +422,206 @@ impl Node for HumanApprovalNode {
                 serde_json::json!({"approval_required": true, "prompt_key": self.prompt_key}),
             ),
         })
+    }
+}
+
+// ── ToolNode ───────────────────────────────────────────────────────────
+
+/// A graph node that spawns the Hermes tools MCP broker as a child process
+/// and invokes tools through MCP JSON-RPC over stdio.
+pub struct ToolNode {
+    pub id: String,
+    pub python: String,
+    pub hermes_source: String,
+    pub lease: Value,
+    pub receipt_dir: String,
+    pub timeout_ms: u64,
+    pub ctx: RunContext,
+}
+
+#[async_trait]
+impl Node for ToolNode {
+    async fn execute(&self, state: &AgentState, _: &GraphConfig) -> Result<NodeOutput> {
+        self.ctx.check()?;
+
+        // Write lease to a temp file the broker can read.
+        let lease_path = format!("{}/lease.json", self.receipt_dir);
+        std::fs::create_dir_all(&self.receipt_dir)
+            .map_err(|e| AgentGraphError::PayloadError(format!("receipt dir: {e}")))?;
+        std::fs::write(
+            &lease_path,
+            serde_json::to_string(&self.lease)
+                .map_err(|e| AgentGraphError::PayloadError(format!("lease serialize: {e}")))?,
+        )
+        .map_err(|e| AgentGraphError::PayloadError(format!("lease write: {e}")))?;
+
+        // Build the read-only tool call from graph state.
+        let tool_name = state
+            .get_opt::<Value>("__tool_name__")
+            .await?
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "read_file".to_owned());
+        let tool_args: Value = state
+            .get_opt::<Value>("__tool_args__")
+            .await?
+            .unwrap_or(Value::Null);
+
+        // Spawn the Hermes MCP broker.
+        let mut child = StdCommand::new(&self.python)
+            .args(["-m", "agent.transports.hermes_tools_mcp_server"])
+            .env("AGENT_GRAPH_LINEAGE", "1")
+            .env("AGENT_GRAPH_LINEAGE_LEASE_PATH", &lease_path)
+            .env("AGENT_GRAPH_LINEAGE_RECEIPT_DIR", &self.receipt_dir)
+            .env("PYTHONPATH", &self.hermes_source)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| AgentGraphError::PayloadError(format!("broker spawn: {e}")))?;
+
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| AgentGraphError::PayloadError("no stdin".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| AgentGraphError::PayloadError("no stdout".into()))?;
+        let stderr = child.stderr.take();
+
+        // MCP initialize handshake.
+        let init_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "agent-graph-tool-node", "version": "0.1"}
+            }
+        });
+        let init_line = serde_json::to_string(&init_req)
+            .map_err(|e| AgentGraphError::PayloadError(format!("init: {e}")))?;
+        writeln!(stdin, "{init_line}")
+            .map_err(|e| AgentGraphError::PayloadError(format!("write init: {e}")))?;
+        stdin
+            .flush()
+            .map_err(|e| AgentGraphError::PayloadError(format!("flush init: {e}")))?;
+
+        let mut reader = BufReader::new(stdout);
+        let mut response = String::new();
+        reader
+            .read_line(&mut response)
+            .map_err(|e| AgentGraphError::PayloadError(format!("read init: {e}")))?;
+
+        // Send initialized notification.
+        let notified = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        });
+        writeln!(
+            stdin,
+            "{}",
+            serde_json::to_string(&notified)
+                .map_err(|e| AgentGraphError::PayloadError(format!("notify: {e}")))?
+        )
+        .map_err(|e| AgentGraphError::PayloadError(format!("write notify: {e}")))?;
+        stdin
+            .flush()
+            .map_err(|e| AgentGraphError::PayloadError(format!("flush notify: {e}")))?;
+
+        // Make the tool call.
+        let call_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": tool_args
+            }
+        });
+        let call_line = serde_json::to_string(&call_req)
+            .map_err(|e| AgentGraphError::PayloadError(format!("call: {e}")))?;
+        writeln!(stdin, "{call_line}")
+            .map_err(|e| AgentGraphError::PayloadError(format!("write call: {e}")))?;
+        stdin
+            .flush()
+            .map_err(|e| AgentGraphError::PayloadError(format!("flush call: {e}")))?;
+
+        response.clear();
+        reader
+            .read_line(&mut response)
+            .map_err(|e| AgentGraphError::PayloadError(format!("read result: {e}")))?;
+
+        // Drop stdin to signal EOF.
+        drop(stdin);
+
+        // Wait for child with timeout.
+        let timeout_dur = std::time::Duration::from_millis(self.timeout_ms);
+        let status = tokio::time::timeout(
+            timeout_dur,
+            tokio::task::spawn_blocking(move || child.wait()),
+        )
+        .await
+        .map_err(|_| AgentGraphError::PayloadError("broker timed out".into()))?
+        .map_err(|e| AgentGraphError::PayloadError(format!("join: {e}")))?
+        .map_err(|e| AgentGraphError::PayloadError(format!("wait: {e}")))?;
+
+        // Capture stderr for diagnostics.
+        let stderr_output = if let Some(stderr) = stderr {
+            let mut buf = String::new();
+            let _ = BufReader::new(stderr).read_line(&mut buf);
+            buf
+        } else {
+            String::new()
+        };
+
+        // Parse MCP response.
+        let result: Value = serde_json::from_str(&response).map_err(|e| {
+            AgentGraphError::PayloadError(format!(
+                "parse result (exit={status:?}, stderr={stderr_output:?}): {e}"
+            ))
+        })?;
+
+        let tool_output = result
+            .get("result")
+            .and_then(|r| r.get("content"))
+            .and_then(|c| c.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|item| item.get("text"))
+            .cloned()
+            .unwrap_or(Value::Null);
+
+        // Check for errors.
+        if let Some(err) = result.get("error") {
+            return Err(AgentGraphError::PayloadError(format!(
+                "tool '{tool_name}' failed: {err}"
+            )));
+        }
+        if !status.success() {
+            return Err(AgentGraphError::PayloadError(format!(
+                "broker exited {status}: {stderr_output}"
+            )));
+        }
+
+        // Read receipt ledger for verification.
+        let ledger_path = format!("{}/ledger.jsonl", self.receipt_dir);
+        let receipt_evidence = if let Ok(contents) = std::fs::read_to_string(&ledger_path) {
+            let receipts: Vec<Value> = contents
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect();
+            receipts.into()
+        } else {
+            Value::Null
+        };
+
+        state
+            .set_raw("__tool_result__", tool_output.clone())
+            .await?;
+        state.set_raw("__tool_receipts__", receipt_evidence).await?;
+        state.set_raw("__tool_success__", Value::Bool(true)).await?;
+
+        Ok(NodeOutput::Done)
     }
 }

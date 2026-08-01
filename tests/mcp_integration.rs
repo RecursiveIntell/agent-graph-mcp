@@ -189,7 +189,9 @@ fn legacy_contract_and_exact_tool_names() {
     assert!(names.contains(&"graph_create"));
     assert!(names.contains(&"graph_execute"));
     assert!(names.contains(&"graph_status"));
-    assert_eq!(names.len(), 25);
+    assert!(names.contains(&"graph_retention_review"));
+    assert!(names.contains(&"graph_retention_set"));
+    assert_eq!(names.len(), 27);
     let created = mcp.call("graph_create", json!({"spec":{"name":"legacy","entry":"a","nodes":[{"id":"a","type":"passthrough"}],"edges":[{"from":"a","to":"END"}]}}));
     assert_eq!(created["graph_id"], "legacy");
     let run = mcp.call(
@@ -199,6 +201,160 @@ fn legacy_contract_and_exact_tool_names() {
     assert_eq!(run["data"]["success"], true);
     assert_eq!(run["data"]["final_state"], json!({"x":1}));
     assert!(run.get("run_id").is_some());
+}
+
+#[test]
+fn configured_graph_capacity_controls_admission_and_status() {
+    let mut mcp = Mcp::new_with_args(&["--direct", "--max-graphs", "1"]);
+    let graph = |name| {
+        json!({
+            "spec": {
+                "name": name,
+                "entry": "node",
+                "nodes": [{"id":"node","type":"passthrough"}],
+                "edges": [{"from":"node","to":"END"}]
+            }
+        })
+    };
+
+    let first = mcp.call("graph_create", graph("capacity-one"));
+    assert_eq!(first["graph_id"], "capacity-one");
+
+    let rejected = mcp.call("graph_create", graph("capacity-two"));
+    assert_eq!(rejected["error_code"], "LIMIT_EXCEEDED");
+    assert_eq!(rejected["error"], "graph limit (1) reached");
+
+    let status = mcp.call("graph_status", json!({"resource":"server"}));
+    assert_eq!(status["data"]["graph_count"], 1);
+    assert_eq!(status["data"]["limits"]["graphs"], 1);
+    assert_eq!(status["data"]["capacity_state"], "within_limit");
+}
+
+#[test]
+fn model_mcp_rejects_lifecycle_mutations_without_deleting_the_graph() {
+    let temp = tempfile::tempdir().expect("temp retention database");
+    let mut mcp = Mcp::new_with_data_dir(temp.path());
+    let spec = json!({
+        "name":"retention-probe",
+        "entry":"node",
+        "nodes":[{"id":"node","type":"passthrough"}],
+        "edges":[{"from":"node","to":"END"}]
+    });
+
+    let created = mcp.call("graph_create", json!({"spec":spec}));
+    assert_eq!(created["ok"], true);
+
+    let review = mcp.call(
+        "graph_retention_review",
+        json!({"graph_id":"retention-probe"}),
+    );
+    assert_eq!(review["ok"], true);
+    assert_eq!(review["data"]["graphs"][0]["state"], "active");
+    assert_eq!(review["data"]["graphs"][0]["execution_count"], 0);
+    assert_eq!(review["data"]["graphs"][0]["deletion_eligible"], true);
+
+    let premature = mcp.call(
+        "graph_create",
+        json!({"action":"delete","graph_id":"retention-probe"}),
+    );
+    assert_eq!(premature["ok"], false);
+    assert_eq!(premature["error_code"], "AUTHENTICATED_OPERATOR_REQUIRED");
+
+    let rejected_retention = mcp.call(
+        "graph_retention_set",
+        json!({
+            "graph_id":"retention-probe",
+            "state":"delete_candidate",
+            "reason":"disposable test graph",
+            "actor":"integration-test"
+        }),
+    );
+    assert_eq!(rejected_retention["ok"], false);
+    assert_eq!(
+        rejected_retention["error_code"],
+        "AUTHENTICATED_OPERATOR_REQUIRED"
+    );
+
+    let rejected_delete = mcp.call(
+        "graph_create",
+        json!({"action":"delete","graph_id":"retention-probe"}),
+    );
+    assert_eq!(rejected_delete["ok"], false);
+    assert_eq!(
+        rejected_delete["error_code"],
+        "AUTHENTICATED_OPERATOR_REQUIRED"
+    );
+
+    let after = mcp.call(
+        "graph_retention_review",
+        json!({"graph_id":"retention-probe"}),
+    );
+    assert_eq!(after["ok"], true);
+    assert_eq!(after["data"]["graphs"][0]["state"], "active");
+    let listed = mcp.call("graph_list", json!({}));
+    assert!(listed["data"]["graphs"]
+        .as_array()
+        .expect("graph list")
+        .iter()
+        .any(|graph| graph["name"] == "retention-probe"));
+}
+
+#[test]
+fn model_mcp_cannot_archive_and_the_active_graph_remains_executable() {
+    let temp = tempfile::tempdir().expect("temp retention database");
+    let mut mcp = Mcp::new_with_data_dir(temp.path());
+    let spec = json!({
+        "name":"archived-probe",
+        "entry":"node",
+        "nodes":[{"id":"node","type":"passthrough"}],
+        "edges":[{"from":"node","to":"END"}]
+    });
+    mcp.call("graph_create", json!({"spec":spec}));
+    let rejected = mcp.call(
+        "graph_retention_set",
+        json!({
+            "graph_id":"archived-probe",
+            "state":"archived",
+            "reason":"kept only for historical inspection",
+            "actor":"integration-test"
+        }),
+    );
+    assert_eq!(rejected["ok"], false);
+    assert_eq!(rejected["error_code"], "AUTHENTICATED_OPERATOR_REQUIRED");
+    let executed = mcp.call(
+        "graph_execute",
+        json!({"graph_id":"archived-probe","input":{"ok":true}}),
+    );
+    assert_eq!(executed["data"]["success"], true);
+}
+
+#[test]
+fn model_mcp_cannot_nominate_an_executed_graph_for_deletion() {
+    let temp = tempfile::tempdir().expect("temp retention database");
+    let mut mcp = Mcp::new_with_data_dir(temp.path());
+    let spec = json!({
+        "name":"executed-probe",
+        "entry":"node",
+        "nodes":[{"id":"node","type":"passthrough"}],
+        "edges":[{"from":"node","to":"END"}]
+    });
+    mcp.call("graph_create", json!({"spec":spec}));
+    let executed = mcp.call(
+        "graph_execute",
+        json!({"graph_id":"executed-probe","input":{}}),
+    );
+    assert_eq!(executed["data"]["success"], true);
+    let candidate = mcp.call(
+        "graph_retention_set",
+        json!({
+            "graph_id":"executed-probe",
+            "state":"delete_candidate",
+            "reason":"must be rejected because execution history exists",
+            "actor":"integration-test"
+        }),
+    );
+    assert_eq!(candidate["ok"], false);
+    assert_eq!(candidate["error_code"], "AUTHENTICATED_OPERATOR_REQUIRED");
 }
 
 #[test]
@@ -1631,9 +1787,9 @@ fn resume_rejects_non_deterministic_or_non_linear_specs() {
     ];
     for (label, spec) in cases {
         let created = mcp.call("graph_create", json!({"spec":spec}));
-        // subgraph and approval are accepted but resume-ineligible.
-        // external and tool are rejected at creation (UNSUPPORTED_NODE_TYPE).
-        if label == "external" || label == "tool" {
+        // subgraph, approval, and tool are accepted but resume-ineligible.
+        // external is rejected at creation (UNSUPPORTED_NODE_TYPE).
+        if label == "external" {
             assert_eq!(
                 created["ok"], false,
                 "{label} graph should be rejected at creation as unsupported node type"
@@ -1744,6 +1900,8 @@ fn daemon_socket_proxy_lifecycle() {
         .arg(dir.path())
         .arg("--socket")
         .arg(&sock)
+        .arg("--max-graphs")
+        .arg("1")
         .env("AGENT_GRAPH_INTEGRITY_KEY_PATH", &key_path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -1819,6 +1977,50 @@ fn daemon_socket_proxy_lifecycle() {
     assert!(names.contains(&"graph_create"));
     assert!(names.contains(&"graph_execute"));
     assert!(names.contains(&"graph_run_start"));
+
+    let graph = |name| {
+        serde_json::json!({
+            "spec": {
+                "name": name,
+                "entry": "node",
+                "nodes": [{"id":"node","type":"passthrough"}],
+                "edges": [{"from":"node","to":"END"}]
+            }
+        })
+    };
+    send_frame(
+        &mut stream,
+        &serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"graph_create","arguments":graph("daemon-capacity-one")}}),
+    );
+    let created = recv_frame(&mut stream);
+    assert_eq!(
+        created["result"]["structuredContent"]["graph_id"],
+        "daemon-capacity-one"
+    );
+
+    send_frame(
+        &mut stream,
+        &serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"graph_create","arguments":graph("daemon-capacity-two")}}),
+    );
+    let rejected = recv_frame(&mut stream);
+    assert_eq!(
+        rejected["result"]["structuredContent"]["error_code"],
+        "LIMIT_EXCEEDED"
+    );
+
+    send_frame(
+        &mut stream,
+        &serde_json::json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"graph_status","arguments":{"resource":"server"}}}),
+    );
+    let status = recv_frame(&mut stream);
+    assert_eq!(
+        status["result"]["structuredContent"]["data"]["limits"]["graphs"],
+        1
+    );
+    assert_eq!(
+        status["result"]["structuredContent"]["data"]["capacity_state"],
+        "within_limit"
+    );
 
     // AG-002: approval tools absent (removed from model tool set)
     assert!(

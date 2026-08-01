@@ -18,7 +18,10 @@ use std::path::PathBuf;
 
 use crate::evidence::{digest, validate_witness_capture, WitnessCapture, WitnessError};
 use crate::run_manager::{initial_state_for_input, RunBudgets, RunManager};
-use crate::spec::{ensure_size, parse_and_validate, GraphSpec, MAX_GRAPHS, MAX_INPUT_BYTES};
+use crate::spec::{
+    ensure_size, parse_and_validate, validate_max_graphs, GraphSpec, DEFAULT_MAX_GRAPHS,
+    MAX_INPUT_BYTES,
+};
 use crate::store::{
     ApprovalError, ApprovalRecord, CheckpointError, CheckpointRecord, GraphDeleteResult,
     PersistentStore,
@@ -198,6 +201,7 @@ pub struct AgentGraphServer {
     graphs: Mutex<HashMap<String, RegisteredGraph>>,
     runs: Mutex<RunManager>,
     store: Option<PersistentStore>,
+    max_graphs: usize,
 }
 
 impl AgentGraphServer {
@@ -215,6 +219,23 @@ impl AgentGraphServer {
         data_dir: Option<PathBuf>,
         integrity_key_path: Option<PathBuf>,
     ) -> Result<Self, String> {
+        Self::new_with_max_graphs(
+            base_url,
+            default_model,
+            data_dir,
+            integrity_key_path,
+            DEFAULT_MAX_GRAPHS,
+        )
+    }
+
+    pub fn new_with_max_graphs(
+        base_url: String,
+        default_model: String,
+        data_dir: Option<PathBuf>,
+        integrity_key_path: Option<PathBuf>,
+        max_graphs: usize,
+    ) -> Result<Self, String> {
+        let max_graphs = validate_max_graphs(max_graphs)?;
         let store = match data_dir {
             Some(ref dir) => Some(PersistentStore::open_with_integrity_key(
                 dir,
@@ -232,6 +253,7 @@ impl AgentGraphServer {
             graphs: Mutex::new(HashMap::new()),
             runs: Mutex::new(RunManager::default()),
             store,
+            max_graphs,
             tool_router: Self::tool_router(),
         };
 
@@ -441,6 +463,20 @@ impl AgentGraphServer {
                     return Ok(error_output(
                         format!("graph '{graph_id}' is referenced by a durable execution"),
                         "GRAPH_REFERENCED",
+                    ));
+                }
+                GraphDeleteResult::ReferencedBySubgraph => {
+                    return Ok(error_output(
+                        format!(
+                            "graph '{graph_id}' is referenced by another graph's subgraph node"
+                        ),
+                        "GRAPH_SUBGRAPH_REFERENCED",
+                    ));
+                }
+                GraphDeleteResult::RetentionApprovalRequired => {
+                    return Ok(error_output(
+                        format!("graph '{graph_id}' requires delete_candidate then delete_approved retention states"),
+                        "RETENTION_APPROVAL_REQUIRED",
                     ));
                 }
                 GraphDeleteResult::NotFound => {
@@ -689,12 +725,15 @@ impl AgentGraphServer {
             }
         }
 
-        // ── delete ──
+        // Lifecycle deletion is never model-authorized. The authenticated
+        // operator IPC service is the sole mutation boundary and must perform
+        // its own request, peer, nonce, and state-digest validation before it
+        // reaches `delete_registered_graph`.
         if action == "delete" {
-            let id = graph_id
-                .as_deref()
-                .ok_or_else(|| invalid_params("missing graph_id for delete action"))?;
-            return self.delete_registered_graph(id);
+            return Ok(error_output(
+                "graph lifecycle deletion requires the authenticated operator service",
+                "AUTHENTICATED_OPERATOR_REQUIRED",
+            ));
         }
 
         if action != "create" && action != "validate" {
@@ -805,9 +844,9 @@ impl AgentGraphServer {
             .map_err(|e| internal_error(e.to_string()))?;
         let name = spec_parsed.name.clone();
         let overwrite = overwrite.unwrap_or(false);
-        if !overwrite && !graphs.contains_key(&name) && graphs.len() >= MAX_GRAPHS {
+        if !overwrite && !graphs.contains_key(&name) && graphs.len() >= self.max_graphs {
             return Ok(error_output(
-                format!("graph limit ({MAX_GRAPHS}) reached"),
+                format!("graph limit ({}) reached", self.max_graphs),
                 "LIMIT_EXCEEDED",
             ));
         }
@@ -873,6 +912,17 @@ impl AgentGraphServer {
     ) -> Result<Json<StructuredOutput>, ErrorData> {
         let input = input.unwrap_or(Value::Null);
         ensure_size(&input, MAX_INPUT_BYTES, "execution input").map_err(|e| invalid_params(e))?;
+        if let Some(store) = self.store.as_ref() {
+            if !store
+                .graph_execution_allowed(&graph_id)
+                .map_err(internal_error)?
+            {
+                return Ok(error_output(
+                    format!("graph '{graph_id}' is archived or pending deletion"),
+                    "GRAPH_RETIRED",
+                ));
+            }
+        }
 
         let graph = self.resolve_graph(&graph_id, graph_version.as_deref())?;
 
@@ -1197,7 +1247,12 @@ impl AgentGraphServer {
                     "hitl": if durable_integrity { "checkpoint_bound_durable_approval_only" } else { "unavailable" },
                     "replay": "integrity_only"
                 },
-                "limits": {"graphs": MAX_GRAPHS}
+                "limits": {"graphs": self.max_graphs},
+                "capacity_state": if graphs.len() <= self.max_graphs {
+                    "within_limit"
+                } else {
+                    "over_limit_legacy"
+                }
             })));
         }
 
@@ -1316,10 +1371,16 @@ impl AgentGraphServer {
         let mut entries: Vec<Value> = graphs
             .iter()
             .filter(|(name, _)| {
+                let visible = self
+                    .store
+                    .as_ref()
+                    .map(|store| store.graph_is_tombstoned(name).map(|v| !v).unwrap_or(false))
+                    .unwrap_or(true);
                 query
                     .as_ref()
                     .map(|q| name.contains(q.as_str()))
                     .unwrap_or(true)
+                    && visible
             })
             .take(limit.unwrap_or(50) as usize)
             .map(|(name, g)| {
@@ -1352,6 +1413,78 @@ impl AgentGraphServer {
             "graphs": entries,
             "count": entries.len(),
         })))
+    }
+
+    #[tool(
+        description = "Read a durable graph retention inventory with execution, version, and inbound-subgraph reference counts. This tool never changes graph state."
+    )]
+    fn graph_retention_review(
+        &self,
+        Parameters(GraphRetentionReviewParams {
+            graph_id,
+            state,
+            limit,
+        }): Parameters<GraphRetentionReviewParams>,
+    ) -> Result<Json<StructuredOutput>, ErrorData> {
+        let Some(store) = self.store.as_ref() else {
+            return Ok(error_output(
+                "SQLite persistence is required for graph retention review",
+                "RETENTION_STORE_REQUIRED",
+            ));
+        };
+        let reports = store
+            .graph_retention_review(
+                graph_id.as_deref(),
+                state.as_deref(),
+                limit.unwrap_or(100).clamp(1, 256) as usize,
+            )
+            .map_err(internal_error)?;
+        let graphs: Vec<Value> = reports
+            .into_iter()
+            .map(|report| {
+                serde_json::json!({
+                    "graph_id": report.graph_id,
+                    "state": report.state,
+                    "reason": report.reason,
+                    "actor": report.actor,
+                    "review_after": report.review_after,
+                    "created_at": report.created_at,
+                    "updated_at": report.updated_at,
+                    "version_count": report.version_count,
+                    "execution_count": report.execution_count,
+                    "last_execution_at": report.last_execution_at,
+                    "state_digest": report.state_digest,
+                    "tombstoned": report.tombstoned,
+                    "inbound_subgraph_refs": report.inbound_subgraph_refs,
+                    "deletion_eligible": report.deletion_eligible,
+                })
+            })
+            .collect();
+        Ok(structured_output(serde_json::json!({
+            "graphs": graphs,
+            "count": graphs.len(),
+            "storage_class": "sqlite_graph_retention",
+        })))
+    }
+
+    #[tool(
+        description = "Set an explicit durable graph lifecycle state. delete_approved requires a prior delete_candidate state and no execution or inbound-subgraph references."
+    )]
+    fn graph_retention_set(
+        &self,
+        Parameters(GraphRetentionSetParams {
+            graph_id,
+            state,
+            reason,
+            actor,
+            review_after,
+        }): Parameters<GraphRetentionSetParams>,
+    ) -> Result<Json<StructuredOutput>, ErrorData> {
+        let _ = (graph_id, state, reason, actor, review_after);
+        Ok(error_output(
+            "graph lifecycle updates require the authenticated operator service",
+            "AUTHENTICATED_OPERATOR_REQUIRED",
+        ))
     }
 
     // ── graph_delete (NEW) ────────────────────────────────────────────
@@ -2036,7 +2169,7 @@ impl AgentGraphServer {
                 return Ok(error_output(
                     "checkpoint graph is no longer in the deterministic local resume subset",
                     "RESUME_INELIGIBLE",
-                ))
+                ));
             }
         };
         if checkpoint.next_node_cursor != eligibility.next_node_cursor

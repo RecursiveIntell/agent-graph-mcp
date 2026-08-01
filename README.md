@@ -30,9 +30,11 @@ agent-graph-mcp --direct --base-url http://127.0.0.1:11434 --model glm-5.2:cloud
 ### Daemon mode (production)
 
 ```bash
-agent-graph-mcpd --data-dir ~/.local/share/agent-graph --socket /tmp/agent-graph.sock &
+agent-graph-mcpd --data-dir ~/.local/share/agent-graph --socket /tmp/agent-graph.sock --max-graphs 256 &
 agent-graph-mcp --socket /tmp/agent-graph.sock
 ```
+
+`--max-graphs` is a per-daemon registration capacity. It defaults to 64 and accepts values from 1 through 1024. Set it explicitly for a durable store whose registered graph count exceeds the historical default. `graph_status` reports both the effective limit and `capacity_state`; an `over_limit_legacy` state preserves existing durable graphs but rejects new registrations until the configured limit is raised or registrations are retired.
 
 ## Client configs
 

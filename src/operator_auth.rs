@@ -9,6 +9,8 @@ pub enum OperatorAction {
     Approve,
     Reject,
     DeleteGraph,
+    SetGraphRetention,
+    ApproveGraphDeletion,
     PromoteTemplate,
     Migrate,
     Install,
