@@ -198,6 +198,10 @@ pub struct AgentGraphServer {
     tool_router: ToolRouter<Self>,
     base_url: String,
     default_model: String,
+    /// Provider API key for http(s) llm-pipeline calls. Attached as a Bearer
+    /// header only for the http(s) path; the codex-app-server:// path carries no
+    /// auth. Never serialized into status, receipts, or logs.
+    api_key: Option<String>,
     graphs: Mutex<HashMap<String, RegisteredGraph>>,
     runs: Mutex<RunManager>,
     store: Option<PersistentStore>,
@@ -235,6 +239,24 @@ impl AgentGraphServer {
         integrity_key_path: Option<PathBuf>,
         max_graphs: usize,
     ) -> Result<Self, String> {
+        Self::new_with_max_graphs_and_key(
+            base_url,
+            default_model,
+            data_dir,
+            integrity_key_path,
+            max_graphs,
+            None,
+        )
+    }
+
+    pub fn new_with_max_graphs_and_key(
+        base_url: String,
+        default_model: String,
+        data_dir: Option<PathBuf>,
+        integrity_key_path: Option<PathBuf>,
+        max_graphs: usize,
+        api_key: Option<String>,
+    ) -> Result<Self, String> {
         let max_graphs = validate_max_graphs(max_graphs)?;
         let store = match data_dir {
             Some(ref dir) => Some(PersistentStore::open_with_integrity_key(
@@ -247,11 +269,13 @@ impl AgentGraphServer {
             store.recover_incomplete_executions()?;
         }
 
+        let runs = RunManager::default().with_api_key(api_key.clone());
         let server = Self {
             base_url,
             default_model,
+            api_key,
             graphs: Mutex::new(HashMap::new()),
-            runs: Mutex::new(RunManager::default()),
+            runs: Mutex::new(runs),
             store,
             max_graphs,
             tool_router: Self::tool_router(),
@@ -1225,6 +1249,7 @@ impl AgentGraphServer {
                 "capabilities": {
                     "runtime": "agent_graph",
                     "async_start": true,
+                    "api_key_configured": self.api_key.is_some(),
                     "cancellation": "provider_future_best_effort_drop; underlying_request_may_continue",
                     "durable_resume": if durable_integrity {
                         Value::String("deterministic_local_resume_only".into())

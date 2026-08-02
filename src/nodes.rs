@@ -89,6 +89,8 @@ pub struct LlmNode {
     pub id: String,
     pub base_url: String,
     pub default_model: String,
+    /// Provider API key for http(s) llm-pipeline calls (Bearer header).
+    pub api_key: Option<String>,
     pub prompt: String,
     pub model: Option<String>,
     pub json_mode: bool,
@@ -146,7 +148,25 @@ impl Node for LlmNode {
                 .with_model(model)
                 .with_timeout(std::time::Duration::from_millis(self.timeout_ms))
                 .with_config(config);
-            let exec_ctx = ExecCtx::builder(&self.base_url).build();
+            let mut exec_builder = ExecCtx::builder(&self.base_url);
+            if let Some(key) = self.api_key.as_deref() {
+                // Attach the provider key as a Bearer header on the http(s)
+                // llm-pipeline path only. The key is never logged or echoed.
+                let mut headers = reqwest::header::HeaderMap::new();
+                let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))
+                    .map_err(|e| {
+                        AgentGraphError::PayloadError(format!("invalid api key header: {e}"))
+                    })?;
+                headers.insert(reqwest::header::AUTHORIZATION, value);
+                let client = reqwest::Client::builder()
+                    .default_headers(headers)
+                    .build()
+                    .map_err(|e| {
+                        AgentGraphError::PayloadError(format!("http client build failed: {e}"))
+                    })?;
+                exec_builder = exec_builder.client(client);
+            }
+            let exec_ctx = exec_builder.build();
             tokio::select! {
                 result = call.invoke(&exec_ctx, input) => result
                     .map_err(|e| AgentGraphError::PayloadError(e.to_string()))

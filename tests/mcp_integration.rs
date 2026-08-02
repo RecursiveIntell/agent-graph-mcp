@@ -36,6 +36,22 @@ impl Mcp {
         data_dir: &std::path::Path,
         fake_codex_bin_dir: &std::path::Path,
     ) -> Self {
+        Self::spawn_with_fake_codex(data_dir, fake_codex_bin_dir, None)
+    }
+
+    fn new_with_data_dir_fake_codex_and_api_key(
+        data_dir: &std::path::Path,
+        fake_codex_bin_dir: &std::path::Path,
+        api_key: &str,
+    ) -> Self {
+        Self::spawn_with_fake_codex(data_dir, fake_codex_bin_dir, Some(api_key))
+    }
+
+    fn spawn_with_fake_codex(
+        data_dir: &std::path::Path,
+        fake_codex_bin_dir: &std::path::Path,
+        api_key: Option<&str>,
+    ) -> Self {
         let key_path = test_integrity_key();
         let mut paths = vec![fake_codex_bin_dir.to_path_buf()];
         paths.extend(std::env::split_paths(
@@ -47,7 +63,8 @@ impl Mcp {
         // only reachable through the daemon entrypoint (the direct CLI rejects
         // non-http(s) schemes), matching the production topology exactly.
         let socket = data_dir.join("run").join("mcp.sock");
-        let daemon = Command::new(env!("CARGO_BIN_EXE_agent-graph-mcpd"))
+        let mut daemon_cmd = Command::new(env!("CARGO_BIN_EXE_agent-graph-mcpd"));
+        daemon_cmd
             .args([
                 "--data-dir",
                 data_dir.to_str().expect("UTF-8 temp path"),
@@ -62,9 +79,11 @@ impl Mcp {
             .env("PATH", &path_env)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("daemon spawn");
+            .stderr(Stdio::null());
+        if let Some(api_key) = api_key {
+            daemon_cmd.args(["--api-key", api_key]);
+        }
+        let daemon = daemon_cmd.spawn().expect("daemon spawn");
         let mut connected = false;
         for _ in 0..200 {
             // A leftover socket file from a previous daemon can exist without a
@@ -466,6 +485,44 @@ fn live_run_receipt_uses_canonical_wrapper_shape() {
         data["receipt"]["terminal_output"]["state_key"], "answer",
         "{receipt}"
     );
+}
+
+#[test]
+fn daemon_accepts_api_key_flag_and_reports_it_configured() {
+    let temp = tempfile::tempdir().expect("fake codex workspace");
+    let data_dir = temp.path().join("graph-data");
+    let fake_codex_bin_dir = fake_codex_bin_dir(temp.path());
+    let mut mcp = Mcp::new_with_data_dir_fake_codex_and_api_key(
+        &data_dir,
+        &fake_codex_bin_dir,
+        "test-secret-key",
+    );
+    let status = mcp.call("graph_status", json!({"resource":"server"}));
+    assert_eq!(
+        status["data"]["capabilities"]["api_key_configured"], true,
+        "{status}"
+    );
+    // The secret must never appear in any server-visible surface.
+    assert!(
+        !status.to_string().contains("test-secret-key"),
+        "api key leaked into graph_status: {status}"
+    );
+    mcp.call("graph_create", json!({"spec":{
+        "name":"api-key-graph", "entry":"ask", "output_key":"answer",
+        "nodes":[{"id":"ask","type":"llm","model":"fake-model","prompt":"reply","config":{"output_key":"answer","timeout_ms":2_000}}],
+        "edges":[{"from":"ask","to":"END"}]
+    }}));
+    let started = mcp.call(
+        "graph_run_start",
+        json!({"graph_id":"api-key-graph","input":{"request":"key"}}),
+    );
+    let run_id = started["run_id"].as_str().expect("run id").to_owned();
+    let completed = mcp.call(
+        "graph_run_wait",
+        json!({"run_id":run_id,"timeout_ms":5_000}),
+    );
+    assert_eq!(completed["data"]["status"], "completed", "{completed}");
+    assert_eq!(completed["data"]["budget_counters"]["llm_calls"], 1);
 }
 
 #[test]

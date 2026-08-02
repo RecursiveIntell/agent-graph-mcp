@@ -26,6 +26,8 @@ pub struct CompileContext {
     pub llm_calls: Arc<AtomicU64>,
     pub max_llm_calls: Option<u64>,
     pub llm_invocations: Arc<Mutex<Vec<Value>>>,
+    /// Provider API key for http(s) llm-pipeline calls (Bearer header).
+    pub api_key: Option<String>,
 }
 
 struct Collector(Arc<Mutex<Vec<GraphEvent>>>);
@@ -74,6 +76,7 @@ pub fn compile(spec: &GraphSpec, cx: CompileContext) -> Result<AgentGraph, Strin
                     id: node.id.clone(),
                     base_url: cx.base_url.clone(),
                     default_model: cx.default_model.clone(),
+                    api_key: cx.api_key.clone(),
                     prompt: node
                         .prompt
                         .clone()

@@ -31,6 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut max_graphs = DEFAULT_MAX_GRAPHS;
     let mut operator_socket: Option<PathBuf> = None;
     let mut operator_uid: Option<u32> = None;
+    let mut api_key: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -38,6 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--socket" => socket = PathBuf::from(args.next().ok_or("missing socket")?),
             "--base-url" => base_url = args.next().ok_or("missing base URL")?,
             "--model" => model = args.next().ok_or("missing model")?,
+            "--api-key" => api_key = Some(args.next().ok_or("missing api key")?),
             "--max-graphs" => {
                 let value = args.next().ok_or("missing max graph count")?;
                 let parsed = value
@@ -58,7 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--help" => {
                 println!(
-                    "agent-graph-mcpd --data-dir PATH --socket PATH [--base-url URL] [--model NAME] [--max-graphs N] [--operator-socket PATH --operator-uid UID]"
+                    "agent-graph-mcpd --data-dir PATH --socket PATH [--base-url URL] [--model NAME] [--api-key KEY] [--max-graphs N] [--operator-socket PATH --operator-uid UID]"
                 );
                 return Ok(());
             }
@@ -95,6 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = data.clone();
     let provider_url = base_url.clone();
     let default_model = model.clone();
+    let api_key_for_runtime = api_key.clone();
     let operator_socket_for_runtime = operator_socket.clone();
     let operator_uid_for_runtime = operator_uid;
     let daemon_instance_id = id.instance_id.clone();
@@ -154,6 +157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let key_path = key_path.clone();
                 let provider_url = provider_url.clone();
                 let default_model = default_model.clone();
+                let api_key = api_key_for_runtime.clone();
                 let max_graphs = max_graphs;
                 tokio::spawn(async move {
                     let _ = serve_connection(
@@ -162,6 +166,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         key_path.as_deref(),
                         &provider_url,
                         &default_model,
+                        api_key,
                         max_graphs,
                     )
                     .await;
@@ -178,6 +183,7 @@ async fn serve_connection(
     key_path: Option<&std::path::Path>,
     provider_url: &str,
     default_model: &str,
+    api_key: Option<String>,
     max_graphs: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (mut sock_rx, mut sock_tx) = stream.into_split();
@@ -242,12 +248,13 @@ async fn serve_connection(
     });
 
     // Create server and serve on rmcp_side of the duplex
-    let server = AgentGraphServer::new_with_max_graphs(
+    let server = AgentGraphServer::new_with_max_graphs_and_key(
         provider_url.to_string(),
         default_model.to_string(),
         Some(data_dir.to_path_buf()),
         key_path.map(|p| p.to_path_buf()),
         max_graphs,
+        api_key,
     )
     .map_err(std::io::Error::other)?;
 
