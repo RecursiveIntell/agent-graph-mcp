@@ -2410,8 +2410,21 @@ impl AgentGraphServer {
             .map_err(|e| internal_error(e.to_string()))?
             .get(&run_id)
         {
+            // Canonical wrapper: identical shape to the durable read-back, so
+            // consumers always read data.receipt. The HMAC receipt_digest is a
+            // persistence artifact, so it is null until the terminal projection
+            // is durably stored; storage_class marks the live-resident path.
             return Ok(output_with_meta(
-                r.receipt.clone(),
+                serde_json::json!({
+                    "receipt": r.receipt.clone(),
+                    "receipt_digest": Value::Null,
+                    "storage_class": "volatile_live",
+                    "replay_capability": r
+                        .receipt
+                        .get("replay_capability")
+                        .and_then(Value::as_str)
+                        .unwrap_or("integrity_only"),
+                }),
                 None,
                 None,
                 Some(&run_id),

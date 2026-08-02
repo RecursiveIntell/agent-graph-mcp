@@ -430,6 +430,45 @@ fn durable_llm_receipt_preserves_typed_invocation_and_terminal_provenance_after_
 }
 
 #[test]
+fn live_run_receipt_uses_canonical_wrapper_shape() {
+    let temp = tempfile::tempdir().expect("fake codex workspace");
+    let data_dir = temp.path().join("graph-data");
+    let fake_codex_bin_dir = fake_codex_bin_dir(temp.path());
+    let mut mcp = Mcp::new_with_data_dir_and_fake_codex(&data_dir, &fake_codex_bin_dir);
+    mcp.call("graph_create", json!({"spec":{
+        "name":"live-receipt-shape", "entry":"ask", "output_key":"answer",
+        "nodes":[{"id":"ask","type":"llm","model":"fake-model","prompt":"reply","config":{"output_key":"answer","timeout_ms":2_000}}],
+        "edges":[{"from":"ask","to":"END"}]
+    }}));
+    let started = mcp.call(
+        "graph_run_start",
+        json!({"graph_id":"live-receipt-shape","input":{"request":"shape"}}),
+    );
+    let run_id = started["run_id"].as_str().expect("run id").to_owned();
+    let completed = mcp.call(
+        "graph_run_wait",
+        json!({"run_id":run_id,"timeout_ms":5_000}),
+    );
+    assert_eq!(completed["data"]["status"], "completed", "{completed}");
+    let receipt = mcp.call("graph_run_receipt", json!({"run_id":run_id}));
+    let data = &receipt["data"];
+    assert_eq!(data["storage_class"], "volatile_live", "{receipt}");
+    assert!(data["receipt_digest"].is_null(), "{receipt}");
+    assert_eq!(
+        data["receipt"]["schema"], "agent-graph-mcp-receipt-v2",
+        "{receipt}"
+    );
+    assert_eq!(
+        data["receipt"]["budget_counters"]["llm_calls"], 1,
+        "{receipt}"
+    );
+    assert_eq!(
+        data["receipt"]["terminal_output"]["state_key"], "answer",
+        "{receipt}"
+    );
+}
+
+#[test]
 fn legacy_contract_and_exact_tool_names() {
     let mut mcp = Mcp::new();
     let list = mcp.request("tools/list", json!({}));
