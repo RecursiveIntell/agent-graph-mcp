@@ -1,5 +1,6 @@
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::OnceLock;
 
 use rusqlite::Connection;
@@ -7,8 +8,10 @@ use serde_json::{json, Value};
 
 struct Mcp {
     child: Child,
+    daemon: Option<Child>,
     input: ChildStdin,
     output: BufReader<ChildStdout>,
+    stderr: ChildStderr,
     id: u64,
 }
 
@@ -27,6 +30,66 @@ impl Mcp {
             ],
             Some(key_path),
         )
+    }
+
+    fn new_with_data_dir_and_fake_codex(
+        data_dir: &std::path::Path,
+        fake_codex_bin_dir: &std::path::Path,
+    ) -> Self {
+        let key_path = test_integrity_key();
+        let mut paths = vec![fake_codex_bin_dir.to_path_buf()];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        let path_env = std::env::join_paths(paths).expect("valid fake-codex PATH");
+
+        // Deterministic daemon+proxy topology: the codex-app-server:// scheme is
+        // only reachable through the daemon entrypoint (the direct CLI rejects
+        // non-http(s) schemes), matching the production topology exactly.
+        let socket = data_dir.join("run").join("mcp.sock");
+        let daemon = Command::new(env!("CARGO_BIN_EXE_agent-graph-mcpd"))
+            .args([
+                "--data-dir",
+                data_dir.to_str().expect("UTF-8 temp path"),
+                "--socket",
+                socket.to_str().expect("UTF-8 socket path"),
+                "--base-url",
+                "codex-app-server://",
+                "--model",
+                "fake-model",
+            ])
+            .env("AGENT_GRAPH_INTEGRITY_KEY_PATH", key_path)
+            .env("PATH", &path_env)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("daemon spawn");
+        let mut connected = false;
+        for _ in 0..200 {
+            // A leftover socket file from a previous daemon can exist without a
+            // listener; only a successful connect proves the daemon is ready.
+            match std::os::unix::net::UnixStream::connect(&socket) {
+                Ok(_) => {
+                    connected = true;
+                    break;
+                }
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            }
+        }
+        assert!(
+            connected,
+            "daemon socket {socket:?} did not accept connections; daemon may have failed to start"
+        );
+
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agent-graph-mcp"));
+        command
+            .args(["--socket", socket.to_str().expect("UTF-8 socket path")])
+            .env("AGENT_GRAPH_INTEGRITY_KEY_PATH", key_path)
+            .env("PATH", &path_env);
+        let mut mcp = Self::from_command(command);
+        mcp.daemon = Some(daemon);
+        mcp
     }
 
     fn new_with_args(args: &[&str]) -> Self {
@@ -58,15 +121,18 @@ impl Mcp {
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
         let input = child.stdin.take().unwrap();
         let output = BufReader::new(child.stdout.take().unwrap());
+        let stderr = child.stderr.take().unwrap();
         let mut mcp = Self {
             child,
+            daemon: None,
             input,
             output,
+            stderr,
             id: 0,
         };
         let _ = mcp.request(
@@ -98,7 +164,18 @@ impl Mcp {
         self.input.flush().unwrap();
         loop {
             let mut line = String::new();
-            self.output.read_line(&mut line).unwrap();
+            let read = match self.output.read_line(&mut line) {
+                Ok(read) => read,
+                Err(error) => self.fail_with_child_diagnostics(&format!(
+                    "stdout read error for {method}: {error}"
+                )),
+            };
+            if read == 0 {
+                self.fail_with_child_diagnostics(&format!(
+                    "MCP child stdout closed (EOF) before the response to {method} id={} arrived",
+                    self.id
+                ));
+            }
             if line.trim().is_empty() {
                 continue;
             }
@@ -107,6 +184,27 @@ impl Mcp {
                 return parsed;
             }
         }
+    }
+
+    /// Kill the child, drain bounded stderr, and panic with a diagnostic.
+    /// Prevents silent infinite loops when the MCP child exits early.
+    fn fail_with_child_diagnostics(&mut self, context: &str) -> ! {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let mut stderr = String::new();
+        let _ = self.stderr.read_to_string(&mut stderr);
+        let tail = stderr
+            .chars()
+            .rev()
+            .take(4000)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<String>();
+        panic!(
+            "{context}\nchild exit status: {:?}\nchild stderr tail:\n{tail}",
+            self.child.try_wait()
+        );
     }
 
     fn call(&mut self, name: &str, arguments: Value) -> Value {
@@ -170,10 +268,165 @@ fn test_integrity_key() -> &'static std::path::Path {
     path
 }
 
+fn fake_codex_bin_dir(root: &std::path::Path) -> std::path::PathBuf {
+    let bin_dir = root.join("fake-codex-bin");
+    std::fs::create_dir_all(&bin_dir).expect("fake codex directory");
+    let fake_codex = bin_dir.join("codex");
+    std::fs::write(
+        &fake_codex,
+        r##"#!/bin/sh
+read line
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+read line
+read line
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"thread":{"id":"thread-test"}}}'
+read line
+printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"turn":{"id":"turn-test"}}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"delta":"deterministic LLM output"}}'
+printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"turn":{"id":"turn-test"}}}'
+"##,
+    )
+    .expect("fake codex script");
+    std::fs::set_permissions(&fake_codex, std::fs::Permissions::from_mode(0o700))
+        .expect("fake codex mode");
+    bin_dir
+}
+
 impl Drop for Mcp {
     fn drop(&mut self) {
         let _ = self.child.kill();
+        if let Some(mut daemon) = self.daemon.take() {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+        }
     }
+}
+
+#[test]
+fn successful_llm_run_counts_preinvocation_attempt() {
+    let temp = tempfile::tempdir().expect("fake codex workspace");
+    let data_dir = temp.path().join("graph-data");
+    let fake_codex_bin_dir = fake_codex_bin_dir(temp.path());
+    let mut mcp = Mcp::new_with_data_dir_and_fake_codex(&data_dir, &fake_codex_bin_dir);
+    let created = mcp.call(
+        "graph_create",
+        json!({"spec":{
+            "name":"count-llm-attempt", "entry":"ask", "output_key":"answer",
+            "nodes":[{"id":"ask","type":"llm","model":"fake-model","prompt":"reply","config":{"output_key":"answer","timeout_ms":2_000}}],
+            "edges":[{"from":"ask","to":"END"}]
+        }}),
+    );
+    assert_eq!(created["ok"], true, "{created}");
+
+    let started = mcp.call(
+        "graph_run_start",
+        json!({"graph_id":"count-llm-attempt","input":{"request":"count one call"}}),
+    );
+    assert_eq!(started["ok"], true, "{started}");
+    let run_id = started["run_id"].as_str().expect("run id").to_owned();
+    let completed = mcp.call(
+        "graph_run_wait",
+        json!({"run_id":run_id,"timeout_ms":5_000}),
+    );
+    let data = &completed["data"];
+    assert_eq!(data["status"], "completed", "{completed}");
+    assert_eq!(data["state"]["answer"], "deterministic LLM output");
+    assert_eq!(data["final_state"], "deterministic LLM output");
+    assert_eq!(data["budget_counters"]["llm_calls"], 1);
+    assert_eq!(data["receipt"]["budget_counters"]["llm_calls"], 1);
+}
+
+#[test]
+fn max_llm_calls_reserves_before_a_second_provider_attempt() {
+    let temp = tempfile::tempdir().expect("fake codex workspace");
+    let data_dir = temp.path().join("graph-data");
+    let fake_codex_bin_dir = fake_codex_bin_dir(temp.path());
+    let mut mcp = Mcp::new_with_data_dir_and_fake_codex(&data_dir, &fake_codex_bin_dir);
+    let created = mcp.call(
+        "graph_create",
+        json!({"spec":{
+            "name":"llm-budget", "entry":"first", "output_key":"first",
+            "nodes":[
+                {"id":"first","type":"llm","model":"fake-model","prompt":"first","config":{"output_key":"first","timeout_ms":2_000}},
+                {"id":"second","type":"llm","model":"fake-model","prompt":"second","config":{"output_key":"second","timeout_ms":2_000}}
+            ],
+            "edges":[{"from":"first","to":"second"},{"from":"second","to":"END"}]
+        }}),
+    );
+    assert_eq!(created["ok"], true, "{created}");
+
+    let started = mcp.call(
+        "graph_run_start",
+        json!({"graph_id":"llm-budget","budgets":{"max_llm_calls":1}}),
+    );
+    assert_eq!(started["ok"], true, "{started}");
+    let run_id = started["run_id"].as_str().expect("run id").to_owned();
+    let completed = mcp.call(
+        "graph_run_wait",
+        json!({"run_id":run_id,"timeout_ms":5_000}),
+    );
+    let data = &completed["data"];
+    assert_eq!(data["status"], "failed", "{completed}");
+    assert_eq!(data["success"], false);
+    assert_eq!(data["error"], "BUDGET_EXHAUSTED");
+    assert_eq!(data["budget_exhausted"], "max_llm_calls");
+    assert_eq!(data["budget_counters"]["llm_calls"], 1);
+    assert_eq!(data["receipt"]["budget_counters"]["llm_calls"], 1);
+    assert_eq!(data["state"]["first"], "deterministic LLM output");
+    assert!(data["state"].get("second").is_none());
+}
+
+#[test]
+fn durable_llm_receipt_preserves_typed_invocation_and_terminal_provenance_after_restart() {
+    let temp = tempfile::tempdir().expect("fake codex workspace");
+    let data_dir = temp.path().join("graph-data");
+    let fake_codex_bin_dir = fake_codex_bin_dir(temp.path());
+    let run_id = {
+        let mut first = Mcp::new_with_data_dir_and_fake_codex(&data_dir, &fake_codex_bin_dir);
+        let created = first.call(
+            "graph_create",
+            json!({"spec":{
+                "name":"typed-llm-receipt", "entry":"ask", "output_key":"answer",
+                "nodes":[{"id":"ask","type":"llm","model":"fake-model","prompt":"reply","config":{"output_key":"answer","timeout_ms":2_000}}],
+                "edges":[{"from":"ask","to":"END"}]
+            }}),
+        );
+        assert_eq!(created["ok"], true, "{created}");
+        let started = first.call(
+            "graph_run_start",
+            json!({"graph_id":"typed-llm-receipt","input":{"request":"durable receipt"}}),
+        );
+        assert_eq!(started["ok"], true, "{started}");
+        let run_id = started["run_id"].as_str().expect("run id").to_owned();
+        let completed = first.call(
+            "graph_run_wait",
+            json!({"run_id":run_id,"timeout_ms":5_000}),
+        );
+        assert_eq!(completed["data"]["status"], "completed", "{completed}");
+        run_id
+    };
+
+    let mut restarted = Mcp::new_with_data_dir_and_fake_codex(&data_dir, &fake_codex_bin_dir);
+    let receipt = restarted.call("graph_run_receipt", json!({"run_id":run_id}));
+    let persisted = &receipt["data"]["receipt"];
+    assert_eq!(persisted["schema"], "agent-graph-mcp-receipt-v2");
+    assert_eq!(persisted["terminal_output"]["state_key"], "answer");
+    assert_eq!(
+        persisted["terminal_output"]["provenance"],
+        "declared_output_key"
+    );
+    assert!(persisted["terminal_output"]["value_digest"]
+        .as_str()
+        .is_some_and(|digest| digest.starts_with("sha256:")));
+    let invocations = persisted["llm_invocations"]
+        .as_array()
+        .expect("typed invocation records");
+    assert_eq!(invocations.len(), 1);
+    assert_eq!(invocations[0]["attempt"], 1);
+    assert_eq!(invocations[0]["node_id"], "ask");
+    assert_eq!(invocations[0]["configured_model"], "fake-model");
+    assert_eq!(invocations[0]["outcome"], "succeeded");
+    assert_eq!(persisted["budget_counters"]["llm_calls"], 1);
 }
 
 #[test]
@@ -1002,7 +1255,6 @@ fn invalid_budget_shapes_are_rejected_with_one_typed_error() {
         json!({"max_nodes": 0}),
         json!({"max_nodes": -1}),
         json!({"max_nodes": "1"}),
-        json!({"max_llm_calls": 1}),
     ] {
         let response = mcp.call(
             "graph_run_start",

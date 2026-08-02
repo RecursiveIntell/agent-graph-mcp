@@ -81,8 +81,9 @@ pub struct RunBudgets {
     pub max_wall_clock_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_nodes: Option<u64>,
-    /// Kept in the model so the public contract has one canonical shape. The
-    /// parser rejects it until a real LLM invocation hook is available.
+    /// Enforced atomically before each provider invocation: attempts are
+    /// reserved pre-invocation, so failed or timed-out calls still count and
+    /// concurrent nodes cannot race past the limit.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_llm_calls: Option<u64>,
 }
@@ -117,13 +118,10 @@ impl RunBudgets {
                 .ok_or_else(|| format!("budget '{key}' must be a positive integer"))?;
             *slot = Some(number);
         }
-        if budgets.max_llm_calls.is_some() {
-            return Err(
-                "max_llm_calls is unavailable: no real LLM invocation hook exists in the permitted runtime path"
-                    .into(),
-            );
-        }
-        if budgets.max_wall_clock_ms.is_none() && budgets.max_nodes.is_none() {
+        if budgets.max_wall_clock_ms.is_none()
+            && budgets.max_nodes.is_none()
+            && budgets.max_llm_calls.is_none()
+        {
             return Err("budgets must contain an enforceable supported field".into());
         }
         Ok(Some(budgets))
@@ -432,6 +430,12 @@ impl RunManager {
         let provider = safe_provider_label(&base_url);
         let configured_model = default_model.clone();
         let events = Arc::new(Mutex::new(Vec::<GraphEvent>::new()));
+        // Shared per-run LLM-attempt accounting: one atomic counter and one
+        // typed invocation ledger are created here, handed into the compiled
+        // nodes, and read back at the terminal boundary so counters and
+        // receipts reflect the same observed provider attempts.
+        let llm_calls = Arc::new(AtomicU64::new(0));
+        let llm_invocations = Arc::new(Mutex::new(Vec::<Value>::new()));
         let graph = compile(
             &spec,
             CompileContext {
@@ -440,6 +444,9 @@ impl RunManager {
                 cancelled: cancelled.clone(),
                 cancellation: cancellation.clone(),
                 events: events.clone(),
+                llm_calls: llm_calls.clone(),
+                max_llm_calls: budgets.as_ref().and_then(|budget| budget.max_llm_calls),
+                llm_invocations: llm_invocations.clone(),
             },
         )?;
         let starting_state = initial_state
@@ -551,6 +558,11 @@ impl RunManager {
             .lock()
             .map_err(|_| "event registry poisoned")?
             .clone();
+        let observed_llm_calls = llm_calls.load(Ordering::SeqCst);
+        let observed_invocations = llm_invocations
+            .lock()
+            .map_err(|_| "llm invocation registry poisoned")?
+            .clone();
         let mut steps: Vec<Value> = Vec::new();
         for event in &graph_events {
             if let GraphEvent::StateUpdate {
@@ -575,10 +587,12 @@ impl RunManager {
                     .filter(|event| matches!(event, GraphEvent::NodeStart { .. }))
                     .count() as u64,
             ),
-            // The LLM node invokes llm-pipeline directly. There is no permitted
-            // invocation hook in this crate, so max_llm_calls is rejected and
-            // this observed counter remains zero for accepted runs.
-            llm_calls: initial_counters.llm_calls,
+            // Observed from the shared pre-invocation reservation counter, so
+            // the terminal record matches actual provider attempts (including
+            // failed or timed-out attempts).
+            llm_calls: initial_counters
+                .llm_calls
+                .saturating_add(observed_llm_calls),
             wall_clock_ms: initial_counters
                 .wall_clock_ms
                 .saturating_add(started_at.elapsed().as_millis().min(u64::MAX as u128) as u64),
@@ -601,10 +615,21 @@ impl RunManager {
                 || (budget_counters.nodes >= limit && iteration_error && budget_limited_iterations))
                 .then_some("max_nodes".into())
         });
+        let llm_exhausted = budgets.as_ref().is_some_and(|budget| {
+            budget.max_llm_calls.is_some()
+                && result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.contains("BUDGET_EXHAUSTED"))
+        });
         let budget_exhausted = if wall_exhausted {
             Some("max_wall_clock_ms".to_owned())
+        } else if let Some(node) = node_exhausted {
+            Some(node)
+        } else if llm_exhausted {
+            Some("max_llm_calls".to_owned())
         } else {
-            node_exhausted
+            None
         };
         let mut dependency_envelopes = Value::Array(Vec::new());
         let mut dependency_envelopes_complete = false;
@@ -665,10 +690,20 @@ impl RunManager {
             .iter()
             .filter_map(|m| m.get("model_alias").cloned())
             .collect();
-        let receipt = serde_json::json!({"schema":"agent-graph-mcp-receipt-v1","run_id":run_id,"trace":trace,"graph_version":graph_version,
+        let terminal_output_key = spec
+            .output_key
+            .clone()
+            .unwrap_or_else(|| "__input__".to_owned());
+        let terminal_output = serde_json::json!({
+            "state_key": terminal_output_key,
+            "provenance": if spec.output_key.is_some() { "declared_output_key" } else { "legacy_input_fallback" },
+            "value_digest": digest(&final_state),
+        });
+        let receipt = serde_json::json!({"schema":"agent-graph-mcp-receipt-v2","run_id":run_id,"trace":trace,"graph_version":graph_version,
             "input_digest":digest(&input),"output_digest":digest(&state_value),"step_count":steps.len(),"models":models,
             "provider":provider,"default_model":configured_model,"model_labels":model_labels,
-            "core":core_receipt,"dependency_envelopes":dependency_envelopes,"dependency_envelopes_complete":dependency_envelopes_complete,"replay_capability":if resumed { "deterministic_local_resume" } else { "integrity_only" },
+            "core":core_receipt,"terminal_output":terminal_output,"llm_invocations":observed_invocations,
+            "dependency_envelopes":dependency_envelopes,"dependency_envelopes_complete":dependency_envelopes_complete,"replay_capability":if resumed { "deterministic_local_resume" } else { "integrity_only" },
             "resume_supported":resumed,
             "checkpoint":checkpoint_id.as_ref().zip(checkpoint_digest.as_ref()).map(|(id, digest)| serde_json::json!({"checkpoint_id":id,"checkpoint_digest":digest})),
             "approval":approval,

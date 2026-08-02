@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command as StdCommand, Stdio};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex,
 };
 
 use async_trait::async_trait;
@@ -24,6 +24,13 @@ use crate::evidence::validate_research_evidence;
 pub struct RunContext {
     pub cancelled: Arc<AtomicBool>,
     pub cancellation: Arc<Notify>,
+    /// Shared pre-invocation attempt counter. Incremented atomically for every
+    /// provider attempt, including attempts that later fail or time out.
+    pub llm_calls: Arc<AtomicU64>,
+    /// Run-scoped cap on provider attempts; None means unlimited.
+    pub max_llm_calls: Option<u64>,
+    /// Shared typed ledger of observed invocations for the terminal receipt.
+    pub llm_invocations: Arc<Mutex<Vec<Value>>>,
 }
 
 impl RunContext {
@@ -32,6 +39,26 @@ impl RunContext {
             Err(AgentGraphError::Cancelled)
         } else {
             Ok(())
+        }
+    }
+
+    /// Atomically reserve one provider-attempt slot BEFORE any provider call,
+    /// so failed and timed-out attempts still count and concurrent nodes cannot
+    /// race past the budget. A denied attempt leaves the counter unchanged.
+    pub fn reserve_llm_attempt(&self) -> Result<u64> {
+        match self
+            .llm_calls
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                if self.max_llm_calls.is_some_and(|limit| used >= limit) {
+                    None
+                } else {
+                    Some(used + 1)
+                }
+            }) {
+            // fetch_update returns the PREVIOUS value; the stored counter was
+            // already advanced to used+1, so the attempt number is used+1.
+            Ok(used) => Ok(used.saturating_add(1)),
+            Err(_) => Err(AgentGraphError::PayloadError("BUDGET_EXHAUSTED".to_owned())),
         }
     }
 }
@@ -85,11 +112,16 @@ impl Node for LlmNode {
             .prompt
             .replace("{input}", &serde_json::to_string(&input)?);
         let model = self.model.as_deref().unwrap_or(&self.default_model);
+        // Reserve the provider attempt before any invocation; the limit cannot
+        // be bypassed by parallel nodes and failed calls still count.
+        let attempt = self.ctx.reserve_llm_attempt()?;
         let mut config = LlmConfig::default().with_json_mode(self.json_mode);
         if let Some(tokens) = self.max_tokens {
             config = config.with_max_tokens(tokens as u32);
         }
-        let output = if self.base_url == "codex-app-server://" {
+        let result: std::result::Result<Value, AgentGraphError> = if self.base_url
+            == "codex-app-server://"
+        {
             let model = model.to_owned();
             let prompt = rendered.clone();
             let timeout = std::time::Duration::from_millis(self.timeout_ms);
@@ -103,10 +135,10 @@ impl Node for LlmNode {
                     let text = result
                         .map_err(|e| AgentGraphError::PayloadError(format!("codex app-server task failed: {e}")))?
                         .map_err(AgentGraphError::PayloadError)?;
-                    Value::String(text)
+                    Ok(Value::String(text))
                 }
                 _ = cancellation_requested(self.ctx.cancelled.clone(), self.ctx.cancellation.clone()) => {
-                    return Err(AgentGraphError::Cancelled);
+                    Err(AgentGraphError::Cancelled)
                 }
             }
         } else {
@@ -117,11 +149,21 @@ impl Node for LlmNode {
             let exec_ctx = ExecCtx::builder(&self.base_url).build();
             tokio::select! {
                 result = call.invoke(&exec_ctx, input) => result
-                    .map_err(|e| AgentGraphError::PayloadError(e.to_string()))?
-                    .value,
+                    .map_err(|e| AgentGraphError::PayloadError(e.to_string()))
+                    .map(|payload| payload.value),
                 _ = cancellation_requested(self.ctx.cancelled.clone(), self.ctx.cancellation.clone()) => {
-                    return Err(AgentGraphError::Cancelled);
+                    Err(AgentGraphError::Cancelled)
                 }
+            }
+        };
+        let output = match result {
+            Ok(output) => {
+                self.record_invocation(attempt, model, "succeeded");
+                output
+            }
+            Err(error) => {
+                self.record_invocation(attempt, model, "failed");
+                return Err(error);
             }
         };
         self.ctx.check()?;
@@ -133,6 +175,21 @@ impl Node for LlmNode {
         // result there made parallel branches race for the graph's final state.
         state.set_raw(&self.output_key, output).await?;
         Ok(NodeOutput::Done)
+    }
+}
+
+impl LlmNode {
+    /// Append one typed invocation record for the terminal receipt. The record
+    /// is derived from the observed attempt, never from graph metadata alone.
+    fn record_invocation(&self, attempt: u64, model: &str, outcome: &str) {
+        if let Ok(mut invocations) = self.ctx.llm_invocations.lock() {
+            invocations.push(serde_json::json!({
+                "attempt": attempt,
+                "node_id": self.id,
+                "configured_model": model,
+                "outcome": outcome,
+            }));
+        }
     }
 }
 

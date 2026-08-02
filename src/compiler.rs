@@ -1,4 +1,7 @@
-use std::sync::{atomic::AtomicBool, Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64},
+    Arc, Mutex,
+};
 
 use ri_agent_graph::event_sink::{EventSink, GraphEvent};
 use ri_agent_graph::join::JoinNode;
@@ -20,6 +23,9 @@ pub struct CompileContext {
     pub cancelled: Arc<AtomicBool>,
     pub cancellation: Arc<Notify>,
     pub events: Arc<Mutex<Vec<GraphEvent>>>,
+    pub llm_calls: Arc<AtomicU64>,
+    pub max_llm_calls: Option<u64>,
+    pub llm_invocations: Arc<Mutex<Vec<Value>>>,
 }
 
 struct Collector(Arc<Mutex<Vec<GraphEvent>>>);
@@ -37,6 +43,9 @@ pub fn compile(spec: &GraphSpec, cx: CompileContext) -> Result<AgentGraph, Strin
     let run = RunContext {
         cancelled: cx.cancelled,
         cancellation: cx.cancellation,
+        llm_calls: cx.llm_calls,
+        max_llm_calls: cx.max_llm_calls,
+        llm_invocations: cx.llm_invocations,
     };
     let mut builder = AgentGraph::builder()
         .with_name(&spec.name)
