@@ -110,9 +110,16 @@ impl Node for LlmNode {
             .get_opt::<Value>(&self.input_key)
             .await?
             .unwrap_or(Value::Null);
-        let rendered = self
-            .prompt
-            .replace("{input}", &serde_json::to_string(&input)?);
+        let input_json = serde_json::to_string(&input)?;
+        // Expand the input placeholder. Council specs reference the input key
+        // by name (e.g. {brief}, {plan}, {input}) — the daemon previously only
+        // expanded {input}, so prompts using {<input_key>} sent the literal
+        // placeholder to the model and analysts never received the coordinator
+        // output (observed 2026-08-03: analysts returned empty content).
+        let mut rendered = self.prompt.replace("{input}", &input_json);
+        if !self.input_key.is_empty() {
+            rendered = rendered.replace(&format!("{{{}}}", self.input_key), &input_json);
+        }
         let model = self.model.as_deref().unwrap_or(&self.default_model);
         // Reserve the provider attempt before any invocation; the limit cannot
         // be bypassed by parallel nodes and failed calls still count.
@@ -149,6 +156,19 @@ impl Node for LlmNode {
                 .with_timeout(std::time::Duration::from_millis(self.timeout_ms))
                 .with_config(config);
             let mut exec_builder = ExecCtx::builder(&self.base_url);
+            // Remote OpenAI-compatible endpoints (http/https) must use the
+            // OpenAI backend (/v1/chat/completions). Without this, the
+            // llm-pipeline default is OllamaBackend, which sends an Ollama
+            // body to /api/generate and is rejected by OpenAI-compatible
+            // providers (observed 2026-08-03: maas returned HTTP 400 "Role
+            // must be in [user, assistant, ...]"). codex-app-server:// is
+            // handled in the branch above; local Ollama keeps the default.
+            if self.base_url.starts_with("http://") || self.base_url.starts_with("https://") {
+                exec_builder = match self.api_key.as_deref() {
+                    Some(key) => exec_builder.openai_with_key(key),
+                    None => exec_builder.openai(),
+                };
+            }
             if let Some(key) = self.api_key.as_deref() {
                 // Attach the provider key as a Bearer header on the http(s)
                 // llm-pipeline path only. The key is never logged or echoed.

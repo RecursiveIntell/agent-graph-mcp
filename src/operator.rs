@@ -82,6 +82,11 @@ impl OperatorService {
             OperatorAction::SetGraphRetention
                 | OperatorAction::ApproveGraphDeletion
                 | OperatorAction::DeleteGraph
+                | OperatorAction::ClearExecutionLineage
+                | OperatorAction::PurgeGraph
+                | OperatorAction::PromoteTemplate
+                | OperatorAction::Migrate
+                | OperatorAction::Install
         ) {
             return error("OPERATOR_ACTION_UNSUPPORTED");
         }

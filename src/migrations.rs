@@ -2,7 +2,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
-pub const CURRENT_VERSION: i64 = 3;
+pub const CURRENT_VERSION: i64 = 4;
 pub const LEGACY_OWNER_UNKNOWN: &str = "legacy_owner_unknown";
 
 #[allow(dead_code)]
@@ -22,7 +22,7 @@ pub fn apply(conn: &mut Connection, binary_digest: &str) -> rusqlite::Result<()>
         .optional()?;
     if exists.is_none() {
         tx.execute_batch("CREATE TABLE IF NOT EXISTS daemon_instances (instance_id TEXT PRIMARY KEY, generation INTEGER NOT NULL UNIQUE, pid INTEGER NOT NULL, boot_id TEXT, executable_digest TEXT, started_at TEXT NOT NULL, heartbeat_at TEXT NOT NULL, clean_shutdown_at TEXT); CREATE TABLE IF NOT EXISTS run_publication_state (run_id TEXT PRIMARY KEY, state TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, reason TEXT); CREATE TABLE IF NOT EXISTS operator_receipts (receipt_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, action TEXT NOT NULL, resource_kind TEXT NOT NULL, resource_id TEXT NOT NULL, state_digest TEXT NOT NULL, operator_uid INTEGER NOT NULL, daemon_instance_id TEXT NOT NULL, nonce TEXT NOT NULL UNIQUE, issued_at TEXT NOT NULL, expires_at TEXT NOT NULL, consumed_at TEXT); CREATE INDEX IF NOT EXISTS idx_operator_receipts_nonce ON operator_receipts(nonce);")?;
-        let has_owner: Option<String> = tx
+        let has_owner: Option<i64> = tx
             .query_row(
                 "SELECT 1 FROM pragma_table_info('executions') WHERE name='owner_instance_id'",
                 [],
@@ -30,9 +30,6 @@ pub fn apply(conn: &mut Connection, binary_digest: &str) -> rusqlite::Result<()>
             )
             .optional()?;
         if has_owner.is_none() {
-            // Only add owner_instance_id if executions table exists.
-            // The store's own migration creates it; if it doesn't exist yet,
-            // the store migration will need to include the column.
             let has_executions: Option<i64> = tx
                 .query_row(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='executions'",
@@ -45,6 +42,39 @@ pub fn apply(conn: &mut Connection, binary_digest: &str) -> rusqlite::Result<()>
                 tx.execute("UPDATE executions SET owner_instance_id = ?1 WHERE owner_instance_id IS NULL AND status IN ('accepted','running')", [LEGACY_OWNER_UNKNOWN])?;
             }
         }
+
+        // v4: deletion governance — phantom remediation + retention lifecycle
+        let has_superseded: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('executions') WHERE name='superseded_by'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if has_superseded.is_none() {
+            tx.execute_batch("ALTER TABLE executions ADD COLUMN superseded_by TEXT DEFAULT NULL;")?;
+        }
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS legal_holds (\
+                hold_id TEXT PRIMARY KEY,\
+                graph_name TEXT NOT NULL,\
+                reason TEXT,\
+                issued_at TEXT NOT NULL DEFAULT (datetime('now')),\
+                expires_at TEXT,\
+                issued_by TEXT\
+            );\
+            CREATE TABLE IF NOT EXISTS archive_manifests (\
+                graph_name TEXT PRIMARY KEY,\
+                graph_version TEXT,\
+                spec_digest TEXT,\
+                version_count INTEGER,\
+                last_execution_at TEXT,\
+                execution_count INTEGER,\
+                content_digest TEXT,\
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))\
+            );",
+        )?;
+
         let digest = migration_digest(binary_digest);
         tx.execute(
             "INSERT INTO schema_migrations(version,migration_digest) VALUES (?1,?2)",

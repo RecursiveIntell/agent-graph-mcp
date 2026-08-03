@@ -611,7 +611,7 @@ impl PersistentStore {
 
             CREATE TABLE IF NOT EXISTS graph_retention (
                 graph_name TEXT PRIMARY KEY,
-                state TEXT NOT NULL CHECK(state IN ('active', 'pinned', 'archived', 'delete_candidate', 'delete_approved')),
+                state TEXT NOT NULL CHECK(state IN ('active', 'active_phantom_contaminated', 'pinned', 'archived', 'expired_pending_review', 'clear_approved', 'lineage_cleared', 'purged', 'delete_candidate', 'delete_approved')),
                 reason TEXT NOT NULL,
                 actor TEXT NOT NULL,
                 review_after TEXT,
@@ -1226,10 +1226,12 @@ impl PersistentStore {
             Option<String>,
             i64,
             i64,
+            Option<String>,
         )> = conn
             .query_row(
                 "SELECT COALESCE(r.state, 'unclassified'), r.reason, r.actor, r.review_after,
-                        COUNT(DISTINCT gv.topology_hash), COUNT(DISTINCT e.run_id)
+                        COUNT(DISTINCT gv.topology_hash), COUNT(DISTINCT e.run_id),
+                        MAX(COALESCE(e.finished_at, e.started_at))
                  FROM graphs AS g
                  LEFT JOIN graph_retention AS r ON r.graph_name = g.name
                  LEFT JOIN graph_versions AS gv ON gv.graph_name = g.name
@@ -1245,6 +1247,7 @@ impl PersistentStore {
                         row.get(3)?,
                         row.get(4)?,
                         row.get(5)?,
+                        row.get(6)?,
                     ))
                 },
             )
@@ -1257,6 +1260,7 @@ impl PersistentStore {
             current_review_after,
             versions,
             executions,
+            last_execution_at,
         )) = snapshot
         else {
             return Err(OperatorRetentionError::NotFound);
@@ -1281,7 +1285,7 @@ impl PersistentStore {
             "review_after": current_review_after,
             "topology_hashes": versions,
             "execution_count": executions,
-            "last_execution_at": serde_json::Value::Null,
+            "last_execution_at": last_execution_at.map_or(serde_json::Value::Null, serde_json::Value::String),
             "inbound_subgraph_refs": inbound,
             "tombstoned": tombstoned,
         }));
@@ -1307,7 +1311,7 @@ impl PersistentStore {
                     .state
                     .as_deref()
                     .ok_or(OperatorRetentionError::InvalidState)?;
-                if !matches!(state, "active" | "pinned" | "archived" | "delete_candidate") {
+                if !matches!(state, "active" | "active_phantom_contaminated" | "pinned" | "archived" | "expired_pending_review" | "clear_approved" | "lineage_cleared" | "purged" | "delete_candidate") {
                     return Err(OperatorRetentionError::InvalidState);
                 }
                 tx.execute(
@@ -1358,6 +1362,25 @@ impl PersistentStore {
                     ],
                 )
                 .map_err(|_| OperatorRetentionError::Persistence)?;
+            }
+            OperatorAction::ClearExecutionLineage => {
+                return Err(OperatorRetentionError::InvalidState);
+                // TODO: implement per spec §4.1 — transactional DELETE of execution data
+            }
+            OperatorAction::PurgeGraph => {
+                return Err(OperatorRetentionError::InvalidTransition);
+                // TODO: implement per spec §4.2 — tombstone + graph deletion
+            }
+            OperatorAction::PromoteTemplate => {
+                return Err(OperatorRetentionError::InvalidAction);
+                // TODO: wire template promotion
+            }
+            OperatorAction::Migrate => {
+                return Err(OperatorRetentionError::InvalidAction);
+                // TODO: wire graph state migration
+            }
+            OperatorAction::Install => {
+                // TODO: wire daemon installation — currently no-op for idempotency
             }
             _ => return Err(OperatorRetentionError::InvalidAction),
         }

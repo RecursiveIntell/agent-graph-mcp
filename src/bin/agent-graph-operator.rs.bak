@@ -9,10 +9,7 @@ use std::{
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let raw_args: Vec<String> = env::args().skip(1).collect();
-    let non_interactive = raw_args.iter().any(|a| a == "--non-interactive")
-        || std::env::var("AGENT_GRAPH_OPERATOR_TOKEN").is_ok();
-    let mut args = raw_args.into_iter().filter(|a| a != "--non-interactive");
+    let mut args = env::args().skip(1);
     let socket = args
         .next()
         .unwrap_or_else(|| "/run/user/1000/agent-graph/operator.sock".into());
@@ -24,14 +21,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = args.next();
     let reason = args.next();
 
-    if !non_interactive {
-        eprint!("Authorize {action_text} on {resource_id}? type 'yes': ");
-        io::stderr().flush()?;
-        let mut answer = String::new();
-        io::stdin().read_line(&mut answer)?;
-        if answer.trim() != "yes" {
-            return Err("operator decision cancelled".into());
-        }
+    eprint!("Authorize {action_text} on {resource_id}? type 'yes': ");
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if answer.trim() != "yes" {
+        return Err("operator decision cancelled".into());
     }
 
     let decision_material = match (state, reason) {

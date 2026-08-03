@@ -11,6 +11,8 @@ pub enum OperatorAction {
     DeleteGraph,
     SetGraphRetention,
     ApproveGraphDeletion,
+    ClearExecutionLineage,
+    PurgeGraph,
     PromoteTemplate,
     Migrate,
     Install,

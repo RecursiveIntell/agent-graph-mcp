@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut max_graphs = DEFAULT_MAX_GRAPHS;
     let mut operator_socket: Option<PathBuf> = None;
     let mut operator_uid: Option<u32> = None;
-    let mut api_key: Option<String> = None;
+    let mut api_key: Option<String> = std::env::var("AGENT_GRAPH_API_KEY").ok();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {

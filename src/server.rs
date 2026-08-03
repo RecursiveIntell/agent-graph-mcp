@@ -870,8 +870,8 @@ impl AgentGraphServer {
         let overwrite = overwrite.unwrap_or(false);
         if !overwrite && !graphs.contains_key(&name) && graphs.len() >= self.max_graphs {
             return Ok(error_output(
-                format!("graph limit ({}) reached", self.max_graphs),
-                "LIMIT_EXCEEDED",
+                format!("graph capacity ({}) exhausted — {} graphs registered", self.max_graphs, graphs.len()),
+                "CAPACITY_EXHAUSTED",
             ));
         }
 
@@ -936,6 +936,12 @@ impl AgentGraphServer {
     ) -> Result<Json<StructuredOutput>, ErrorData> {
         let input = input.unwrap_or(Value::Null);
         ensure_size(&input, MAX_INPUT_BYTES, "execution input").map_err(|e| invalid_params(e))?;
+        let sync = mode.as_deref().is_none_or(|m| m == "sync");
+        if sync {
+            tracing::warn!(
+                "graph_execute sync mode is deprecated — use graph_run_start + graph_run_get"
+            );
+        }
         if let Some(store) = self.store.as_ref() {
             if !store
                 .graph_execution_allowed(&graph_id)

@@ -5,6 +5,7 @@
 //! may instead expose final text in a completed `agentMessage` item.
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -106,21 +107,34 @@ pub fn run_turn(
     if model.trim().is_empty() {
         return Err("codex model must not be empty".to_owned());
     }
-    let mut child = Command::new(codex_bin)
-        .args([
-            "app-server",
-            "--stdio",
-            "-c",
-            &format!("model={:?}", model),
-            "-c",
-            "sandbox_mode=\"read-only\"",
-        ])
-        .current_dir(cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("failed to start codex app-server: {e}"))?;
+    let mut child = unsafe {
+        Command::new(codex_bin)
+            .args([
+                "app-server",
+                "--stdio",
+                "-c",
+                &format!("model={:?}", model),
+                "-c",
+                "sandbox_mode=\"read-only\"",
+            ])
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .pre_exec(|| {
+                // Create a new process group so we can cleanly kill the entire
+                // process tree on timeout/failure.  A negative PID in kill(2)
+                // targets the group.  setpgid(0,0) returns 0 on success.
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            })
+            .spawn()
+    }
+    .map_err(|e| format!("failed to start codex app-server: {e}"))?;
+    let pgid = child.id();
     let mut stdin = child.stdin.take().ok_or("codex stdin unavailable")?;
     let stdout = child.stdout.take().ok_or("codex stdout unavailable")?;
     let (tx, rx) = mpsc::channel();
@@ -135,12 +149,15 @@ pub fn run_turn(
         }
     });
     let deadline = Instant::now() + timeout;
+    // Startup gets a bounded sub-budget so a cold Node start doesn't
+    // consume the entire generation window.
+    let startup_deadline = deadline.min(Instant::now() + Duration::from_secs(60));
     let result = (|| {
         send(
             &mut stdin,
             json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"agent-graph-mcp","title":"Agent Graph MCP","version":env!("CARGO_PKG_VERSION")},"capabilities":{}}}),
         )?;
-        receive(&rx, 1, deadline)?;
+        receive(&rx, 1, startup_deadline)?;
         send(
             &mut stdin,
             json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
@@ -149,7 +166,7 @@ pub fn run_turn(
             &mut stdin,
             json!({"jsonrpc":"2.0","id":2,"method":"thread/start","params":{"cwd":cwd}}),
         )?;
-        let thread = receive(&rx, 2, deadline)?;
+        let thread = receive(&rx, 2, startup_deadline)?;
         let thread_id = thread
             .pointer("/thread/id")
             .and_then(Value::as_str)
@@ -183,7 +200,17 @@ pub fn run_turn(
             }
         }
     })();
-    let _ = child.kill();
+    let _ = pgid_kill(pgid);
     let _ = child.wait();
     result
+}
+
+/// Send SIGKILL to every process in the process group identified by `pgid`
+/// (the codex app-server, its Node wrapper, and any subprocesses).
+fn pgid_kill(pgid: u32) {
+    // Graceful first: SIGTERM allows the Node wrapper to forward to children.
+    unsafe { libc::kill(-(pgid as i32), libc::SIGTERM) };
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    // Force: SIGKILL guarantees termination of any stragglers.
+    unsafe { libc::kill(-(pgid as i32), libc::SIGKILL) };
 }
