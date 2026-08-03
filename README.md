@@ -70,6 +70,16 @@ mcp_servers:
 {"mcpServers": {"agent-graph": {"command": "npx", "args": ["-y", "@recursiveintell/agent-graph-mcp", "--direct", "--base-url", "http://127.0.0.1:11434", "--model", "llama3.2:3b"]}}}
 ```
 
+### Try it out
+
+Once configured, your agent can use any of the 25 tools directly. Try these natural language prompts:
+
+> "Use the `council_deliberation` template to debate the merits of Rust vs. Go for systems programming."
+
+> "Create a graph with 3 parallel research nodes analyzing web framework tradeoffs, join the results, and produce a ranked recommendation."
+
+> "Spin up a plan→critique→refine pipeline for a database migration strategy, and pause for my approval before the final report."
+
 ## 9 agents at once
 
 Fan out to 9 LLM nodes in parallel, then join results into one synthesis:
@@ -175,6 +185,7 @@ cargo test --lib --test daemon_recovery --test mcp_integration
 | `graph_run_start` returns immediately | Run is async by default | Use `graph_run_wait` to block on completion, or `graph_execute` for sync |
 | "socket not found" | Daemon not started or socket path mismatch | Ensure `--socket` matches between daemon and client |
 | Approval stuck | Human hasn't decided | Check `graph_approval_list`, use `graph_approval_request` with decision |
+| Execution hangs silently | Logging too quiet | Run daemon with `RUST_LOG=debug agent-graph-mcpd ...` — logs to stderr. For `--direct` mode, add `RUST_LOG=debug` before the command |
 
 ## Status and limitations
 
@@ -184,6 +195,7 @@ cargo test --lib --test daemon_recovery --test mcp_integration
 - **Durable execution** requires the daemon. Direct mode is ephemeral.
 - **Max parallelism:** 16 nodes per parallel fan-out (compiler-enforced).
 - **LLM providers:** any OpenAI-compatible endpoint. Tested primarily with Ollama and OpenRouter.
+- **No AGENTS.md yet.** An AI-agent guidance file is planned — this will help coding agents navigate the 24-module Rust workspace.
 
 ## Support, security, and contributing
 
