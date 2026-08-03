@@ -22,11 +22,12 @@
 
 - An LLM endpoint (local Ollama, or any OpenAI-compatible API)
 - Node.js ≥ 18 (for npx) or Rust ≥ 1.75 (for cargo install)
+- A model available at your endpoint. Examples below use `llama3.2:3b` (pull with `ollama pull llama3.2:3b`). Any model works — just replace `--model`.
 
 ### npx (recommended)
 
 ```bash
-npx -y @recursiveintell/agent-graph-mcp --direct --base-url http://127.0.0.1:11434 --model glm-5.2:cloud
+npx -y @recursiveintell/agent-graph-mcp --direct --base-url http://127.0.0.1:11434 --model llama3.2:3b
 ```
 
 **Expected output:** MCP initialization handshake. Run `tools/list` to verify you see 25 tools.
@@ -35,7 +36,7 @@ npx -y @recursiveintell/agent-graph-mcp --direct --base-url http://127.0.0.1:114
 
 ```bash
 cargo install agent-graph-mcp --locked
-agent-graph-mcp --direct --base-url http://127.0.0.1:11434 --model glm-5.2:cloud
+agent-graph-mcp --direct --base-url http://127.0.0.1:11434 --model llama3.2:3b
 ```
 
 ### Daemon mode (multi-client, persistent state)
@@ -66,7 +67,7 @@ mcp_servers:
 
 **Claude Desktop:**
 ```json
-{"mcpServers": {"agent-graph": {"command": "npx", "args": ["-y", "@recursiveintell/agent-graph-mcp", "--direct", "--base-url", "http://127.0.0.1:11434", "--model", "glm-5.2:cloud"]}}}
+{"mcpServers": {"agent-graph": {"command": "npx", "args": ["-y", "@recursiveintell/agent-graph-mcp", "--direct", "--base-url", "http://127.0.0.1:11434", "--model", "llama3.2:3b"]}}}
 ```
 
 ## 9 agents at once
@@ -154,7 +155,7 @@ Human-in-the-loop approvals are backed by durable SQLite checkpoints. When a gra
 ```bash
 # Smoke test — verify 25 tools are exposed
 echo '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | \
-  npx -y @recursiveintell/agent-graph-mcp --direct --base-url http://127.0.0.1:11434 --model glm-5.2:cloud 2>/dev/null | \
+  npx -y @recursiveintell/agent-graph-mcp --direct --base-url http://127.0.0.1:11434 --model llama3.2:3b 2>/dev/null | \
   python3 -c "import sys,json; msg=json.loads(sys.stdin.read()); print(f'{len(msg[\"result\"][\"tools\"])} tools')"
 # Expected: 25 tools
 
