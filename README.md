@@ -195,14 +195,14 @@ cargo test --lib --test daemon_recovery --test mcp_integration
 - **Durable execution** requires the daemon. Direct mode is ephemeral.
 - **Max parallelism:** 16 nodes per parallel fan-out (compiler-enforced).
 - **LLM providers:** any OpenAI-compatible endpoint. Tested primarily with Ollama and OpenRouter.
-- **No AGENTS.md yet.** An AI-agent guidance file is planned — this will help coding agents navigate the 24-module Rust workspace.
 
 ## Support, security, and contributing
 
 - **Issues and discussions:** [GitHub Issues](https://github.com/RecursiveIntell/agent-graph-mcp/issues)
-- **Security:** For vulnerability reports, open a private security advisory on the repository. No separate SECURITY.md yet — this is a known gap.
-- **Contributing:** Pull requests welcome. No formal CONTRIBUTING.md yet — open an issue to discuss before large changes.
-- **Code of Conduct:** Not yet published. Standard open-source norms apply.
+- **Security:** [SECURITY.md](SECURITY.md) — report vulnerabilities privately via GitHub Security Advisories
+- **Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md) — setup, workflow, code style, and PR expectations
+- **Code of Conduct:** [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) — Contributor Covenant 2.1
+- **AI agents:** [AGENTS.md](AGENTS.md) — project structure, conventions, and constraints for coding agents
 
 ## License
 
