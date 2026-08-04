@@ -1,6 +1,6 @@
 # agent-graph-mcp
 
-**Run 9 agents at once.** MCP server for graph-orchestrated LLM workflows — dispatch up to 16 LLM nodes in parallel fan-out with typed joins, checkpoint/resume, human-in-the-loop approvals, and HMAC-authenticated execution receipts. 25 typed tools.
+**Run 9 agents at once.** MCP server for graph-orchestrated LLM workflows — dispatch up to 16 LLM nodes in parallel fan-out with typed joins, checkpoint/resume, human-in-the-loop approvals, and HMAC-authenticated execution receipts. 27 typed tools.
 
 [![Crates.io](https://img.shields.io/crates/v/agent-graph-mcp)](https://crates.io/crates/agent-graph-mcp)
 [![docs.rs](https://img.shields.io/docsrs/agent-graph-mcp)](https://docs.rs/agent-graph-mcp)
@@ -10,7 +10,7 @@
 
 ![Architecture diagram showing MCP client connecting via stdin/stdout to the agent-graph-mcp proxy, which communicates over Unix socket to the agent-graph-mcpd daemon backed by SQLite](assets/architecture.svg)
 
-> **Expose the `ri-agent-graph` runtime engine over MCP.** Compile declarative JSON workflow specs, execute synchronously or asynchronously, checkpoint/resume, request human approval, capture source witnesses, and get cryptographic receipts — all through 25 typed MCP tools.
+> **Expose the `ri-agent-graph` runtime engine over MCP.** Compile declarative JSON workflow specs, execute synchronously or asynchronously, checkpoint/resume, request human approval, capture source witnesses, and get cryptographic receipts — all through 27 typed MCP tools.
 
 ## Who is this for?
 
@@ -30,7 +30,9 @@
 npx -y @recursiveintell/agent-graph-mcp --direct --base-url http://127.0.0.1:11434 --model llama3.2:3b
 ```
 
-**Expected output:** MCP initialization handshake. Run `tools/list` to verify you see 25 tools.
+> **Note:** `--direct` is deprecated. Prefer daemon mode (below) for persistence and multi-client support. Direct mode still works but will be removed in a future release.
+
+**Expected output:** MCP initialization handshake. Run `tools/list` to verify you see 27 tools.
 
 ### Cargo install
 
@@ -42,11 +44,29 @@ agent-graph-mcp --direct --base-url http://127.0.0.1:11434 --model llama3.2:3b
 ### Daemon mode (multi-client, persistent state)
 
 ```bash
-agent-graph-mcpd --data-dir ~/.local/share/agent-graph --socket /tmp/agent-graph.sock --max-graphs 256 &
-agent-graph-mcp --socket /tmp/agent-graph.sock
+# Start the daemon (all defaults shown explicitly)
+agent-graph-mcpd \
+  --data-dir ~/.local/share/agent-graph \
+  --socket /tmp/agent-graph/mcp.sock \
+  --base-url http://127.0.0.1:11434 \
+  --model llama3.2:3b \
+  --max-graphs 256 &
+
+# Connect proxy
+agent-graph-mcp --socket /tmp/agent-graph/mcp.sock
 ```
 
-`--max-graphs` is a per-daemon registration capacity. It defaults to 64 and accepts values from 1 through 1024. Set it explicitly for a durable store whose registered graph count exceeds the historical default. `graph_status` reports both the effective limit and `capacity_state`; an `over_limit_legacy` state preserves existing durable graphs but rejects new registrations until the configured limit is raised or registrations are retired.
+**Defaults** (applied when flags are omitted):
+
+| Flag | Default | Notes |
+|------|---------|-------|
+| `--data-dir` | `/tmp/agent-graph` | Ephemeral across reboots. Set explicitly for durable storage |
+| `--socket` | `/tmp/agent-graph/mcp.sock` | Must match between daemon and proxy |
+| `--base-url` | `http://127.0.0.1:11434` | Ollama default. Change for any provider |
+| `--model` | `glm-5.2:cloud` | **Always override this.** The default exists only for backward compatibility |
+| `--max-graphs` | 64 | Range 1–1024. Raise for large graph libraries |
+
+`--max-graphs` is a per-daemon registration capacity. `graph_status` reports both the effective limit and `capacity_state`; an `over_limit_legacy` state preserves existing durable graphs but rejects new registrations until the configured limit is raised or registrations are retired.
 
 ### Direct vs daemon
 
@@ -96,6 +116,46 @@ npx -y @recursiveintell/agent-graph-mcp --direct --base-url https://api.deepseek
 
 **Choosing a model for agent-graph:** Fan-out nodes share the same model. For 9-agent sweeps, use a fast model (`deepseek-v4-flash`, `llama3.2:3b`). For synthesis/report nodes that process all collected results, prefer a larger-context model (`deepseek-v4-pro`, `gpt-4o`). The daemon currently uses a single model for all nodes in a graph; per-node model selection is tracked but not yet shipped.
 
+## Complete CLI reference
+
+### Daemon (`agent-graph-mcpd`)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--data-dir PATH` | `/tmp/agent-graph` | Persistent storage. Set for durable graphs across restarts |
+| `--socket PATH` | `/tmp/agent-graph/mcp.sock` | Unix socket for proxy connections |
+| `--base-url URL` | `http://127.0.0.1:11434` | OpenAI-compatible LLM endpoint |
+| `--model NAME` | `glm-5.2:cloud` | Default model for all LLM nodes. **Override this** |
+| `--max-graphs N` | 64 | Graph registration capacity (1–1024) |
+| `--help` | | Print usage |
+| `--version` | | Print version |
+
+### Proxy (`agent-graph-mcp`)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--socket PATH` | `$XDG_RUNTIME_DIR/agent-graph/mcp.sock` or `/tmp/agent-graph/mcp.sock` | Daemon socket to connect to |
+| `--connect-timeout-ms N` | 2000 | Connection timeout in milliseconds |
+| `--version` | | Print version |
+
+### Direct mode (`agent-graph-mcp --direct`) — deprecated
+
+Prefers daemon mode. All daemon flags above plus:
+
+| Flag | Description |
+|------|-------------|
+| `--integrity-key PATH` | HMAC key file for receipt authentication |
+| `--require-integrity-key` | Refuse startup if integrity key is missing/unreadable (requires `--data-dir`) |
+| `--ephemeral` | In-memory only, no persistence (mutually exclusive with `--data-dir`) |
+
+### Environment variables
+
+| Variable | Used by | Description |
+|----------|---------|-------------|
+| `OPENAI_API_KEY` | Daemon, direct | API key for the LLM provider |
+| `AGENT_GRAPH_INTEGRITY_KEY_PATH` | Daemon, direct | Alternative to `--integrity-key` for receipt signing |
+| `RUST_LOG` | Both | Log level. Set to `debug` for verbose output |
+
 ## Client configs
 
 **Hermes Agent:**
@@ -103,7 +163,7 @@ npx -y @recursiveintell/agent-graph-mcp --direct --base-url https://api.deepseek
 mcp_servers:
   agent_graph:
     command: agent-graph-mcp
-    args: [--socket, /tmp/agent-graph.sock]
+    args: [--socket, /tmp/agent-graph/mcp.sock]
 ```
 
 **Claude Desktop:**
@@ -113,7 +173,7 @@ mcp_servers:
 
 ### Try it out
 
-Once configured, your agent can use any of the 25 tools directly. Try these natural language prompts:
+Once configured, your agent can use any of the 27 tools directly. Try these natural language prompts:
 
 > "Use the `council_deliberation` template to debate the merits of Rust vs. Go for systems programming."
 
@@ -182,7 +242,7 @@ MCP Client ──→ agent-graph-mcp (proxy) ──Unix socket──→ agent-gr
 
 Human-in-the-loop approvals are backed by durable SQLite checkpoints. When a graph reaches an approval node, execution pauses, a checkpoint is persisted, and the approval is surfaced via `graph_approval_list`. The human reviews and decides; the graph resumes from the checkpoint.
 
-## Tools (25)
+## Tools (27)
 
 **Graph lifecycle (4):** `graph_create`, `graph_list`, `graph_inspect`, `graph_render`
 **Execution (5):** `graph_execute`, `graph_run_start`, `graph_run_wait`, `graph_run_cancel`, `graph_run_get`
@@ -191,6 +251,7 @@ Human-in-the-loop approvals are backed by durable SQLite checkpoints. When a gra
 **Evidence (2):** `graph_source_witness_capture`, `graph_source_witness_get`
 **Templates (4):** `graph_template_list`, `graph_template_instantiate`, `graph_template_candidates`, `graph_template_outcomes`
 **Receipts & status (3):** `graph_policy_check`, `graph_run_receipt`, `graph_status`
+**Retention (2):** `graph_retention_review`, `graph_retention_set`
 
 ## Ecosystem
 
@@ -204,11 +265,11 @@ Human-in-the-loop approvals are backed by durable SQLite checkpoints. When a gra
 ## Verification
 
 ```bash
-# Smoke test — verify 25 tools are exposed
+# Smoke test — verify 27 tools are exposed
 echo '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | \
   npx -y @recursiveintell/agent-graph-mcp --direct --base-url http://127.0.0.1:11434 --model llama3.2:3b 2>/dev/null | \
   python3 -c "import sys,json; msg=json.loads(sys.stdin.read()); print(f'{len(msg[\"result\"][\"tools\"])} tools')"
-# Expected: 25 tools
+# Expected: 27 tools
 
 # Build and test suite
 cargo build --release
@@ -222,11 +283,12 @@ cargo test --lib --test daemon_recovery --test mcp_integration
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
 | `tools/list` returns 0 or errors | MCP relay or daemon not running | Verify daemon: `agent-graph-mcpd --data-dir ... &`. Check `graph_status` |
-| LLM nodes hang | Provider unreachable or model name wrong | Test: `curl http://127.0.0.1:11434/api/tags` |
+| LLM nodes hang | Provider unreachable or model name wrong | Test endpoint: `curl <your-base-url>/models` (Ollama) or `curl -H "Authorization: Bearer $OPENAI_API_KEY" <your-base-url>/models` (cloud) |
 | `graph_run_start` returns immediately | Run is async by default | Use `graph_run_wait` to block on completion, or `graph_execute` for sync |
-| "socket not found" | Daemon not started or socket path mismatch | Ensure `--socket` matches between daemon and client |
+| "socket not found" | Daemon not started or socket path mismatch | Ensure `--socket` matches between daemon and proxy. Default is `/tmp/agent-graph/mcp.sock` |
 | Approval stuck | Human hasn't decided | Check `graph_approval_list`, use `graph_approval_request` with decision |
 | Execution hangs silently | Logging too quiet | Run daemon with `RUST_LOG=debug agent-graph-mcpd ...` — logs to stderr. For `--direct` mode, add `RUST_LOG=debug` before the command |
+| Unknown model errors | Default model is `glm-5.2:cloud` | Always pass `--model`. The default exists for backward compatibility and won't exist on your endpoint |
 
 ## Status and limitations
 
@@ -235,7 +297,7 @@ cargo test --lib --test daemon_recovery --test mcp_integration
 - **No CI currently configured.** All verification is local.
 - **Durable execution** requires the daemon. Direct mode is ephemeral.
 - **Max parallelism:** 16 nodes per parallel fan-out (compiler-enforced).
-- **LLM providers:** any OpenAI-compatible endpoint. Tested primarily with Ollama and OpenRouter.
+- **LLM providers:** any OpenAI-compatible endpoint. See [Provider and model configuration](#provider-and-model-configuration) for tested providers and setup.
 
 ## Support, security, and contributing
 
