@@ -3,6 +3,12 @@ use rmcp::ServiceExt;
 use std::io::{self, BufRead, Write};
 
 fn main() {
+    // Initialize tracing. Set RUST_LOG=debug for verbose daemon logs.
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .init();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("--direct") {
         let direct: Vec<String> = args.into_iter().skip(1).collect();
