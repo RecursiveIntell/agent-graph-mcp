@@ -55,6 +55,47 @@ agent-graph-mcp --socket /tmp/agent-graph.sock
 | `--direct` | Single MCP client, no persistence needed, simplest setup |
 | `--socket` (daemon) | Multiple clients, durable graph storage, long-running workflows, HITL approvals |
 
+## Provider and model configuration
+
+Every graph run sends LLM calls to an OpenAI-compatible endpoint. You control **where** (`--base-url`) and **which model** (`--model`). The API key flows through the `OPENAI_API_KEY` environment variable.
+
+### Daemon mode (persistent)
+
+```bash
+# Ollama (local)
+agent-graph-mcpd --base-url http://127.0.0.1:11434 --model llama3.2:3b
+
+# OpenAI
+OPENAI_API_KEY=sk-... agent-graph-mcpd --base-url https://api.openai.com/v1 --model gpt-4o
+
+# DeepSeek
+OPENAI_API_KEY=sk-... agent-graph-mcpd --base-url https://api.deepseek.com/v1 --model deepseek-v4-pro
+
+# OpenRouter (any model)
+OPENAI_API_KEY=sk-or-... agent-graph-mcpd --base-url https://openrouter.ai/api/v1 --model openai/gpt-4o
+
+# Alibaba MaaS (note: has gateway body-size limits — large councils may need trimming)
+OPENAI_API_KEY=sk-... agent-graph-mcpd --base-url https://llm-<id>.ap-southeast-1.maas.aliyuncs.com/compatible-mode --model deepseek-v4-flash
+```
+
+### Direct mode (ephemeral, same flags)
+
+```bash
+npx -y @recursiveintell/agent-graph-mcp --direct --base-url https://api.deepseek.com/v1 --model deepseek-v4-pro
+```
+
+### Current state
+
+| Provider | Tested | Notes |
+|----------|--------|-------|
+| Ollama (local) | ✅ daily | Lowest latency, no API key needed |
+| DeepSeek | ✅ daily | Primary cloud provider. `deepseek-v4-pro` for large councils, `deepseek-v4-flash` for fast fan-out |
+| OpenRouter | ✅ works | Any model, pay-per-token. Set `OPENAI_API_KEY` to your OpenRouter key |
+| OpenAI | ⚠️ compatible | Untested but OpenAI-compatible. Same flag pattern |
+| Alibaba MaaS | ⚠️ body-size limit | Gateway rejects payloads > ~100KB — trim council context before dispatch |
+
+**Choosing a model for agent-graph:** Fan-out nodes share the same model. For 9-agent sweeps, use a fast model (`deepseek-v4-flash`, `llama3.2:3b`). For synthesis/report nodes that process all collected results, prefer a larger-context model (`deepseek-v4-pro`, `gpt-4o`). The daemon currently uses a single model for all nodes in a graph; per-node model selection is tracked but not yet shipped.
+
 ## Client configs
 
 **Hermes Agent:**
