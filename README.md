@@ -79,6 +79,42 @@ agent-graph-mcp --socket /tmp/agent-graph/mcp.sock
 
 Every graph run sends LLM calls to an OpenAI-compatible endpoint. You control **where** (`--base-url`) and **which model** (`--model`). The API key flows through the `OPENAI_API_KEY` environment variable.
 
+### Setting your API key
+
+All OpenAI-compatible providers use the same variable — `OPENAI_API_KEY`. Set it one of these ways:
+
+```bash
+# Inline (visible in process list — use only for testing)
+OPENAI_API_KEY=sk-... agent-graph-mcpd --base-url https://api.deepseek.com/v1 --model deepseek-v4-pro
+
+# Export (session-only)
+export OPENAI_API_KEY=sk-...
+agent-graph-mcpd --base-url https://api.deepseek.com/v1 --model deepseek-v4-pro
+
+# systemd unit (persistent, recommended)
+# Add to ~/.config/systemd/user/agent-graph-mcpd.service:
+#   [Service]
+#   Environment=OPENAI_API_KEY=sk-...
+systemctl --user daemon-reload
+systemctl --user restart agent-graph-mcpd
+```
+
+For convenience, the daemon also accepts `AGENT_GRAPH_API_KEY` — if set, it takes precedence over `OPENAI_API_KEY`. Use this when you want to isolate the agent-graph key from other tools that read `OPENAI_API_KEY`.
+
+**Security note:** Never commit API keys to git, dotfiles, or shell history. Use a secrets manager (1Password CLI, `pass`, systemd `LoadCredential=`) or set the environment at boot.
+
+### Provider-specific keys
+
+| Provider | Key format | Where to get it |
+|----------|-----------|-----------------|
+| DeepSeek | `sk-...` | [platform.deepseek.com/api_keys](https://platform.deepseek.com/api_keys) |
+| OpenAI | `sk-proj-...` or `sk-...` | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) |
+| OpenRouter | `sk-or-v1-...` | [openrouter.ai/keys](https://openrouter.ai/keys) |
+| Alibaba MaaS | `sk-...` | Alibaba Cloud console → Model Studio → API Keys |
+| Ollama | None required | Local, no key needed |
+
+All providers use the same env var name. Just set `OPENAI_API_KEY` to the key for whichever provider you're pointing `--base-url` at.
+
 ### Daemon mode (persistent)
 
 ```bash
@@ -152,7 +188,8 @@ Prefers daemon mode. All daemon flags above plus:
 
 | Variable | Used by | Description |
 |----------|---------|-------------|
-| `OPENAI_API_KEY` | Daemon, direct | API key for the LLM provider |
+| `OPENAI_API_KEY` | Daemon, direct | API key for the LLM provider. Works for all OpenAI-compatible endpoints (DeepSeek, OpenAI, OpenRouter, etc.) |
+| `AGENT_GRAPH_API_KEY` | Daemon, direct | Optional. Takes precedence over `OPENAI_API_KEY`. Use to isolate the agent-graph key from other tools |
 | `AGENT_GRAPH_INTEGRITY_KEY_PATH` | Daemon, direct | Alternative to `--integrity-key` for receipt signing |
 | `RUST_LOG` | Both | Log level. Set to `debug` for verbose output |
 
