@@ -1,4 +1,4 @@
-use agent_graph_mcp::{cli, daemon, AgentGraphServer};
+use agent_graph_mcp::{daemon, AgentGraphServer};
 use rmcp::ServiceExt;
 use std::{os::unix::fs::PermissionsExt, path::PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
