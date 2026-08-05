@@ -135,8 +135,7 @@ pub fn compile(spec: &GraphSpec, cx: CompileContext) -> Result<AgentGraph, Strin
                     .get("tools")
                     .and_then(|v| v.as_array())
                     .map(|arr| arr.clone())
-                    .filter(|arr| !arr.is_empty())
-                    .unwrap_or_else(default_tools);
+                    .unwrap_or_default();
                 Box::new(LlmNode {
                     id: node.id.clone(),
                     base_url: cx.base_url.clone(),
