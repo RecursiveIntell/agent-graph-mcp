@@ -10,6 +10,7 @@ use ri_agent_graph::retry::RetryPolicy;
 use ri_agent_graph::AgentGraph;
 use tokio::sync::Notify;
 
+use crate::model_executor::ExecutorHandle;
 use crate::nodes::{
     legacy_router, HumanApprovalNode, LlmNode, PassthroughNode, RouterConfig, RouterNode,
     RunContext, ToolNode, TransformConfig, TransformNode,
@@ -48,6 +49,7 @@ pub fn compile(spec: &GraphSpec, cx: CompileContext) -> Result<AgentGraph, Strin
         llm_calls: cx.llm_calls,
         max_llm_calls: cx.max_llm_calls,
         llm_invocations: cx.llm_invocations,
+        executor: ExecutorHandle::none(),
     };
     let mut builder = AgentGraph::builder()
         .with_name(&spec.name)

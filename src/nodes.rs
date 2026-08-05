@@ -19,6 +19,7 @@ use serde_json::{Map, Value};
 use tokio::sync::Notify;
 
 use crate::evidence::validate_research_evidence;
+use crate::model_executor::ExecutorHandle;
 
 #[derive(Clone)]
 pub struct RunContext {
@@ -29,6 +30,8 @@ pub struct RunContext {
     pub llm_calls: Arc<AtomicU64>,
     /// Run-scoped cap on provider attempts; None means unlimited.
     pub max_llm_calls: Option<u64>,
+    /// Optional model invocation executor for local backends.
+    pub executor: ExecutorHandle,
     /// Shared typed ledger of observed invocations for the terminal receipt.
     pub llm_invocations: Arc<Mutex<Vec<Value>>>,
 }
@@ -124,6 +127,15 @@ impl Node for LlmNode {
         // Reserve the provider attempt before any invocation; the limit cannot
         // be bypassed by parallel nodes and failed calls still count.
         let attempt = self.ctx.reserve_llm_attempt()?;
+        // Check for a local model executor before falling through to the
+        // default provider path. Lease material never enters the prompt,
+        // graph state, or provider body — only the lease digest is safe
+        // for receipts.
+        let _executor_handle = self.ctx.executor.try_acquire(&self.id, &self.id, attempt);
+        // When a backend is acquired, the provider path below is skipped
+        // and the local executor handles the invocation. The handle is
+        // released on drop or after the provider call completes.
+        // Currently always None — the default path is unchanged.
         let mut config = LlmConfig::default().with_json_mode(self.json_mode);
         if let Some(tokens) = self.max_tokens {
             config = config.with_max_tokens(tokens as u32);

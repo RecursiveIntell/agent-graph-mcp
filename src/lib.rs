@@ -7,6 +7,7 @@ pub mod evidence;
 pub mod fs_security;
 pub mod lifecycle;
 pub mod migrations;
+pub mod model_executor;
 pub mod nodes;
 pub mod operator;
 pub mod operator_auth;
