@@ -608,6 +608,7 @@ fn validate_node(node: &NodeSpec, ids: &BTreeSet<&str>) -> Result<(), String> {
             "first_non_null",
             "all_success",
             "quorum",
+            "collect_object",
         ]
         .contains(&mode)
         {

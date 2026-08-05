@@ -33,6 +33,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 provekv = { path = "../../proveKV/proveKV", optional = true }
 blake3 = { version = "1", optional = true }
 rand = { version = "0.8", optional = true }
+regex = "1.11"
+uuid = { version = "1", features = ["v4", "serde"] }
 
 [features]
 default = []

@@ -123,6 +123,21 @@ impl Node for LlmNode {
         if !self.input_key.is_empty() {
             rendered = rendered.replace(&format!("{{{}}}", self.input_key), &input_json);
         }
+        // Expand any remaining {keyname} placeholders from agent state.
+        // Council specs use cross-node references like {attack} and {cross_reviewed}
+        // which are separate state keys, not the current node's input_key.
+        let state_snapshot = state.snapshot().await;
+        for (key, value) in &state_snapshot.data {
+            if key.starts_with("__") {
+                continue; // skip internal keys
+            }
+            let placeholder = format!("{{{}}}", key);
+            if rendered.contains(&placeholder) {
+                if let Ok(json_str) = serde_json::to_string(value) {
+                    rendered = rendered.replace(&placeholder, &json_str);
+                }
+            }
+        }
         let model = self.model.as_deref().unwrap_or(&self.default_model);
         // Reserve the provider attempt before any invocation; the limit cannot
         // be bypassed by parallel nodes and failed calls still count.
@@ -463,6 +478,11 @@ async fn predicate(state: &AgentState, rule: &Rule) -> Result<bool> {
             .as_f64()
             .zip(rule.value.as_f64())
             .is_some_and(|(a, b)| a >= b),
+        "regex" => rule
+            .value
+            .as_str()
+            .and_then(|pat| regex::Regex::new(pat).ok())
+            .is_some_and(|re| re.is_match(&value_text(&value))),
         _ => false,
     })
 }

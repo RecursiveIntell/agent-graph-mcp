@@ -141,6 +141,13 @@ pub fn compile(spec: &GraphSpec, cx: CompileContext) -> Result<AgentGraph, Strin
                     .unwrap_or("collect_array")
                 {
                     "collect_array" => Box::new(JoinNode::collect_array(inputs, output)),
+                    "collect_object" => Box::new(JoinNode::new(inputs, output, |values| {
+                        let obj: serde_json::Map<String, serde_json::Value> = values
+                            .into_iter()
+                            .map(|(k, v)| (k, v))
+                            .collect();
+                        Ok(serde_json::Value::Object(obj))
+                    })),
                     "merge_objects" => Box::new(JoinNode::merge_objects(inputs, output)),
                     "first_non_null" => Box::new(JoinNode::new(inputs, output, |values| {
                         Ok(values
