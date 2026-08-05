@@ -496,7 +496,7 @@ fn validate_node(node: &NodeSpec, ids: &BTreeSet<&str>) -> Result<(), String> {
             {
                 let op = rule.get("op").and_then(Value::as_str).unwrap_or("");
                 if ![
-                    "equals", "eq", "exists", "contains", "lt", "lte", "gt", "gte",
+                    "equals", "eq", "exists", "contains", "lt", "lte", "gt", "gte", "regex",
                 ]
                 .contains(&op)
                 {
