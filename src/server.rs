@@ -209,6 +209,15 @@ pub struct AgentGraphServer {
 }
 
 impl AgentGraphServer {
+    /// Open a proveKV executor using the server's local state directory.
+    #[cfg(feature = "provekv")]
+    pub fn open_provekv_executor(
+        root: impl Into<PathBuf>,
+    ) -> Result<crate::provekv_executor::ProveKvExecutor, String> {
+        crate::provekv_executor::ProveKvExecutor::open(root)
+            .map_err(|error| format!("open proveKV executor: {error}"))
+    }
+
     fn graph_requires_witness_store(spec: &GraphSpec) -> bool {
         spec.nodes.iter().any(|node| node.evidence_required)
     }

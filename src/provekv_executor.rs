@@ -37,8 +37,6 @@ pub struct ProveKvExecutor {
     store: Mutex<provekv::StateStore>,
     /// Active leases by (run_id, node_id, attempt_id).
     active_leases: Mutex<HashMap<(String, String, u64), provekv::StateLease>>,
-    /// Store root directory for persistence across restarts.
-    root: PathBuf,
 }
 
 impl ProveKvExecutor {
@@ -49,8 +47,19 @@ impl ProveKvExecutor {
         Ok(Self {
             store: Mutex::new(store),
             active_leases: Mutex::new(HashMap::new()),
-            root,
         })
+    }
+
+    /// Replay a previously captured state by ID.
+    pub fn replay_state(
+        &self,
+        state_id: &provekv::HybridStateId,
+    ) -> Option<provekv::HybridStateManifestV1> {
+        self.store
+            .lock()
+            .unwrap()
+            .get(state_id)
+            .map(|state| state.manifest.clone())
     }
 
     /// Commit a state to the store and return its ID.
@@ -177,6 +186,22 @@ mod tests {
             .fork_state(&root, sample_manifest("child"))
             .unwrap();
         assert_ne!(root.as_str(), child.as_str());
+    }
+
+    #[test]
+    fn state_capture_fork_replay_cycle_preserves_lineage() {
+        let executor = temp_executor();
+        let captured = sample_manifest("captured");
+        let root = executor.commit_state(captured.clone()).unwrap();
+        let fork = executor
+            .fork_state(&root, sample_manifest("forked"))
+            .unwrap();
+
+        let replayed_root = executor.replay_state(&root).unwrap();
+        let replayed_fork = executor.replay_state(&fork).unwrap();
+        assert_eq!(replayed_root, captured);
+        assert_eq!(replayed_fork, sample_manifest("forked"));
+        assert_ne!(root, fork);
     }
 
     #[test]
