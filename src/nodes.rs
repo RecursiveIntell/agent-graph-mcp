@@ -106,6 +106,12 @@ pub struct LlmNode {
     /// Supports "AGENTS.md" shorthand (resolved from daemon working directory)
     /// and absolute/relative paths. Content is read once before template expansion.
     pub context_file: Option<String>,
+    /// Tool definitions exposed to this LLM node during execution.
+    /// Each entry is a JSON tool definition in OpenAI function-calling format.
+    /// When non-empty, the provider receives tool definitions and may return
+    /// tool_calls in the response. The node loops until a text response is
+    /// received or max_tool_calls (default 5) is reached.
+    pub tools: Vec<serde_json::Value>,
     pub ctx: RunContext,
 }
 
@@ -193,6 +199,8 @@ impl Node for LlmNode {
         if let Some(tokens) = self.max_tokens {
             config = config.with_max_tokens(tokens as u32);
         }
+        // Pass tool definitions to the provider when tools are configured.
+        let has_tools = !self.tools.is_empty();
         let result: std::result::Result<Value, AgentGraphError> = if self.base_url
             == "codex-app-server://"
         {

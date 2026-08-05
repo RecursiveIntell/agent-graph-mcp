@@ -79,6 +79,12 @@ pub fn compile(spec: &GraphSpec, cx: CompileContext) -> Result<AgentGraph, Strin
                     .get("context_file")
                     .and_then(|v| v.as_str())
                     .map(str::to_owned);
+                let tools: Vec<serde_json::Value> = node
+                    .config
+                    .get("tools")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.clone())
+                    .unwrap_or_default();
                 Box::new(LlmNode {
                     id: node.id.clone(),
                     base_url: cx.base_url.clone(),
@@ -106,6 +112,7 @@ pub fn compile(spec: &GraphSpec, cx: CompileContext) -> Result<AgentGraph, Strin
                     input_key,
                     output_key,
                     context_file,
+                    tools,
                     ctx: run.clone(),
                 })
             }
