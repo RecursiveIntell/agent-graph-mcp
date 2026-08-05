@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod bridge_config;
 pub mod checkpoint_binding;
 pub mod cli;
 pub mod codex_app_server;
