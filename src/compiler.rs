@@ -18,6 +18,55 @@ use crate::nodes::{
 use crate::spec::{GraphSpec, NodeType, ReducerKind};
 use serde_json::Value;
 
+
+fn default_tools() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "search_memory",
+                "description": "Search semantic memory for facts, claims, and past work.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Search keywords or namespace: prefix"}
+                    },
+                    "required": ["query"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file. Returns content with line numbers.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "File path to read"}
+                    },
+                    "required": ["path"]
+                }
+            }
+        }),
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "search_codebase",
+                "description": "Search codebase for files, types, or patterns.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": {"type": "string", "description": "Search pattern"},
+                        "path": {"type": "string", "description": "Directory to search"}
+                    },
+                    "required": ["pattern"]
+                }
+            }
+        })
+    ]
+}
+
 pub struct CompileContext {
     pub base_url: String,
     pub default_model: String,
@@ -29,6 +78,8 @@ pub struct CompileContext {
     pub llm_invocations: Arc<Mutex<Vec<Value>>>,
     /// Provider API key for http(s) llm-pipeline calls (Bearer header).
     pub api_key: Option<String>,
+    /// Optional model invocation executor for local backends (proveKV).
+    pub executor: ExecutorHandle,
 }
 
 struct Collector(Arc<Mutex<Vec<GraphEvent>>>);
@@ -49,7 +100,7 @@ pub fn compile(spec: &GraphSpec, cx: CompileContext) -> Result<AgentGraph, Strin
         llm_calls: cx.llm_calls,
         max_llm_calls: cx.max_llm_calls,
         llm_invocations: cx.llm_invocations,
-        executor: ExecutorHandle::none(),
+        executor: cx.executor.clone(),
     };
     let mut builder = AgentGraph::builder()
         .with_name(&spec.name)
@@ -84,7 +135,8 @@ pub fn compile(spec: &GraphSpec, cx: CompileContext) -> Result<AgentGraph, Strin
                     .get("tools")
                     .and_then(|v| v.as_array())
                     .map(|arr| arr.clone())
-                    .unwrap_or_default();
+                    .filter(|arr| !arr.is_empty())
+                    .unwrap_or_else(default_tools);
                 Box::new(LlmNode {
                     id: node.id.clone(),
                     base_url: cx.base_url.clone(),

@@ -13,6 +13,7 @@ use serde_json::Value;
 use tokio::sync::Notify;
 
 use crate::compiler::{compile, CompileContext};
+use crate::model_executor::ExecutorHandle;
 use crate::evidence::{bundle, digest, redact, validate_witness_dependencies};
 use crate::spec::{ensure_size, GraphSpec, MAX_OUTPUT_BYTES, MAX_STATE_BYTES};
 use crate::store::PersistentStore;
@@ -456,6 +457,7 @@ impl RunManager {
                 max_llm_calls: budgets.as_ref().and_then(|budget| budget.max_llm_calls),
                 llm_invocations: llm_invocations.clone(),
                 api_key: self.api_key.clone(),
+                executor: ExecutorHandle::none(),
             },
         )?;
         let starting_state = initial_state
