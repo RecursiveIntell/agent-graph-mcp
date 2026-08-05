@@ -102,6 +102,10 @@ pub struct LlmNode {
     pub timeout_ms: u64,
     pub input_key: String,
     pub output_key: String,
+    /// Optional file path to prepend to the prompt for project-specific context.
+    /// Supports "AGENTS.md" shorthand (resolved from daemon working directory)
+    /// and absolute/relative paths. Content is read once before template expansion.
+    pub context_file: Option<String>,
     pub ctx: RunContext,
 }
 
@@ -114,6 +118,40 @@ impl Node for LlmNode {
             .await?
             .unwrap_or(Value::Null);
         let input_json = serde_json::to_string(&input)?;
+        // Prepend context file content if configured. This allows graph specs
+        // to reference AGENTS.md or project files instead of embedding massive
+        // context in every prompt. Large files (>32KB) are truncated.
+        let mut rendered = if let Some(ref cf) = self.context_file {
+            let resolved = match cf.as_str() {
+                "AGENTS.md" => {
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    cwd.join("AGENTS.md")
+                }
+                p if p.starts_with('/') => std::path::PathBuf::from(p),
+                p => {
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    cwd.join(p)
+                }
+            };
+            match std::fs::read_to_string(&resolved) {
+                Ok(file_content) => {
+                    let truncated: String = file_content.chars().take(32768).collect();
+                    format!(
+                        "[CONTEXT FILE: {}]
+
+{}
+
+---
+
+{}",
+                        cf, truncated, self.prompt
+                    )
+                }
+                Err(_) => self.prompt.clone(),
+            }
+        } else {
+            self.prompt.clone()
+        };
         // Expand the input placeholder. Council specs reference the input key
         // by name (e.g. {brief}, {plan}, {input}) — the daemon previously only
         // expanded {input}, so prompts using {<input_key>} sent the literal
