@@ -20,6 +20,7 @@ use tokio::sync::Notify;
 
 use crate::evidence::validate_research_evidence;
 use crate::model_executor::ExecutorHandle;
+use crate::tool_exec::ToolExecContext;
 
 #[derive(Clone)]
 pub struct RunContext {
@@ -201,7 +202,24 @@ impl Node for LlmNode {
         }
         // Pass tool definitions to the provider when tools are configured.
         let has_tools = !self.tools.is_empty();
-        let result: std::result::Result<Value, AgentGraphError> = if self.base_url
+        let result: std::result::Result<Value, AgentGraphError> = if has_tools {
+            let tool_ctx = ToolExecContext::new(&self.tools)
+                .map_err(AgentGraphError::PayloadError)?;
+            let runner = tool_ctx.runner();
+            let mut request = llm_pipeline::ToolLoopRequest::new(model, rendered.clone());
+            request.config = config;
+            request.max_round_trips = 5;
+            request.api_key = self.api_key.clone();
+            let exec_ctx = ExecCtx::builder(&self.base_url).build();
+            let use_openai = self.base_url.starts_with("http://") || self.base_url.starts_with("https://");
+            let response = tokio::task::spawn_blocking(move || {
+                tokio::runtime::Handle::current().block_on(async move {
+                    if use_openai { runner.run_openai_responses(&exec_ctx, request).await }
+                    else { runner.run_ollama(&exec_ctx, request).await }
+                })
+            }).await.map_err(|e| AgentGraphError::PayloadError(format!("tool loop task failed: {e}")))?;
+            response.map(|r| Value::String(r.final_text)).map_err(|e| AgentGraphError::PayloadError(e.to_string()))
+        } else if self.base_url
             == "codex-app-server://"
         {
             let model = model.to_owned();

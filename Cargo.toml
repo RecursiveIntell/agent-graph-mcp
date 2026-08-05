@@ -15,6 +15,7 @@ categories = ["development-tools", "asynchronous"]
 [dependencies]
 ri-agent-graph = "0.2"
 llm-pipeline = { version = "0.2", features = ["openai"] }
+llm-tool-runtime = "0.1"
 async-trait = "0.1"
 rmcp = { version = "1", features = ["server", "transport-io"] }
 anyhow = "1"

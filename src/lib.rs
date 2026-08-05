@@ -10,6 +10,7 @@ pub mod lifecycle;
 pub mod migrations;
 pub mod model_executor;
 pub mod nodes;
+pub mod tool_exec;
 pub mod operator;
 pub mod operator_auth;
 pub mod operator_ipc;
