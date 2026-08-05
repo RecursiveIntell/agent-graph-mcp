@@ -30,6 +30,13 @@ fs2 = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+provekv = { path = "../../proveKV/proveKV", optional = true }
+blake3 = { version = "1", optional = true }
+rand = { version = "0.8", optional = true }
+
+[features]
+default = []
+provekv = ["dep:provekv", "dep:blake3", "dep:rand"]
 
 [dev-dependencies]
 tempfile = "3"

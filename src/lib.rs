@@ -17,6 +17,8 @@ pub mod operator_ipc;
 pub mod owner_lock;
 pub mod policy;
 pub mod promotion;
+#[cfg(feature = "provekv")]
+pub mod provekv_executor;
 pub mod proxy;
 pub mod run_manager;
 pub mod server;
