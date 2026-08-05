@@ -247,14 +247,20 @@ fn budget_exhaustion_blocks_further_calls() {
 
     // First two calls succeed.
     let r1 = reserve_call(
-        &signed, &key(), Utc::now(), binding(),
+        &signed,
+        &key(),
+        Utc::now(),
+        binding(),
         invocation("read_file", ToolEffect::ReadOnly),
     )
     .expect("call 1");
     assert_eq!(r1.updated_lease.lease.counters.tool_calls, 1);
 
     let r2 = reserve_call(
-        &r1.updated_lease, &key(), Utc::now(), binding(),
+        &r1.updated_lease,
+        &key(),
+        Utc::now(),
+        binding(),
         invocation("search_files", ToolEffect::ReadOnly),
     )
     .expect("call 2");
@@ -263,7 +269,10 @@ fn budget_exhaustion_blocks_further_calls() {
     // Third call must fail.
     assert_eq!(
         reserve_call(
-            &r2.updated_lease, &key(), Utc::now(), binding(),
+            &r2.updated_lease,
+            &key(),
+            Utc::now(),
+            binding(),
             invocation("web_search", ToolEffect::ReadOnly),
         )
         .unwrap_err(),
@@ -279,7 +288,10 @@ fn tool_not_in_allowlist_is_denied() {
 
     // Allowed.
     reserve_call(
-        &signed, &key(), Utc::now(), binding(),
+        &signed,
+        &key(),
+        Utc::now(),
+        binding(),
         invocation("read_file", ToolEffect::ReadOnly),
     )
     .expect("allowed");
@@ -287,7 +299,10 @@ fn tool_not_in_allowlist_is_denied() {
     // Denied — not in allowlist.
     assert_eq!(
         reserve_call(
-            &signed, &key(), Utc::now(), binding(),
+            &signed,
+            &key(),
+            Utc::now(),
+            binding(),
             invocation("web_search", ToolEffect::ReadOnly),
         )
         .unwrap_err(),
@@ -330,7 +345,10 @@ fn effect_classification_mismatch_is_denied() {
     // Claim read_only but classify_tool says write_file is LocalMutation.
     assert_eq!(
         reserve_call(
-            &signed, &key(), Utc::now(), binding(),
+            &signed,
+            &key(),
+            Utc::now(),
+            binding(),
             invocation("write_file", ToolEffect::ReadOnly),
         )
         .unwrap_err(),
@@ -342,7 +360,10 @@ fn effect_classification_mismatch_is_denied() {
 fn receipt_chain_rejects_wrong_parent() {
     let signed = issue_lease(lease(), &key()).expect("signed");
     let r1 = reserve_call(
-        &signed, &key(), Utc::now(), binding(),
+        &signed,
+        &key(),
+        Utc::now(),
+        binding(),
         invocation("read_file", ToolEffect::ReadOnly),
     )
     .expect("reservation 1");
@@ -350,7 +371,10 @@ fn receipt_chain_rejects_wrong_parent() {
     let mut r2_invocation = invocation("search_files", ToolEffect::ReadOnly);
     r2_invocation.parent_receipt_digest = Some("sha256:correct-parent".into());
     let r2 = reserve_call(
-        &r1.updated_lease, &key(), Utc::now(), binding(),
+        &r1.updated_lease,
+        &key(),
+        Utc::now(),
+        binding(),
         r2_invocation,
     )
     .expect("reservation 2");
@@ -395,7 +419,10 @@ fn replay_detection_requires_exact_idempotency() {
 fn receipt_summary_too_large_is_rejected() {
     let signed = issue_lease(lease(), &key()).expect("signed");
     let reserved = reserve_call(
-        &signed, &key(), Utc::now(), binding(),
+        &signed,
+        &key(),
+        Utc::now(),
+        binding(),
         invocation("read_file", ToolEffect::ReadOnly),
     )
     .expect("reservation");
@@ -432,7 +459,10 @@ fn concurrent_counters_are_atomic_per_reservation() {
             ("write_file", ToolEffect::LocalMutation)
         };
         current = reserve_call(
-            &current, &key(), Utc::now(), binding(),
+            &current,
+            &key(),
+            Utc::now(),
+            binding(),
             invocation(tool.0, tool.1),
         )
         .expect("call")

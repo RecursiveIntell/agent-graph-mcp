@@ -1311,7 +1311,18 @@ impl PersistentStore {
                     .state
                     .as_deref()
                     .ok_or(OperatorRetentionError::InvalidState)?;
-                if !matches!(state, "active" | "active_phantom_contaminated" | "pinned" | "archived" | "expired_pending_review" | "clear_approved" | "lineage_cleared" | "purged" | "delete_candidate") {
+                if !matches!(
+                    state,
+                    "active"
+                        | "active_phantom_contaminated"
+                        | "pinned"
+                        | "archived"
+                        | "expired_pending_review"
+                        | "clear_approved"
+                        | "lineage_cleared"
+                        | "purged"
+                        | "delete_candidate"
+                ) {
                     return Err(OperatorRetentionError::InvalidState);
                 }
                 tx.execute(

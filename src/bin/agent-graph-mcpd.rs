@@ -15,6 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut base_url = String::from("http://127.0.0.1:11434");
     let mut model = String::from("glm-5.2:cloud");
     let mut max_graphs: usize = 64;
+    let mut api_key: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -29,9 +30,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .parse()
                     .map_err(|_| "max-graphs must be a number")?;
             }
+            "--api-key" => {
+                api_key = Some(args.next().ok_or("missing api-key value")?.to_string());
+            }
             "--help" => {
                 println!(
-                    "agent-graph-mcpd --data-dir PATH --socket PATH [--base-url URL] [--model NAME] [--max-graphs N]"
+                    "agent-graph-mcpd --data-dir PATH --socket PATH [--base-url URL] [--model NAME] [--api-key KEY] [--max-graphs N]"
                 );
                 return Ok(());
             }
@@ -76,9 +80,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let key_path = key_path.clone();
                 let base_url = base_url.clone();
                 let model = model.clone();
+                let api_key = api_key.clone();
                 tokio::spawn(async move {
-                    let _ = serve_connection(stream, &data_dir, key_path.as_deref(), &base_url, &model, max_graphs)
-                        .await;
+                    let _ = serve_connection(
+                        stream,
+                        &data_dir,
+                        key_path.as_deref(),
+                        &base_url,
+                        &model,
+                        api_key.as_deref(),
+                        max_graphs,
+                    )
+                    .await;
                 });
             }
         });
@@ -92,6 +105,7 @@ async fn serve_connection(
     key_path: Option<&std::path::Path>,
     base_url: &str,
     model: &str,
+    api_key: Option<&str>,
     max_graphs: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (mut sock_rx, mut sock_tx) = stream.into_split();
@@ -147,12 +161,13 @@ async fn serve_connection(
         }
     });
 
-    let server = AgentGraphServer::new_with_max_graphs(
+    let server = AgentGraphServer::new_with_max_graphs_and_key(
         base_url.to_owned(),
         model.to_owned(),
         Some(data_dir.to_path_buf()),
         key_path.map(|p| p.to_path_buf()),
         max_graphs,
+        api_key.map(|s| s.to_owned()),
     )
     .map_err(std::io::Error::other)?;
 

@@ -870,7 +870,11 @@ impl AgentGraphServer {
         let overwrite = overwrite.unwrap_or(false);
         if !overwrite && !graphs.contains_key(&name) && graphs.len() >= self.max_graphs {
             return Ok(error_output(
-                format!("graph capacity ({}) exhausted — {} graphs registered", self.max_graphs, graphs.len()),
+                format!(
+                    "graph capacity ({}) exhausted — {} graphs registered",
+                    self.max_graphs,
+                    graphs.len()
+                ),
                 "CAPACITY_EXHAUSTED",
             ));
         }
