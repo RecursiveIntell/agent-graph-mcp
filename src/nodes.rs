@@ -281,7 +281,23 @@ impl Node for LlmNode {
             tokio::select! {
                 result = call.invoke(&exec_ctx, input) => result
                     .map_err(|e| AgentGraphError::PayloadError(e.to_string()))
-                    .map(|payload| payload.value),
+                    .map(|mut payload| {
+                        // Qwen models on Ollama output to the `reasoning`
+                        // field (thinking mode) with empty `content`. When
+                        // content is empty and reasoning is populated, use
+                        // reasoning as the content so graph nodes receive
+                        // usable output.
+                        if let Some(content) = payload.value.get("content") {
+                            if content.as_str().map_or(false, |s| s.is_empty()) {
+                                if let Some(reasoning) = payload.value.get("reasoning") {
+                                    if reasoning.as_str().map_or(false, |s| !s.is_empty()) {
+                                        payload.value["content"] = reasoning.clone();
+                                    }
+                                }
+                            }
+                        }
+                        payload.value
+                    }),
                 _ = cancellation_requested(self.ctx.cancelled.clone(), self.ctx.cancellation.clone()) => {
                     Err(AgentGraphError::Cancelled)
                 }
