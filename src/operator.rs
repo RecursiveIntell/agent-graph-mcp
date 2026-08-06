@@ -49,7 +49,7 @@ impl OperatorService {
         if let Err(code) = validate(&frame) {
             return error(code);
         }
-        if frame.resource_kind != "graph" {
+        if frame.resource_kind != "graph" && !(frame.action == OperatorAction::DecideApproval && frame.resource_kind == "approval") {
             return error("OPERATOR_RESOURCE_UNSUPPORTED");
         }
         if !self.allowed_uids.contains(&peer.uid) {
@@ -87,9 +87,48 @@ impl OperatorService {
                 | OperatorAction::PromoteTemplate
                 | OperatorAction::Migrate
                 | OperatorAction::Install
+                | OperatorAction::DecideApproval
         ) {
             return error("OPERATOR_ACTION_UNSUPPORTED");
         }
+        // ── DecideApproval: authenticated operator decision on a durable approval.
+        if frame.action == OperatorAction::DecideApproval {
+            let material: Value = match frame.decision_material.as_deref() {
+                Some(raw) => match serde_json::from_str(raw) {
+                    Ok(v) => v,
+                    Err(_) => return error("OPERATOR_DECISION_INVALID"),
+                },
+                None => json!({}),
+            };
+            let decision = material
+                .get("decision")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let actor = material
+                .get("claimed_actor_label")
+                .and_then(Value::as_str)
+                .unwrap_or("operator");
+            match self
+                .store
+                .decide_checkpoint_approval(&frame.resource_id, decision, actor, Utc::now())
+            {
+                Ok(approved) => OperatorResponse {
+                    protocol: PROTOCOL.into(),
+                    ok: true,
+                    error_code: None,
+                    receipt_id: Some(approved.approval.approval_id.clone()),
+                },
+                Err(err) => {
+                    let code = err.code();
+                    OperatorResponse {
+                        protocol: PROTOCOL.into(),
+                        ok: false,
+                        error_code: Some(code.into()),
+                        receipt_id: None,
+                    }
+                }
+            }
+        } else {
         let material: Value = match frame.decision_material.as_deref() {
             Some(raw) => match serde_json::from_str(raw) {
                 Ok(v) => v,
@@ -147,6 +186,7 @@ impl OperatorService {
                 OperatorRetentionError::InvalidAction => "OPERATOR_ACTION_UNSUPPORTED",
                 OperatorRetentionError::Persistence => "OPERATOR_PERSISTENCE_FAILED",
             }),
+        }
         }
     }
 }

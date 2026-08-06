@@ -2177,7 +2177,19 @@ impl AgentGraphServer {
                 "APPROVAL_PENDING",
             ));
         }
-        if checkpoint.consumed_at.is_some() {
+        let approval_status = store
+            .checkpoint_approval_status(&checkpoint.checkpoint_id)
+            .map_err(|error| internal_error(error.message()))?;
+        if approval_status.as_deref() == Some("rejected") {
+            return Ok(error_output(
+                "checkpoint resume was rejected by the operator decision",
+                "APPROVAL_REJECTED",
+            ));
+        }
+        // An approved operator decision consumes the checkpoint atomically at
+        // decide time; that consumption is the authorization, so resume permits
+        // it. Any other consumed checkpoint (or no approval) stays fail-closed.
+        if checkpoint.consumed_at.is_some() && approval_status.as_deref() != Some("approved") {
             return Ok(checkpoint_error_output(CheckpointError::Consumed));
         }
         if run_id
@@ -2238,13 +2250,19 @@ impl AgentGraphServer {
             return Ok(error_output(error, "RUN_CAPACITY"));
         }
         drop(reserved_runs);
-        let consumed = match store.consume_resume_checkpoint(&checkpoint.checkpoint_id) {
-            Ok(record) => record,
-            Err(error) => {
-                if let Ok(runs) = self.runs.lock() {
-                    runs.release_async_slot();
+        let consumed = if checkpoint.consumed_at.is_some() {
+            // Approved operator decision already consumed this checkpoint
+            // atomically; the loaded record carries the resume state.
+            checkpoint.clone()
+        } else {
+            match store.consume_resume_checkpoint(&checkpoint.checkpoint_id) {
+                Ok(record) => record,
+                Err(error) => {
+                    if let Ok(runs) = self.runs.lock() {
+                        runs.release_async_slot();
+                    }
+                    return Ok(checkpoint_error_output(error));
                 }
-                return Ok(checkpoint_error_output(error));
             }
         };
         self.launch_resumed(consumed, contract, graph, budgets, None)

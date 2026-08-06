@@ -48,7 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     std::fs::create_dir_all(&data)?;
     let key_path = std::env::var_os("AGENT_GRAPH_INTEGRITY_KEY_PATH").map(PathBuf::from);
-    let _store = agent_graph_mcp::store::PersistentStore::open_with_integrity_key(
+    let store = agent_graph_mcp::store::PersistentStore::open_with_integrity_key(
         &data,
         key_path.as_deref(),
     )
@@ -71,6 +71,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let listener = tokio::net::UnixListener::bind(&socket)?;
             std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+            // ── Authenticated operator service (peer-credentialed Unix socket) ──
+            let operator_socket = socket
+                .parent()
+                .map(|p| p.join("operator.sock"))
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp/agent-graph/operator.sock"));
+            let operator_store = store.clone();
+            let instance_id = id.instance_id.clone();
+            let allowed_uids: std::collections::BTreeSet<u32> =
+                std::iter::once(unsafe { libc::getuid() }).collect();
+            tokio::spawn(async move {
+                if operator_socket.exists() {
+                    let _ = tokio::fs::remove_file(&operator_socket).await;
+                }
+                if let Some(p) = operator_socket.parent() {
+                    let _ = tokio::fs::create_dir_all(p).await;
+                }
+                if let Ok(op_listener) = tokio::net::UnixListener::bind(&operator_socket) {
+                    let _ = std::fs::set_permissions(
+                        &operator_socket,
+                        std::fs::Permissions::from_mode(0o600),
+                    );
+                    let service = agent_graph_mcp::operator::OperatorService::new(
+                        operator_store,
+                        allowed_uids,
+                        instance_id,
+                    );
+                    loop {
+                        match op_listener.accept().await {
+                            Ok((stream, _)) => {
+                                let svc = service.clone();
+                                tokio::spawn(async move {
+                                    let _ = agent_graph_mcp::operator::serve_connection(stream, svc)
+                                        .await;
+                                });
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+            });
             loop {
                 let (stream, _) = match listener.accept().await {
                     Ok(pair) => pair,

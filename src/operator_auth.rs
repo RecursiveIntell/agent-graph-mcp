@@ -16,6 +16,7 @@ pub enum OperatorAction {
     PromoteTemplate,
     Migrate,
     Install,
+    DecideApproval,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
