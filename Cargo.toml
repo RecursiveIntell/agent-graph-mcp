@@ -39,7 +39,7 @@ toml = "0.8"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [features]
-default = []
+default = ["provekv"]
 provekv = ["dep:provekv", "dep:blake3", "dep:rand"]
 
 [dev-dependencies]

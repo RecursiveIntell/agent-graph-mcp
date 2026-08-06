@@ -147,6 +147,8 @@ pub struct RunManager {
     /// Provider API key attached to http(s) llm-pipeline calls as a Bearer
     /// header. Never serialized; codex-app-server:// carries no auth.
     api_key: Option<String>,
+    /// Optional proveKV executor for local state reuse.
+    provekv_executor: Option<Arc<dyn crate::model_executor::ModelInvocationExecutor>>,
 }
 struct Inner {
     runs: HashMap<String, RunRecord>,
@@ -164,11 +166,20 @@ impl Default for RunManager {
             })),
             counter: Arc::new(AtomicU64::new(1)),
             api_key: None,
+            provekv_executor: None,
         }
     }
 }
 
 impl RunManager {
+    pub fn with_provekv_executor(
+        mut self,
+        executor: Option<crate::provekv_executor::ProveKvExecutor>,
+    ) -> Self {
+        self.provekv_executor = executor.map(|e| Arc::new(e) as Arc<dyn crate::model_executor::ModelInvocationExecutor>);
+        self
+    }
+
     pub fn with_api_key(mut self, api_key: Option<String>) -> Self {
         self.api_key = api_key;
         self
@@ -457,7 +468,11 @@ impl RunManager {
                 max_llm_calls: budgets.as_ref().and_then(|budget| budget.max_llm_calls),
                 llm_invocations: llm_invocations.clone(),
                 api_key: self.api_key.clone(),
-                executor: ExecutorHandle::none(),
+                executor: self
+                    .provekv_executor
+                    .as_ref()
+                    .map(|e| ExecutorHandle::with(e.clone()))
+                    .unwrap_or_else(ExecutorHandle::none),
             },
         )?;
         let starting_state = initial_state

@@ -19,6 +19,8 @@ pub struct CliConfig {
     pub ephemeral: bool,
     pub max_graphs: usize,
     pub api_key: Option<String>,
+    /// proveKV state store root for shared KV cache reuse across graph nodes.
+    pub provekv_state_root: Option<PathBuf>,
 }
 
 impl Default for CliConfig {
@@ -32,6 +34,7 @@ impl Default for CliConfig {
             ephemeral: false,
             max_graphs: DEFAULT_MAX_GRAPHS,
             api_key: None,
+            provekv_state_root: None,
         }
     }
 }

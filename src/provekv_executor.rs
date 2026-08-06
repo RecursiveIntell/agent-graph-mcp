@@ -258,12 +258,29 @@ mod tests {
     }
 
     #[test]
-    fn acquire_returns_none_without_live_model() {
-        // Without a live Qwen model and captured state, acquire returns
-        // None to fall through to the default provider path.
+    fn acquire_returns_handle_in_demo_mode() {
+        // In demo mode, acquire auto-populates with a synthetic manifest
+        // and returns a BackendHandle. This enables multi-agent state
+        // machine demos without requiring a live model.
         let executor = temp_executor();
         let handle = executor.acquire("r1", "n1", 0);
-        assert!(handle.is_none());
+        assert!(handle.is_some(), "demo mode should return a handle");
+        assert!(handle.unwrap().lease_digest.len() > 0);
+    }
+
+    #[test]
+    fn multiple_acquires_return_valid_handles() {
+        // Each call to acquire in demo mode should return a valid handle
+        // with a non-empty lease digest and state ID.
+        let executor = temp_executor();
+        let h1 = executor.acquire("run-m", "node-a", 0).unwrap();
+        let h2 = executor.acquire("run-m", "node-b", 1).unwrap();
+        assert!(!h1.state_id.is_empty());
+        assert!(!h1.lease_digest.is_empty());
+        assert!(!h2.state_id.is_empty());
+        assert!(!h2.lease_digest.is_empty());
+        // Each node gets a unique lease even with shared state
+        assert_ne!(h1.lease_digest, h2.lease_digest);
     }
 
     #[test]
