@@ -138,7 +138,7 @@ impl GraphSpec {
             NodeType::HumanApproval => Ok("human_approval"),
             NodeType::External => Err("UNSUPPORTED_NODE_TYPE: external".into()),
             NodeType::Tool => Ok("tool"),
-            NodeType::Loop => Err("UNSUPPORTED_NODE_TYPE: loop".into()),
+            NodeType::Loop => Ok("loop"),
         }
     }
 
@@ -609,6 +609,10 @@ fn validate_node(node: &NodeSpec, ids: &BTreeSet<&str>) -> Result<(), String> {
             "all_success",
             "quorum",
             "collect_object",
+            "dedupe_by_identity",
+            "contradiction_matrix",
+            "minority_report",
+            "proof_carrying_join",
         ]
         .contains(&mode)
         {
@@ -692,6 +696,32 @@ fn validate_node(node: &NodeSpec, ids: &BTreeSet<&str>) -> Result<(), String> {
         {
             return Err(format!(
                 "human_approval '{}' requires config.audience array",
+                node.id
+            ));
+        }
+    }
+    if node.node_type == NodeType::Loop {
+        let entry = node.config.get("entry").and_then(Value::as_str);
+        if entry.is_none() || !ids.contains(entry.unwrap_or("")) {
+            return Err(format!(
+                "loop '{}' requires config.entry naming an existing node",
+                node.id
+            ));
+        }
+        let iterations = node.config.get("max_iterations").and_then(Value::as_u64);
+        match iterations {
+            Some(n) if (1..=32).contains(&n) => {}
+            _ => {
+                return Err(format!(
+                    "loop '{}' requires config.max_iterations in 1..=32",
+                    node.id
+                ))
+            }
+        }
+        let exit = node.config.get("exit").and_then(Value::as_str);
+        if exit.is_none() || (exit != Some("END") && !ids.contains(exit.unwrap_or(""))) {
+            return Err(format!(
+                "loop '{}' requires config.exit naming an existing node or END",
                 node.id
             ));
         }
@@ -793,5 +823,29 @@ mod tests {
             ], "edges":[{"from":"left","to":"right"},{"from":"right","to":"END"}]
         });
         assert!(parse_and_validate(&spec).is_ok());
+    }
+
+    #[test]
+    fn swarm_join_modes_are_accepted() {
+        for mode in [
+            "collect_object",
+            "dedupe_by_identity",
+            "contradiction_matrix",
+            "minority_report",
+            "proof_carrying_join",
+        ] {
+            let spec = json!({
+                "name": "join-modes", "entry": "join",
+                "nodes": [
+                    {"id": "join", "type": "join",
+                     "config": {"mode": mode, "inputs": ["branch_a"], "output": "merged"}}
+                ],
+                "edges": [{"from": "join", "to": "END"}]
+            });
+            assert!(
+                parse_and_validate(&spec).is_ok(),
+                "swarm join mode '{mode}' rejected"
+            );
+        }
     }
 }

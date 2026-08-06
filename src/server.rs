@@ -278,8 +278,7 @@ impl AgentGraphServer {
             store.recover_incomplete_executions()?;
         }
 
-                let runs = RunManager::default()
-            .with_api_key(api_key.clone());
+        let runs = RunManager::default().with_api_key(api_key.clone());
         let server = Self {
             base_url,
             default_model,

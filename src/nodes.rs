@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command as StdCommand, Stdio};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     Arc, Mutex,
 };
 
@@ -35,6 +35,36 @@ pub struct RunContext {
     pub executor: ExecutorHandle,
     /// Shared typed ledger of observed invocations for the terminal receipt.
     pub llm_invocations: Arc<Mutex<Vec<Value>>>,
+    /// Optional subgraph executor provided by the host (server/run manager).
+    /// When None, subgraph nodes fail with an explicit error.
+    pub subgraph: Option<SubgraphExecutor>,
+    /// Shared nesting depth counter for subgraph-in-subgraph recursion guards.
+    pub subgraph_depth: Arc<AtomicU32>,
+    /// Maximum allowed subgraph nesting depth.
+    pub subgraph_limit: u32,
+}
+
+/// Host-provided subgraph runner: (graph_name, input_value, depth) -> terminal output value.
+/// The runner returns a future so sub-executions can be awaited inside the engine's
+/// async runtime without blocking (block_on is illegal on a runtime worker thread).
+#[derive(Clone)]
+pub struct SubgraphExecutor {
+    pub inner: Arc<
+        dyn Fn(
+                String,
+                Value,
+                u32,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = std::result::Result<Value, String>> + Send>,
+            > + Send
+            + Sync,
+    >,
+}
+
+impl std::fmt::Debug for SubgraphExecutor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubgraphExecutor").finish_non_exhaustive()
+    }
 }
 
 impl RunContext {
@@ -203,25 +233,31 @@ impl Node for LlmNode {
         // Pass tool definitions to the provider when tools are configured.
         let has_tools = !self.tools.is_empty();
         let result: std::result::Result<Value, AgentGraphError> = if has_tools {
-            let tool_ctx = ToolExecContext::new(&self.tools)
-                .map_err(AgentGraphError::PayloadError)?;
+            let tool_ctx =
+                ToolExecContext::new(&self.tools).map_err(AgentGraphError::PayloadError)?;
             let runner = tool_ctx.runner();
             let mut request = llm_pipeline::ToolLoopRequest::new(model, rendered.clone());
             request.config = config;
             request.max_round_trips = 5;
             request.api_key = self.api_key.clone();
             let exec_ctx = ExecCtx::builder(&self.base_url).build();
-            let use_openai = self.base_url.starts_with("http://") || self.base_url.starts_with("https://");
+            let use_openai =
+                self.base_url.starts_with("http://") || self.base_url.starts_with("https://");
             let response = tokio::task::spawn_blocking(move || {
                 tokio::runtime::Handle::current().block_on(async move {
-                    if use_openai { runner.run_openai_responses(&exec_ctx, request).await }
-                    else { runner.run_ollama(&exec_ctx, request).await }
+                    if use_openai {
+                        runner.run_openai_responses(&exec_ctx, request).await
+                    } else {
+                        runner.run_ollama(&exec_ctx, request).await
+                    }
                 })
-            }).await.map_err(|e| AgentGraphError::PayloadError(format!("tool loop task failed: {e}")))?;
-            response.map(|r| Value::String(r.final_text)).map_err(|e| AgentGraphError::PayloadError(e.to_string()))
-        } else if self.base_url
-            == "codex-app-server://"
-        {
+            })
+            .await
+            .map_err(|e| AgentGraphError::PayloadError(format!("tool loop task failed: {e}")))?;
+            response
+                .map(|r| Value::String(r.final_text))
+                .map_err(|e| AgentGraphError::PayloadError(e.to_string()))
+        } else if self.base_url == "codex-app-server://" {
             let model = model.to_owned();
             let prompt = rendered.clone();
             let timeout = std::time::Duration::from_millis(self.timeout_ms);
@@ -831,6 +867,83 @@ impl Node for ToolNode {
         state.set_raw("__tool_receipts__", receipt_evidence).await?;
         state.set_raw("__tool_success__", Value::Bool(true)).await?;
 
+        Ok(NodeOutput::Done)
+    }
+}
+
+/// Explicit bounded loop: re-enters `entry` until `max_iterations` is reached,
+/// then navigates to `exit` (or END). The engine's graph-level max_iterations
+/// remains the outer safety net. The loop node always navigates explicitly so
+/// multi-out-edge fan-out cannot fire during a cycle.
+pub struct LoopNode {
+    pub entry: String,
+    pub exit: String,
+    pub max_iterations: u64,
+    pub counter_key: String,
+    pub ctx: RunContext,
+}
+
+#[async_trait]
+impl Node for LoopNode {
+    async fn execute(&self, state: &AgentState, _: &GraphConfig) -> Result<NodeOutput> {
+        self.ctx.check()?;
+        let count: u64 = state.get_opt::<u64>(&self.counter_key).await?.unwrap_or(0);
+        let mut update = HashMap::new();
+        if count < self.max_iterations {
+            update.insert(self.counter_key.clone(), Value::from(count + 1));
+            Ok(NodeOutput::Command(Command {
+                goto: Navigation::Node(self.entry.clone()),
+                update: Some(update),
+            }))
+        } else {
+            update.insert(self.counter_key.clone(), Value::Null);
+            let goto = if self.exit == "END" {
+                Navigation::End
+            } else {
+                Navigation::Node(self.exit.clone())
+            };
+            Ok(NodeOutput::Command(Command {
+                goto,
+                update: Some(update),
+            }))
+        }
+    }
+}
+
+/// Subgraph reference: executes another registered graph through the host-provided
+/// runner, then writes the referenced graph's terminal output under `output_key`
+/// and returns Done (engine follows this node's out-edges).
+pub struct SubgraphNode {
+    pub graph_name: String,
+    pub input_key: String,
+    pub output_key: String,
+    pub ctx: RunContext,
+}
+
+#[async_trait]
+impl Node for SubgraphNode {
+    async fn execute(&self, state: &AgentState, _: &GraphConfig) -> Result<NodeOutput> {
+        self.ctx.check()?;
+        let depth = self.ctx.subgraph_depth.fetch_add(1, Ordering::SeqCst) + 1;
+        if depth > self.ctx.subgraph_limit {
+            self.ctx.subgraph_depth.fetch_sub(1, Ordering::SeqCst);
+            return Err(AgentGraphError::ExecutionError(format!(
+                "subgraph depth exceeded (limit {})",
+                self.ctx.subgraph_limit
+            )));
+        }
+        let input = state
+            .get_opt::<Value>(&self.input_key)
+            .await?
+            .unwrap_or(Value::Null);
+        let runner = self.ctx.subgraph.clone().ok_or_else(|| {
+            AgentGraphError::ExecutionError("subgraph executor unavailable".into())
+        })?;
+        let future = (runner.inner)(self.graph_name.clone(), input, depth);
+        let result = future.await;
+        self.ctx.subgraph_depth.fetch_sub(1, Ordering::SeqCst);
+        let output = result.map_err(AgentGraphError::ExecutionError)?;
+        state.set_raw(&self.output_key, output).await?;
         Ok(NodeOutput::Done)
     }
 }

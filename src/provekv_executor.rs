@@ -21,8 +21,8 @@
 //! - Short TTL, least rights, revocation, quotas.
 //! - No network listener.
 
-use std::collections::HashMap;
 use blake3;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -123,7 +123,9 @@ impl ModelInvocationExecutor for ProveKvExecutor {
         // Find existing state for this run or create one
         let state_id = {
             let prefix = format!("mas-demo-run-{}", key.0);
-            let existing = store.state_ids().iter()
+            let existing = store
+                .state_ids()
+                .iter()
                 .find(|id| id.as_str().starts_with(&prefix))
                 .map(|id| id.to_string());
             if let Some(id) = existing {
@@ -132,11 +134,16 @@ impl ModelInvocationExecutor for ProveKvExecutor {
                 // First node: commit a base state representing a shared KV prefix
                 let shape = provekv::KvTensorShape {
                     attention_type: provekv::AttentionType::MHA,
-                    num_layers: 1, num_heads: 32, num_kv_heads: 32,
-                    head_dim: 128, hidden_size: 4096,
+                    num_layers: 1,
+                    num_heads: 32,
+                    num_kv_heads: 32,
+                    head_dim: 128,
+                    hidden_size: 4096,
                 };
                 let manifest = provekv::HybridStateManifestV1::new(
-                    "qwen2.5-0.5b", "qwen2.5-tokenizer", shape,
+                    "qwen2.5-0.5b",
+                    "qwen2.5-tokenizer",
+                    shape,
                     vec![provekv::HybridComponent {
                         name: format!("{}-shared_attn_k", key.1),
                         version: "1.0".into(),
@@ -150,7 +157,8 @@ impl ModelInvocationExecutor for ProveKvExecutor {
                     format!("sha256:policy_demo"),
                     format!("sha256:version_demo"),
                 );
-                store.commit_root(manifest)
+                store
+                    .commit_root(manifest)
                     .map(|id| id.to_string())
                     .unwrap_or(format!("{}-fallback", prefix))
             }

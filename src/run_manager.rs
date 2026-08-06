@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     Arc, Mutex,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -13,8 +13,9 @@ use serde_json::Value;
 use tokio::sync::Notify;
 
 use crate::compiler::{compile, CompileContext};
-use crate::model_executor::ExecutorHandle;
 use crate::evidence::{bundle, digest, redact, validate_witness_dependencies};
+use crate::model_executor::ExecutorHandle;
+use crate::nodes::SubgraphExecutor;
 use crate::spec::{ensure_size, GraphSpec, MAX_OUTPUT_BYTES, MAX_STATE_BYTES};
 use crate::store::PersistentStore;
 
@@ -176,7 +177,8 @@ impl RunManager {
         mut self,
         executor: Option<crate::provekv_executor::ProveKvExecutor>,
     ) -> Self {
-        self.provekv_executor = executor.map(|e| Arc::new(e) as Arc<dyn crate::model_executor::ModelInvocationExecutor>);
+        self.provekv_executor = executor
+            .map(|e| Arc::new(e) as Arc<dyn crate::model_executor::ModelInvocationExecutor>);
         self
     }
 
@@ -456,6 +458,115 @@ impl RunManager {
         // receipts reflect the same observed provider attempts.
         let llm_calls = Arc::new(AtomicU64::new(0));
         let llm_invocations = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let max_llm_calls = budgets.as_ref().and_then(|budget| budget.max_llm_calls);
+        // Subgraph executor: late-bound so nested subgraph calls resolve to this
+        // same runner. Sub-runs share the parent's budget counters and cancellation
+        // flags, use fresh event sinks, and are executed in-process (no separate
+        // run record; the parent run's receipt is the durable artifact).
+        let subgraph_depth = Arc::new(AtomicU32::new(0));
+        let subgraph_limit: u32 = 4;
+        let subgraph_holder: Arc<Mutex<Option<SubgraphExecutor>>> = Arc::new(Mutex::new(None));
+        let sub_runner: SubgraphExecutor = SubgraphExecutor {
+            inner: Arc::new({
+                let holder = subgraph_holder.clone();
+                let store = store.clone();
+                let api_key = self.api_key.clone();
+                let executor = self
+                    .provekv_executor
+                    .as_ref()
+                    .map(|e| ExecutorHandle::with(e.clone()))
+                    .unwrap_or_else(ExecutorHandle::none);
+                let base_url = base_url.clone();
+                let default_model = default_model.clone();
+                let cancelled = cancelled.clone();
+                let cancellation = cancellation.clone();
+                let llm_calls = llm_calls.clone();
+                let llm_invocations = llm_invocations.clone();
+                let subgraph_depth = subgraph_depth.clone();
+                move |graph_name: String, input: Value, _depth: u32| {
+                    let holder = holder.clone();
+                    let store = store.clone();
+                    let api_key = api_key.clone();
+                    let executor = executor.clone();
+                    let base_url = base_url.clone();
+                    let default_model = default_model.clone();
+                    let cancelled = cancelled.clone();
+                    let cancellation = cancellation.clone();
+                    let llm_calls = llm_calls.clone();
+                    let llm_invocations = llm_invocations.clone();
+                    let subgraph_depth = subgraph_depth.clone();
+                    Box::pin(async move {
+                        let Some(store) = store.as_ref() else {
+                            return Err("subgraph: store unavailable".into());
+                        };
+                        let Some((spec_json, _hash)) = store
+                            .load_graph(&graph_name)
+                            .map_err(|e| format!("subgraph load error: {e}"))?
+                        else {
+                            return Err(format!("subgraph: graph '{graph_name}' not found"));
+                        };
+                        let sub_spec: GraphSpec = serde_json::from_str(&spec_json)
+                            .map_err(|e| format!("subgraph spec parse error: {e}"))?;
+                        let sub_events = Arc::new(Mutex::new(Vec::<GraphEvent>::new()));
+                        let sub_executor = holder
+                            .lock()
+                            .map_err(|_| "subgraph holder poisoned".to_string())?
+                            .clone();
+                        let sub_graph = compile(
+                            &sub_spec,
+                            CompileContext {
+                                base_url: base_url.clone(),
+                                default_model: default_model.clone(),
+                                cancelled: cancelled.clone(),
+                                cancellation: cancellation.clone(),
+                                events: sub_events.clone(),
+                                llm_calls: llm_calls.clone(),
+                                max_llm_calls,
+                                llm_invocations: llm_invocations.clone(),
+                                api_key: api_key.clone(),
+                                executor: executor.clone(),
+                                subgraph: sub_executor,
+                                subgraph_depth: subgraph_depth.clone(),
+                                subgraph_limit,
+                            },
+                        )?;
+                        // Sub-execution is awaited inside the engine's async runtime;
+                        // no block_on is legal on a runtime worker thread.
+                        let sub_state = AgentState::with_data_and_limits(
+                            HashMap::from([("__input__".to_string(), input)]),
+                            StateLimits {
+                                max_keys: 1000,
+                                max_value_bytes: 256 * 1024,
+                                max_history_len: 100,
+                                lock_timeout: std::time::Duration::from_secs(5),
+                            },
+                        );
+                        let sub_snapshot = sub_state.clone();
+                        let sub_config = GraphConfig::new()
+                            .with_recursion_limit(sub_spec.max_iterations.unwrap_or(64).min(256))
+                            .with_max_parallelism(sub_spec.max_parallelism.unwrap_or(8));
+                        let sub_graph = Arc::new(sub_graph);
+                        let (handle, _engine_cancel) = sub_graph
+                            .execute_cancellable(&sub_spec.entry, sub_state, sub_config);
+                        handle
+                            .await
+                            .map_err(|e| format!("subgraph execution task failed: {e}"))?
+                            .map_err(|e| e.to_string())?;
+                        let exported = sub_snapshot.export().await;
+                        let state_value = serde_json::to_value(exported)
+                            .map_err(|e| format!("subgraph state export error: {e}"))?;
+                        Ok(sub_spec
+                            .output_key
+                            .as_deref()
+                            .and_then(|key| state_value.get(key).cloned())
+                            .unwrap_or(Value::Null))
+                    })
+                }
+            }),
+        };
+        *subgraph_holder
+            .lock()
+            .map_err(|_| "subgraph holder poisoned")? = Some(sub_runner.clone());
         let graph = compile(
             &spec,
             CompileContext {
@@ -465,7 +576,7 @@ impl RunManager {
                 cancellation: cancellation.clone(),
                 events: events.clone(),
                 llm_calls: llm_calls.clone(),
-                max_llm_calls: budgets.as_ref().and_then(|budget| budget.max_llm_calls),
+                max_llm_calls,
                 llm_invocations: llm_invocations.clone(),
                 api_key: self.api_key.clone(),
                 executor: self
@@ -473,6 +584,9 @@ impl RunManager {
                     .as_ref()
                     .map(|e| ExecutorHandle::with(e.clone()))
                     .unwrap_or_else(ExecutorHandle::none),
+                subgraph: Some(sub_runner),
+                subgraph_depth,
+                subgraph_limit,
             },
         )?;
         let starting_state = initial_state

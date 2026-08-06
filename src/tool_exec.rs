@@ -1,6 +1,8 @@
 //! Adapter from graph tool definitions to `llm-pipeline`'s tool-loop runtime.
 use async_trait::async_trait;
-use llm_tool_runtime::{Tool, ToolCall, ToolDescriptor, ToolError, ToolErrorClass, ToolRegistry, ToolResult};
+use llm_tool_runtime::{
+    Tool, ToolCall, ToolDescriptor, ToolError, ToolErrorClass, ToolRegistry, ToolResult,
+};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -19,7 +21,9 @@ impl ToolExecContext {
         let mut registry = ToolRegistry::new();
         for value in tools {
             let function = value.get("function").unwrap_or(value);
-            let name = function.get("name").and_then(Value::as_str)
+            let name = function
+                .get("name")
+                .and_then(Value::as_str)
                 .ok_or_else(|| "tool definition missing function.name".to_owned())?;
             let descriptor: ToolDescriptor = serde_json::from_value(json!({
                 "name": name, "version": "1",
@@ -43,13 +47,21 @@ impl ToolExecContext {
     }
 }
 
-struct GraphTool { descriptor: ToolDescriptor }
+struct GraphTool {
+    descriptor: ToolDescriptor,
+}
 
 #[async_trait]
 impl Tool for GraphTool {
-    fn descriptor(&self) -> &ToolDescriptor { &self.descriptor }
+    fn descriptor(&self) -> &ToolDescriptor {
+        &self.descriptor
+    }
 
-    async fn invoke(&self, ctx: &llm_tool_runtime::ToolCtx, call: &ToolCall) -> Result<ToolResult, ToolError> {
+    async fn invoke(
+        &self,
+        ctx: &llm_tool_runtime::ToolCtx,
+        call: &ToolCall,
+    ) -> Result<ToolResult, ToolError> {
         // Graph tools forward execution to the MCP tool runtime.
         // When no handler is registered, return an empty JSON result
         // so the tool loop can continue. Real execution requires the

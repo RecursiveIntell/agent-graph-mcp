@@ -256,6 +256,12 @@ Fan out to 9 LLM nodes in parallel, then join results into one synthesis:
 
 All 9 LLM calls execute concurrently via Tokio `JoinSet`. The join node collects results from agents 0-7 into `{collected}`, then the report node synthesizes. Scale up to 16 branches per parallel node.
 
+## Loop and subgraph nodes
+
+- **`loop`** — bounded iteration. Config: `{"entry": "<body node>", "exit": "<node>|END", "max_iterations": 1..=32}`. The loop node re-enters `entry` (body should edge back to the loop node to sustain the cycle) and navigates to `exit` once the iteration budget is exhausted. The iteration counter lives in `__loop__:<loop node id>` and can be read by the body via `input_key`. Graph-level `max_iterations` is the outer safety net.
+- **`subgraph`** — execute another registered graph. Config: `{"graph_name": "<registered graph>", "input_key": "__input__", "output_key": "__subgraph_output__"}`. The referenced graph runs in-process with the parent's budget counters and cancellation; its terminal output is written under `output_key`. Nesting depth limit: 4.
+- **`human_approval`** — effect gate. Writes `__approval_request__` (pending) to state and interrupts; the effect is NOT executed without authority. Durable approvals are checkpoint-bound (run with `checkpoint: true` on deterministic transform chains); deciding an approval requires the authenticated operator transport. See the doctrine register for the full §13 contract.
+
 ## Built-in templates
 
 | Template | Description |

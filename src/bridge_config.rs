@@ -42,7 +42,6 @@ impl Default for AppConfig {
     }
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetentionConfig {
     /// How long to retain captured states before GC eligibility (seconds).
@@ -64,7 +63,6 @@ impl Default for RetentionConfig {
         }
     }
 }
-
 
 fn default_true() -> bool {
     true
@@ -112,8 +110,7 @@ impl BridgeConfig {
     pub fn from_file(path: &PathBuf) -> Result<Self, String> {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("failed to read config {}: {e}", path.display()))?;
-        toml::from_str(&content)
-            .map_err(|e| format!("invalid TOML in {}: {e}", path.display()))
+        toml::from_str(&content).map_err(|e| format!("invalid TOML in {}: {e}", path.display()))
     }
 
     /// Get the effective config for an app, falling back to default.
