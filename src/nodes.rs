@@ -232,6 +232,7 @@ impl Node for LlmNode {
         }
         // Pass tool definitions to the provider when tools are configured.
         let has_tools = !self.tools.is_empty();
+        let mut last_usage: Option<Value> = None;
         let result: std::result::Result<Value, AgentGraphError> = if has_tools {
             let tool_ctx =
                 ToolExecContext::new(&self.tools).map_err(AgentGraphError::PayloadError)?;
@@ -318,6 +319,14 @@ impl Node for LlmNode {
                 result = call.invoke(&exec_ctx, input) => result
                     .map_err(|e| AgentGraphError::PayloadError(e.to_string()))
                     .map(|mut payload| {
+                        // Record provider token usage for cost accounting.
+                        last_usage = payload.token_usage.as_ref().map(|u| {
+                            serde_json::json!({
+                                "prompt_tokens": u.prompt_tokens,
+                                "completion_tokens": u.completion_tokens,
+                                "total_tokens": u.total_tokens,
+                            })
+                        });
                         // Qwen models on Ollama output to the `reasoning`
                         // field (thinking mode) with empty `content`. When
                         // content is empty and reasoning is populated, use
@@ -341,11 +350,11 @@ impl Node for LlmNode {
         };
         let output = match result {
             Ok(output) => {
-                self.record_invocation(attempt, model, "succeeded", None);
+                self.record_invocation(attempt, model, "succeeded", last_usage);
                 output
             }
             Err(error) => {
-                self.record_invocation(attempt, model, "failed", None);
+                self.record_invocation(attempt, model, "failed", last_usage);
                 return Err(error);
             }
         };
@@ -366,14 +375,18 @@ impl LlmNode {
     /// is derived from the observed attempt, never from graph metadata alone.
     /// `usage` is provider token accounting (prompt/completion/total); None
     /// until llm-pipeline carries it in PayloadOutput. See TOKEN_ACCOUNTING_SPEC.md.
-    fn record_invocation(&self, attempt: u64, model: &str, outcome: &str, _usage: Option<Value>) {
+    fn record_invocation(&self, attempt: u64, model: &str, outcome: &str, usage: Option<Value>) {
         if let Ok(mut invocations) = self.ctx.llm_invocations.lock() {
-            invocations.push(serde_json::json!({
+            let mut entry = serde_json::json!({
                 "attempt": attempt,
                 "node_id": self.id,
                 "configured_model": model,
                 "outcome": outcome,
-            }));
+            });
+            if let Some(u) = usage {
+                entry["usage"] = u;
+            }
+            invocations.push(entry);
         }
     }
 }

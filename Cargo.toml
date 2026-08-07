@@ -52,3 +52,6 @@ path = "src/main.rs"
 [[bin]]
 name = "agent-graph-mcpd"
 path = "src/bin/agent-graph-mcpd.rs"
+
+[patch.crates-io]
+llm-pipeline = { path = "../Libraries/llm-pipeline" }
