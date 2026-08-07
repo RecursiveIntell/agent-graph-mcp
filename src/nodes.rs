@@ -341,11 +341,11 @@ impl Node for LlmNode {
         };
         let output = match result {
             Ok(output) => {
-                self.record_invocation(attempt, model, "succeeded");
+                self.record_invocation(attempt, model, "succeeded", None);
                 output
             }
             Err(error) => {
-                self.record_invocation(attempt, model, "failed");
+                self.record_invocation(attempt, model, "failed", None);
                 return Err(error);
             }
         };
@@ -364,7 +364,9 @@ impl Node for LlmNode {
 impl LlmNode {
     /// Append one typed invocation record for the terminal receipt. The record
     /// is derived from the observed attempt, never from graph metadata alone.
-    fn record_invocation(&self, attempt: u64, model: &str, outcome: &str) {
+    /// `usage` is provider token accounting (prompt/completion/total); None
+    /// until llm-pipeline carries it in PayloadOutput. See TOKEN_ACCOUNTING_SPEC.md.
+    fn record_invocation(&self, attempt: u64, model: &str, outcome: &str, _usage: Option<Value>) {
         if let Ok(mut invocations) = self.ctx.llm_invocations.lock() {
             invocations.push(serde_json::json!({
                 "attempt": attempt,
