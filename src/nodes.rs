@@ -267,7 +267,15 @@ impl Node for LlmNode {
             })?;
             tokio::select! {
                 result = tokio::task::spawn_blocking(move || {
-                    crate::codex_app_server::run_turn("codex", &model, &cwd, &prompt, timeout)
+                    if crate::codex_app_server::use_persistent_worker() {
+                        crate::codex_app_server::run_turn_pooled(
+                            "codex", &model, &cwd, &prompt, timeout,
+                        )
+                    } else {
+                        crate::codex_app_server::run_turn(
+                            "codex", &model, &cwd, &prompt, timeout,
+                        )
+                    }
                 }) => {
                     let text = result
                         .map_err(|e| AgentGraphError::PayloadError(format!("codex app-server task failed: {e}")))?

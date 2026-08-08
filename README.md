@@ -10,7 +10,7 @@
 
 ![Architecture diagram showing MCP client connecting via stdin/stdout to the agent-graph-mcp proxy, which communicates over Unix socket to the agent-graph-mcpd daemon backed by SQLite](assets/architecture.svg)
 
-> **Expose the `ri-agent-graph` runtime engine over MCP.** Compile declarative JSON workflow specs, execute synchronously or asynchronously, checkpoint/resume, request human approval, capture source witnesses, and get cryptographic receipts — all through 27 typed MCP tools.
+> **Expose the `ri-agent-graph` runtime engine over MCP.** Compile declarative JSON workflow specs, execute synchronously or asynchronously, checkpoint/resume, request human approval, capture source witnesses, and get cryptographic receipts — all through 27 typed MCP tools. Normal execution is synchronous. Durable approval is supported only as a SQLite-backed decision.
 
 ## Who is this for?
 
@@ -78,6 +78,27 @@ agent-graph-mcp --socket /tmp/agent-graph/mcp.sock
 ## Provider and model configuration
 
 Every graph run sends LLM calls to an OpenAI-compatible endpoint. You control **where** (`--base-url`) and **which model** (`--model`). The API key flows through the `OPENAI_API_KEY` environment variable.
+
+### Codex App Server mode
+
+When `--base-url codex-app-server://` is selected, the Rust daemon starts one long-lived local Codex App Server worker over a loopback WebSocket and reuses it across graph nodes. Turns are serialized through a bounded Rust-owned session; a failed or timed-out worker is terminated and recreated cleanly. This avoids the fixed memory multiplier from spawning one heavy App Server process per node.
+
+The integration is bounded before launch and during streaming:
+
+- one persistent Codex App Server worker when the configured process limit is
+  one; higher limits use bounded one-shot workers for true provider concurrency;
+- the Luna service launcher enumerates enabled Codex MCP servers and disables
+  those servers plus plugin/app injection for prompt-only graph turns;
+- each completed graph thread is deleted before the worker is reused, preventing
+  the long-lived connection from retaining auto-subscribed thread state;
+- prompt input capped at 256 KiB;
+- model reasoning effort pinned to `low` for bounded graph lanes;
+- each JSON-RPC line capped at 4 MiB and each WebSocket message capped at 1 MiB;
+- streamed assistant output capped at 256 KiB;
+- stderr retained as an 8 KiB tail and redacted before MCP errors;
+- stdio-only Codex-compatible test executables may use the legacy one-shot compatibility path.
+
+`graph max_parallelism` controls graph scheduling, while the persistent worker provides provider-side serialization. Increase provider concurrency only by implementing and measuring additional workers; do not assume graph fan-out is safe by itself.
 
 ### Setting your API key
 
