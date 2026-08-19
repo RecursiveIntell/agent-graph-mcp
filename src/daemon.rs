@@ -214,3 +214,39 @@ pub fn socket_path(runtime_dir: &Path, instance: &str) -> PathBuf {
         .join(instance)
         .join("daemon.sock")
 }
+
+/// Resolve the provider API key: an explicit `--api-key` flag wins (kept as a
+/// deprecated fallback for one release cycle), otherwise the `AGENT_GRAPH_API_KEY`
+/// environment variable is used. Keeping the key out of argv removes it from
+/// world-readable `/proc/<pid>/cmdline` exposure.
+pub fn resolve_api_key(flag: Option<String>, env_value: Option<String>) -> Option<String> {
+    flag.or(env_value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_api_key;
+
+    #[test]
+    fn resolve_api_key_env_fallback() {
+        // B1: env var used when no flag present.
+        assert_eq!(
+            resolve_api_key(None, Some("sk-env".into())),
+            Some("sk-env".into())
+        );
+    }
+
+    #[test]
+    fn resolve_api_key_flag_wins_over_env() {
+        // Deprecated flag still wins while it exists.
+        assert_eq!(
+            resolve_api_key(Some("sk-flag".into()), Some("sk-env".into())),
+            Some("sk-flag".into())
+        );
+    }
+
+    #[test]
+    fn resolve_api_key_neither() {
+        assert_eq!(resolve_api_key(None, None), None);
+    }
+}

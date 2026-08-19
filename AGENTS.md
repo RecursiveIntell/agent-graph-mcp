@@ -28,7 +28,7 @@ The binary installs to `~/.cargo/bin/agent-graph-mcp`. There is also a daemon bi
 src/
 ├── main.rs              # CLI entry point (direct mode, daemon client)
 ├── cli.rs               # Argument parsing
-├── server.rs            # MCP tool router (25 tools)
+├── server.rs            # MCP tool router (31 tools)
 ├── tools.rs             # Tool parameter types + JSON schemas
 ├── daemon.rs             # Daemon process (agent-graph-mcpd)
 ├── run_manager.rs       # Graph execution lifecycle

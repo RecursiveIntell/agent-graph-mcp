@@ -35,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             "--help" => {
                 println!(
-                    "agent-graph-mcpd --data-dir PATH --socket PATH [--base-url URL] [--model NAME] [--api-key KEY] [--max-graphs N]"
+                    "agent-graph-mcpd --data-dir PATH --socket PATH [--base-url URL] [--model NAME] [--api-key KEY (deprecated; prefer AGENT_GRAPH_API_KEY env)] [--max-graphs N]"
                 );
                 return Ok(());
             }
@@ -47,6 +47,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     std::fs::create_dir_all(&data)?;
+    // B1: key out of argv — explicit flag wins (deprecated), else env var.
+    let api_key = daemon::resolve_api_key(api_key, std::env::var("AGENT_GRAPH_API_KEY").ok());
     let key_path = std::env::var_os("AGENT_GRAPH_INTEGRITY_KEY_PATH").map(PathBuf::from);
     let store = agent_graph_mcp::store::PersistentStore::open_with_integrity_key(
         &data,
