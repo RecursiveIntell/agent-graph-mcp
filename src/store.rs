@@ -1684,7 +1684,20 @@ impl PersistentStore {
     }
 
     /// True when an unexpired legal hold exists for the graph.
+    /// Tolerant of a missing `legal_holds` table (pre-migration stores):
+    /// absence of the table means no holds can exist, so the operator path
+    /// keeps working instead of hard-failing with a persistence error.
     fn has_active_legal_hold(conn: &Connection, graph: &str) -> Result<bool, String> {
+        let table_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='legal_holds'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("legal hold table check error: {e}"))?;
+        if table_exists == 0 {
+            return Ok(false);
+        }
         conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM legal_holds WHERE graph_name = ?1
                AND (expires_at IS NULL OR expires_at > datetime('now')))",
