@@ -134,7 +134,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let status_store = probe_store.clone();
                         let status_mcp = probe_mcp.clone();
                         let status_op = probe_op.clone();
-                        tokio::task::spawn_blocking(move || {
+                        let _ = tokio::task::spawn_blocking(move || {
                             if let Some(path) = status_mcp.parent() {
                                 let count = status_store.count_live_graphs().unwrap_or(0);
                                 let status = serde_json::json!({
@@ -229,6 +229,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_connection(
     stream: tokio::net::UnixStream,
     data_dir: &std::path::Path,

@@ -2375,7 +2375,12 @@ impl AgentGraphServer {
             .map_err(|e| internal_error(e.to_string()))?;
         let r = runs
             .get(&run_id)
-            .ok_or_else(|| invalid_params(format!("run '{run_id}' not found")))?;
+            .ok_or_else(|| {
+                invalid_params(
+                    "run '{run_id}' not found or not live on this connection — completed runs: use graph_run_receipt (store-backed); the in-memory state projection is per-connection"
+                        .replace("{run_id}", &run_id),
+                )
+            })?;
         let state = if let Some(pointer) = json_pointer.as_deref() {
             if pointer.is_empty() {
                 r.state.clone()

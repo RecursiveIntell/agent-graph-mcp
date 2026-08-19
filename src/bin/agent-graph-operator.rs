@@ -269,7 +269,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             !a.starts_with('-') && PathBuf::from(a).extension().is_none() && a.contains('/')
         })
         .unwrap_or_else(resolve_operator_socket);
-    let mut rest: Vec<String> = if socket.contains('/') && !args.is_empty() && args[0] == socket {
+    let rest: Vec<String> = if socket.contains('/') && !args.is_empty() && args[0] == socket {
         args.into_iter().skip(1).collect()
     } else {
         args

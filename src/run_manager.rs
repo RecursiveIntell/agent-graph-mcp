@@ -20,7 +20,18 @@ use crate::spec::{ensure_size, GraphSpec, MAX_OUTPUT_BYTES, MAX_STATE_BYTES};
 use crate::store::PersistentStore;
 
 const MAX_RUNS: usize = 100;
-const MAX_ACTIVE_RUNS: usize = 8;
+const MAX_ACTIVE_RUNS_DEFAULT: usize = 8;
+
+/// G2: concurrent-run capacity, configurable via `AGENT_GRAPH_RUN_CAPACITY`
+/// (default 8, max 64, memory-bounded). The 9th concurrent run is rejected
+/// with an actionable RUN_CAPACITY error instead of an opaque failure.
+fn max_active_runs() -> usize {
+    std::env::var("AGENT_GRAPH_RUN_CAPACITY")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|n| (1..=64).contains(n))
+        .unwrap_or(MAX_ACTIVE_RUNS_DEFAULT)
+}
 
 pub struct ResumedRun {
     pub run_id: String,
@@ -414,9 +425,10 @@ impl RunManager {
             .values()
             .filter(|run| run.status == "running")
             .count();
-        if active_runs + inner.reserved_async_slots >= MAX_ACTIVE_RUNS {
+        if active_runs + inner.reserved_async_slots >= max_active_runs() {
+            let max = max_active_runs();
             return Err(format!(
-                "active run capacity reached: {MAX_ACTIVE_RUNS} concurrent runs"
+                "active run capacity reached: {max} concurrent runs (active: {active_runs}) — retry after a run completes"
             ));
         }
         let run = inner.runs.get_mut(id).ok_or("run not found")?;
@@ -436,9 +448,10 @@ impl RunManager {
             .values()
             .filter(|run| run.status == "running")
             .count();
-        if active_runs + inner.reserved_async_slots >= MAX_ACTIVE_RUNS {
+        if active_runs + inner.reserved_async_slots >= max_active_runs() {
+            let max = max_active_runs();
             return Err(format!(
-                "active run capacity reached: {MAX_ACTIVE_RUNS} concurrent runs"
+                "active run capacity reached: {max} concurrent runs (active: {active_runs}) — retry after a run completes"
             ));
         }
         inner.reserved_async_slots += 1;
@@ -1261,7 +1274,7 @@ mod tests {
     #[test]
     fn async_admission_is_bounded_atomically() {
         let manager = RunManager::default();
-        for index in 0..MAX_ACTIVE_RUNS {
+        for index in 0..max_active_runs() {
             let id = manager
                 .allocate("graph", "version", serde_json::json!({"index": index}))
                 .expect("allocate admitted run");

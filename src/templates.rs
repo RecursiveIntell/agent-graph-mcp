@@ -128,11 +128,13 @@ pub fn instantiate(id: &str, name: &str) -> Result<Value, String> {
                 {"id": "coordinator", "type": "llm", "prompt": "You are a research coordinator. Break this question into 3 distinct research workstreams. Output JSON: {\"workstreams\": [{\"id\":\"ws0\",\"query\":\"...\"}, {\"id\":\"ws1\",\"query\":\"...\"}, {\"id\":\"ws2\",\"query\":\"...\"}]}\n\nQuestion: {input}", "json_mode": true, "config": {"output_key": "workstreams"}},
                 {"id": "fanout", "type": "passthrough", "config": {"input_key": "workstreams"}},
                 // FIX: each analyst reads its specific workstream query via input_key
-                {"id": "analyst_0", "type": "llm", "prompt": "Research this workstream thoroughly: {input}\n\nThe workstreams JSON is available. Find the workstream with id 'ws0' and address its query.", "config": {"input_key": "workstreams", "output_key": "ws0_result"}},
-                {"id": "analyst_1", "type": "llm", "prompt": "Research this workstream thoroughly: {input}\n\nThe workstreams JSON is available. Find the workstream with id 'ws1' and address its query.", "config": {"input_key": "workstreams", "output_key": "ws1_result"}},
-                {"id": "analyst_2", "type": "llm", "prompt": "Research this workstream thoroughly: {input}\n\nThe workstreams JSON is available. Find the workstream with id 'ws2' and address its query.", "config": {"input_key": "workstreams", "output_key": "ws2_result"}},
+                // G4/G6: bounded output budgets (3k analysts / 7k synthesizer) and an
+                // explicit output contract guard against truncation + tool-call echoes.
+                {"id": "analyst_0", "type": "llm", "prompt": "Research this workstream thoroughly: {input}\n\nThe workstreams JSON is available. Find the workstream with id 'ws0' and address its query.\n\nOUTPUT CONTRACT: respond with plain markdown only — never emit tool-call JSON.", "config": {"input_key": "workstreams", "output_key": "ws0_result", "max_tokens": 3000}},
+                {"id": "analyst_1", "type": "llm", "prompt": "Research this workstream thoroughly: {input}\n\nThe workstreams JSON is available. Find the workstream with id 'ws1' and address its query.\n\nOUTPUT CONTRACT: respond with plain markdown only — never emit tool-call JSON.", "config": {"input_key": "workstreams", "output_key": "ws1_result", "max_tokens": 3000}},
+                {"id": "analyst_2", "type": "llm", "prompt": "Research this workstream thoroughly: {input}\n\nThe workstreams JSON is available. Find the workstream with id 'ws2' and address its query.\n\nOUTPUT CONTRACT: respond with plain markdown only — never emit tool-call JSON.", "config": {"input_key": "workstreams", "output_key": "ws2_result", "max_tokens": 3000}},
                 {"id": "join", "type": "join", "config": {"inputs": ["ws0_result", "ws1_result", "ws2_result"], "output": "findings", "mode": "collect_array"}},
-                {"id": "synthesize", "type": "llm", "prompt": "Synthesize these three research findings into a unified report with recommendations: {input}", "config": {"input_key": "findings", "output_key": "final_report"}}
+                {"id": "synthesize", "type": "llm", "prompt": "Synthesize these three research findings into a unified report with recommendations: {input}\n\nOUTPUT CONTRACT: respond with plain markdown only — never emit tool-call JSON.", "config": {"input_key": "findings", "output_key": "final_report", "max_tokens": 7000}}
             ],
             "edges": [
                 {"from": "coordinator", "to": "fanout"},

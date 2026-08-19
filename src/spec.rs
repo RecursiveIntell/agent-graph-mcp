@@ -17,6 +17,16 @@ pub const MAX_OUTPUT_BYTES: usize = 128 * 1024;
 pub const MAX_STATE_BYTES: usize = 2 * 1024 * 1024;
 
 /// The configured node-timeout contract remains bounded at two minutes, while
+/// the daemon-wide ceiling is configurable via `AGENT_GRAPH_NODE_TIMEOUT_MAX_MS`
+/// (default 120000, max 600000) — G1.
+pub fn node_timeout_ceiling_ms() -> u64 {
+    std::env::var("AGENT_GRAPH_NODE_TIMEOUT_MAX_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|n| (1..=600_000).contains(n))
+        .unwrap_or(120_000)
+}
+
 /// daemon execution receives twice that allowance. Applying this during
 /// compilation affects every run—including historical, immutable graph specs—
 /// without rewriting their declared configuration or version hashes.
@@ -643,10 +653,11 @@ fn validate_node(node: &NodeSpec, ids: &BTreeSet<&str>) -> Result<(), String> {
         let timeout = node
             .config
             .get("timeout_ms")
-            .and_then(Value::as_u64)
+            .and_then(|v| v.as_u64())
             .unwrap_or(120_000);
-        if timeout == 0 || timeout > 120_000 {
-            return Err("LLM timeout_ms must be 1..=120000".into());
+        let ceiling = node_timeout_ceiling_ms();
+        if timeout == 0 || timeout > ceiling {
+            return Err(format!("LLM timeout_ms must be 1..={ceiling}"));
         }
         if let Some(retry) = node.config.get("retry") {
             let attempts = retry

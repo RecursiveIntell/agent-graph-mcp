@@ -1881,7 +1881,6 @@ impl PersistentStore {
             );
         }
         let candidates = self.gc_candidates()?;
-        let actions = crate::gc::gc_decisions(&candidates, &policy, now);
         let mut archived = 0i64;
         let mut expired = 0i64;
         let mut flagged = 0i64;
@@ -1926,11 +1925,26 @@ impl PersistentStore {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         conn.execute("UPDATE gc_policy SET last_run = ?1 WHERE id = 1", [now])
             .map_err(|e| e.to_string())?;
+        // G9: sweep orphaned idempotency keys (no matching execution row).
+        let swept: i64 = conn
+            .execute(
+                "DELETE FROM idempotency_keys
+                 WHERE key NOT IN (SELECT idempotency_key FROM executions WHERE idempotency_key IS NOT NULL)",
+                [],
+            )
+            .map_err(|e| format!("idempotency sweep error: {e}"))?
+            as i64;
+        // G7: passive WAL checkpoint to bound WAL growth (safe with concurrency).
+        let wal_before: i64 = conn
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |r| r.get(0))
+            .unwrap_or(0);
         Ok(serde_json::json!({
             "enabled": true,
             "archived": archived,
             "expired": expired,
             "flagged": flagged,
+            "idempotency_keys_swept": swept,
+            "wal_checkpoint_state": wal_before,
             "last_run": now,
         }))
     }

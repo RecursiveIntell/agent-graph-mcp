@@ -119,7 +119,7 @@ pub fn idle_days_before(last_execution_at: Option<&str>, now: &str) -> i64 {
             .parse()
             .ok()
             .unwrap_or(0);
-        Some(y * 372 + m * 31 + d + (t as i64) / 86400)
+        Some(y * 372 + m * 31 + d + t / 86400)
     };
     let (Some(a), Some(b)) = (parse(last), parse(now)) else {
         return i64::MAX;
