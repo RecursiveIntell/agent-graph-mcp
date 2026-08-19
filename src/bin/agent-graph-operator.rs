@@ -68,31 +68,52 @@ fn resolve_mcp_socket() -> String {
     expand_home(DEFAULT_MCP_SOCKET)
 }
 
-/// One JSON-RPC tools/call over the MCP socket (line-delimited framing).
+/// One JSON-RPC tools/call through the stdio proxy (which owns the framed
+/// socket protocol + hello handshake). Sends initialize, initialized, then
+/// the tools/call; the response is the last non-empty stdout line.
 fn mcp_call(
     tool: &str,
     arguments: serde_json::Value,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let proxy_bin =
+        env::var("AGENT_GRAPH_MCP_BIN").unwrap_or_else(|_| "~/.local/bin/agent-graph-mcp".into());
+    let proxy_bin = expand_home(&proxy_bin);
     let socket = resolve_mcp_socket();
-    let mut stream = UnixStream::connect(&socket)
-        .map_err(|e| format!("mcp socket {socket} unavailable: {e}"))?;
-    let request = serde_json::json!({
-        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-        "params": {"name": tool, "arguments": arguments}
-    });
-    stream.write_all(request.to_string().as_bytes())?;
-    stream.write_all(b"\n")?;
-    stream.flush()?;
-    let mut reader = io::BufReader::new(stream);
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
-    let resp: serde_json::Value = serde_json::from_str(&line)?;
+    let mut child = std::process::Command::new(&proxy_bin)
+        .args(["--socket", &socket, "--connect-timeout-ms", "5000"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("spawn proxy {proxy_bin}: {e}"))?;
+    let mut stdin = child.stdin.take().ok_or("proxy stdin unavailable")?;
+    for msg in [
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"agent-graph-operator","version":env!("CARGO_PKG_VERSION")}}}),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool,"arguments":arguments}}),
+    ] {
+        stdin.write_all(msg.to_string().as_bytes())?;
+        stdin.write_all(b"\n")?;
+    }
+    drop(stdin);
+    let mut stdout = String::new();
+    child
+        .stdout
+        .take()
+        .ok_or("proxy stdout unavailable")?
+        .read_to_string(&mut stdout)?;
+    let _ = child.wait();
+    let line = stdout
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .ok_or("proxy returned no response")?;
+    let resp: serde_json::Value = serde_json::from_str(line)?;
     if let Some(err) = resp.get("error") {
         return Err(format!("mcp error: {err}").into());
     }
     let data = resp["result"]["structuredContent"]["data"].clone();
     if data.is_null() {
-        // Some tools return content[0].text JSON instead.
         let text = resp["result"]["content"][0]["text"].clone();
         if let Some(t) = text.as_str() {
             return Ok(serde_json::from_str(t).unwrap_or(text));
