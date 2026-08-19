@@ -728,12 +728,15 @@ impl AgentGraphServer {
             .map_err(|e| internal_error(e.to_string()))?;
         let name = spec_parsed.name.clone();
         let overwrite = overwrite.unwrap_or(false);
-        if !overwrite && !graphs.contains_key(&name) && graphs.len() >= self.max_graphs {
+        // B3: capacity is store-authoritative (tombstone-aware) so operator
+        // purges are reflected immediately on every connection.
+        let store_count = self.store.as_ref().and_then(|s| s.count_live_graphs().ok());
+        let current_count: i64 = store_count.unwrap_or(graphs.len() as i64);
+        if !overwrite && !graphs.contains_key(&name) && current_count >= self.max_graphs as i64 {
             return Ok(error_output(
                 format!(
                     "graph capacity ({}) exhausted — {} graphs registered",
-                    self.max_graphs,
-                    graphs.len()
+                    self.max_graphs, current_count
                 ),
                 "CAPACITY_EXHAUSTED",
             ));
@@ -1100,10 +1103,16 @@ impl AgentGraphServer {
                 .store
                 .as_ref()
                 .is_some_and(PersistentStore::has_integrity_key);
+            // B3: report store-authoritative live count when a store exists.
+            let graph_count: i64 = self
+                .store
+                .as_ref()
+                .and_then(|s| s.count_live_graphs().ok())
+                .unwrap_or(graphs.len() as i64);
 
             return Ok(structured_output(serde_json::json!({
                 "graphs": graph_names,
-                "graph_count": graphs.len(),
+                "graph_count": graph_count,
                 "execution_count": run_ids.len(),
                 "retained_execution_count": run_ids.len(),
                 "total_execution_count": run_ids.len(),
@@ -1144,7 +1153,7 @@ impl AgentGraphServer {
                     "replay": "integrity_only"
                 },
                 "limits": {"graphs": self.max_graphs},
-                "capacity_state": if graphs.len() <= self.max_graphs {
+                "capacity_state": if graph_count <= self.max_graphs as i64 {
                     "within_limit"
                 } else {
                     "over_limit_legacy"

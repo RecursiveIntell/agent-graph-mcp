@@ -1683,6 +1683,20 @@ impl PersistentStore {
         Ok(OperatorRetentionResult::Applied { receipt_id })
     }
 
+    /// Tombstone-aware count of live graphs (B3 — store-authoritative
+    /// capacity). Used by `graph_create` capacity checks and `graph_status`
+    /// so operator purges are visible to every connection immediately.
+    pub fn count_live_graphs(&self) -> Result<i64, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM graphs
+             WHERE name NOT IN (SELECT graph_name FROM graph_tombstones)",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())
+    }
+
     /// True when an unexpired legal hold exists for the graph.
     /// Tolerant of a missing `legal_holds` table (pre-migration stores):
     /// absence of the table means no holds can exist, so the operator path
@@ -3703,5 +3717,29 @@ mod tests {
         contents = contents.replace("\"archive_version\": 1", "\"archive_version\": 2");
         std::fs::write(&path, contents).expect("tamper");
         assert!(!store.verify_archived_lineage("tamper").expect("tampered"));
+    }
+
+    #[test]
+    fn count_live_graphs_is_tombstone_aware() {
+        let (temp, store) = open_store_with_daemon_schema();
+        store
+            .save_graph("live-a", "{}", "v1", false)
+            .expect("graph a");
+        store
+            .save_graph("dead-b", "{}", "v1", false)
+            .expect("graph b");
+        assert_eq!(store.count_live_graphs().expect("count"), 2);
+        store
+            .conn
+            .lock()
+            .expect("conn")
+            .execute(
+                "INSERT INTO graph_tombstones (graph_name, topology_hash, reason, actor)
+                 VALUES ('dead-b', 'v1', 'test', 'unit')",
+                [],
+            )
+            .expect("tombstone");
+        assert_eq!(store.count_live_graphs().expect("count"), 1);
+        drop(temp);
     }
 }
