@@ -2228,6 +2228,43 @@ impl AgentGraphServer {
         }
     }
 
+    /// E3: compact human-readable receipt summary for `graph_run_receipt`.
+    fn receipt_summary(receipt: &serde_json::Value) -> serde_json::Value {
+        let receipt_obj = receipt
+            .get("receipt")
+            .cloned()
+            .unwrap_or_else(|| receipt.clone());
+        let bc = receipt_obj
+            .get("budget_counters")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+        let usage = |key: &str| {
+            receipt_obj
+                .get("llm_invocations")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| {
+                    arr.iter().find_map(|inv| {
+                        inv.get("usage")
+                            .and_then(|u| u.get(key))
+                            .and_then(|v| v.as_u64())
+                    })
+                })
+        };
+        serde_json::json!({
+            "run_id": receipt_obj.get("run_id").cloned().unwrap_or(serde_json::json!(null)),
+            "schema": receipt_obj.get("schema").cloned().unwrap_or(serde_json::json!(null)),
+            "status": receipt_obj.get("status").cloned().unwrap_or(serde_json::json!(null)),
+            "success": receipt_obj.get("success").cloned().unwrap_or(serde_json::json!(null)),
+            "nodes": bc.get("nodes").cloned().unwrap_or(serde_json::json!(null)),
+            "llm_calls": bc.get("llm_calls").cloned().unwrap_or(serde_json::json!(null)),
+            "wall_clock_ms": bc.get("wall_clock_ms").cloned().unwrap_or(serde_json::json!(null)),
+            "persistence_status": receipt_obj.get("persistence_status").cloned().unwrap_or(serde_json::json!(null)),
+            "provider": receipt_obj.get("provider").cloned().unwrap_or(serde_json::json!(null)),
+            "prompt_tokens": usage("prompt_tokens"),
+            "completion_tokens": usage("completion_tokens"),
+        })
+    }
+
     #[tool(
         description = "List interrupted_non_resumable runs for resume-or-purge triage (B9): run_id, graph, error, checkpoint flag. Purging runs is operator-only (agent-graph-operator run-purge)."
     )]
@@ -2395,7 +2432,13 @@ impl AgentGraphServer {
         if let Some(store) = store {
             match store.load_terminal_receipt(&run_id) {
                 Ok(Some(receipt)) => {
-                    return Ok(output_with_meta(receipt, None, None, Some(&run_id)));
+                    // E3: human-readable summary alongside the full receipt.
+                    let summary = Self::receipt_summary(&receipt);
+                    let mut enriched = receipt;
+                    if let Some(obj) = enriched.as_object_mut() {
+                        obj.insert("summary".into(), summary);
+                    }
+                    return Ok(output_with_meta(enriched, None, None, Some(&run_id)));
                 }
                 Ok(None) => {}
                 Err(error) if error == "RECEIPT_INTEGRITY_FAILURE" => {

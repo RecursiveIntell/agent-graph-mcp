@@ -75,10 +75,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let listener = tokio::net::UnixListener::bind(&socket)?;
             std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+            // ── Authenticated operator service (peer-credentialed Unix socket) ──
+            let operator_socket = socket
+                .parent()
+                .map(|p| p.join("operator.sock"))
+                .unwrap_or_else(|| std::path::PathBuf::from("/tmp/agent-graph/operator.sock"));
+            // E1/B10: publish the well-known status file (single source of
+            // truth for socket paths), then refresh it with the health probe.
+            let write_status = |store: &agent_graph_mcp::store::PersistentStore,
+                                mcp_socket: &std::path::Path,
+                                op_socket: &std::path::Path| {
+                if let Some(path) = mcp_socket.parent() {
+                    let count = store.count_live_graphs().unwrap_or(0);
+                    let status = serde_json::json!({
+                        "daemon_pid": std::process::id(),
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "started_at": chrono::Utc::now().to_rfc3339(),
+                        "mcp_socket": mcp_socket.to_string_lossy(),
+                        "operator_socket": op_socket.to_string_lossy(),
+                        "graph_count": count,
+                        "capacity_state": if count <= max_graphs as i64 { "within_limit" } else { "over_limit_legacy" },
+                        "limits": {"graphs": max_graphs},
+                    });
+                    let _ = std::fs::write(
+                        path.join("status.json"),
+                        serde_json::to_string_pretty(&status).unwrap_or_default(),
+                    );
+                    let _ = std::fs::set_permissions(
+                        path.join("status.json"),
+                        std::fs::Permissions::from_mode(0o600),
+                    );
+                }
+            };
+            write_status(&store, &socket, &operator_socket);
             // B2: provider-path health probe (TCP + minimal HTTP GET every 60s).
             {
                 let health = provider_health.clone();
                 let probe_url = base_url.clone();
+                let probe_store = store.clone();
+                let probe_mcp = socket.clone();
+                let probe_op = operator_socket.clone();
                 tokio::spawn(async move {
                     loop {
                         let ok = tokio::task::spawn_blocking({
@@ -94,6 +130,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             health.record_failure("provider probe failed (tcp/http)");
                         }
+                        // Refresh the well-known status file with the probe.
+                        let status_store = probe_store.clone();
+                        let status_mcp = probe_mcp.clone();
+                        let status_op = probe_op.clone();
+                        tokio::task::spawn_blocking(move || {
+                            if let Some(path) = status_mcp.parent() {
+                                let count = status_store.count_live_graphs().unwrap_or(0);
+                                let status = serde_json::json!({
+                                    "daemon_pid": std::process::id(),
+                                    "version": env!("CARGO_PKG_VERSION"),
+                                    "mcp_socket": status_mcp.to_string_lossy(),
+                                    "operator_socket": status_op.to_string_lossy(),
+                                    "graph_count": count,
+                                    "capacity_state": if count <= max_graphs as i64 { "within_limit" } else { "over_limit_legacy" },
+                                    "limits": {"graphs": max_graphs},
+                                });
+                                let _ = std::fs::write(
+                                    path.join("status.json"),
+                                    serde_json::to_string_pretty(&status).unwrap_or_default(),
+                                );
+                            }
+                        })
+                        .await;
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     }
                 });
@@ -111,10 +170,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
             }
             // ── Authenticated operator service (peer-credentialed Unix socket) ──
-            let operator_socket = socket
-                .parent()
-                .map(|p| p.join("operator.sock"))
-                .unwrap_or_else(|| std::path::PathBuf::from("/tmp/agent-graph/operator.sock"));
             let operator_store = store.clone();
             let instance_id = id.instance_id.clone();
             let allowed_uids: std::collections::BTreeSet<u32> =
