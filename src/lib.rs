@@ -21,6 +21,7 @@ pub mod policy;
 pub mod promotion;
 #[cfg(feature = "provekv")]
 pub mod provekv_executor;
+pub mod provider_health;
 pub mod proxy;
 pub mod run_manager;
 pub mod server;

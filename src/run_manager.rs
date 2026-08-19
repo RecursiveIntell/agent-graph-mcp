@@ -163,6 +163,15 @@ fn execution_error_code(error: &str) -> &'static str {
         "CANCELLATION_REQUESTED"
     } else if error.contains("WITNESS_") {
         "EVIDENCE_FAILURE"
+    } else if error.contains("rate limit")
+        || error.contains("rate_limit")
+        || error.contains("429")
+        || error.contains("too many requests")
+        || error.contains("quota")
+    {
+        // B8: distinguish provider rate-limiting from provider crashes so
+        // operators see RATE_LIMITED instead of a generic PROVIDER_FAILURE.
+        "RATE_LIMITED"
     } else if error.contains("no usable assistant result")
         || error.contains("provider")
         || error.contains("codex-app-server")
@@ -1356,6 +1365,13 @@ mod tests {
             execution_error_code("WITNESS_EVIDENCE_MISSING"),
             "EVIDENCE_FAILURE"
         );
+        // B8: rate-limit classification is distinct from generic provider failure.
+        assert_eq!(
+            execution_error_code("HTTP 429 Too Many Requests from provider"),
+            "RATE_LIMITED"
+        );
+        assert_eq!(execution_error_code("rate limit exceeded"), "RATE_LIMITED");
+        assert_eq!(execution_error_code("quota exhausted"), "RATE_LIMITED");
         assert_eq!(
             execution_error_code("broker timed out"),
             "TOOL_EXECUTION_FAILURE"

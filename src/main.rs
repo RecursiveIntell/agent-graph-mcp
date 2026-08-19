@@ -29,6 +29,24 @@ fn main() {
             std::process::exit(69);
         }
     };
+    // B5: protocol hello handshake — fail fast on version mismatch instead of
+    // failing silently mid-session (relay restart loop hazard).
+    if transport::write_frame(&mut socket, &transport::hello_frame()).is_err() {
+        eprintln!("PROTOCOL_HANDSHAKE_WRITE_FAILED");
+        std::process::exit(70);
+    }
+    match transport::read_frame(&mut socket) {
+        Ok(resp) => {
+            if let Err(e) = transport::parse_hello_response(&resp) {
+                eprintln!("PROTOCOL_VERSION_MISMATCH: {e}");
+                std::process::exit(71);
+            }
+        }
+        Err(_) => {
+            eprintln!("PROTOCOL_HANDSHAKE_NO_RESPONSE");
+            std::process::exit(70);
+        }
+    }
     let stdin = io::stdin();
     let mut out = io::stdout();
     for line in stdin.lock().lines() {

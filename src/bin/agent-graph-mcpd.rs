@@ -49,6 +49,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(&data)?;
     // B1: key out of argv — explicit flag wins (deprecated), else env var.
     let api_key = daemon::resolve_api_key(api_key, std::env::var("AGENT_GRAPH_API_KEY").ok());
+    // B2: shared provider-path health, probed by a daemon task below.
+    let provider_health = agent_graph_mcp::provider_health::ProviderHealth::new();
     let key_path = std::env::var_os("AGENT_GRAPH_INTEGRITY_KEY_PATH").map(PathBuf::from);
     let store = agent_graph_mcp::store::PersistentStore::open_with_integrity_key(
         &data,
@@ -73,6 +75,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let listener = tokio::net::UnixListener::bind(&socket)?;
             std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+            // B2: provider-path health probe (TCP + minimal HTTP GET every 60s).
+            {
+                let health = provider_health.clone();
+                let probe_url = base_url.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let ok = tokio::task::spawn_blocking({
+                            let url = probe_url.clone();
+                            move || {
+                                agent_graph_mcp::provider_health::probe_base_url(&url, 5000).is_ok()
+                            }
+                        })
+                        .await
+                        .unwrap_or(false);
+                        if ok {
+                            health.record_success();
+                        } else {
+                            health.record_failure("provider probe failed (tcp/http)");
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    }
+                });
+            }
             // ── Authenticated operator service (peer-credentialed Unix socket) ──
             let operator_socket = socket
                 .parent()
@@ -117,6 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let base_url = base_url.clone();
                 let model = model.clone();
                 let api_key = api_key.clone();
+                let provider_health = provider_health.clone();
                 tokio::spawn(async move {
                     let _ = serve_connection(
                         stream,
@@ -126,6 +152,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &model,
                         api_key.as_deref(),
                         max_graphs,
+                        provider_health,
                     )
                     .await;
                 });
@@ -143,10 +170,50 @@ async fn serve_connection(
     model: &str,
     api_key: Option<&str>,
     max_graphs: usize,
+    provider_health: agent_graph_mcp::provider_health::ProviderHealth,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (mut sock_rx, mut sock_tx) = stream.into_split();
     let (bridge_side, rmcp_side) = tokio::io::duplex(1024 * 1024 + 4096);
     let (bridge_rx, mut bridge_tx) = tokio::io::split(bridge_side);
+
+    // B5: protocol hello handshake on the first frame. Legacy (non-hello)
+    // frames are forwarded into the MCP bridge unchanged; version mismatch
+    // replies with a hello_error frame and drops the connection (fail fast).
+    {
+        let mut hdr = [0u8; 4];
+        if sock_rx.read_exact(&mut hdr).await.is_err() {
+            return Ok(());
+        }
+        let len = u32::from_be_bytes(hdr) as usize;
+        if len > 1024 * 1024 {
+            return Ok(());
+        }
+        let mut payload = vec![0u8; len];
+        if sock_rx.read_exact(&mut payload).await.is_err() {
+            return Ok(());
+        }
+        match agent_graph_mcp::transport::interpret_hello(&payload) {
+            Some(Ok(reply)) => {
+                let _ = sock_tx.write_all(&(reply.len() as u32).to_be_bytes()).await;
+                let _ = sock_tx.write_all(&reply).await;
+                let _ = sock_tx.flush().await;
+            }
+            Some(Err(reason)) => {
+                let _ = sock_tx
+                    .write_all(&(reason.len() as u32).to_be_bytes())
+                    .await;
+                let _ = sock_tx.write_all(reason.as_bytes()).await;
+                let _ = sock_tx.flush().await;
+                return Ok(());
+            }
+            None => {
+                // Legacy proxy: forward the first MCP frame into the bridge.
+                let _ = bridge_tx.write_all(&payload).await;
+                let _ = bridge_tx.write_all(b"\n").await;
+                let _ = bridge_tx.flush().await;
+            }
+        }
+    }
 
     let to_rmcp = tokio::spawn(async move {
         loop {
@@ -205,7 +272,8 @@ async fn serve_connection(
         max_graphs,
         api_key.map(|s| s.to_owned()),
     )
-    .map_err(std::io::Error::other)?;
+    .map_err(std::io::Error::other)?
+    .with_provider_health(provider_health);
 
     let service = match server.serve(rmcp_side).await {
         Ok(service) => service,

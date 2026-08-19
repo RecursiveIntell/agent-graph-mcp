@@ -206,6 +206,9 @@ pub struct AgentGraphServer {
     runs: Mutex<RunManager>,
     store: Option<PersistentStore>,
     max_graphs: usize,
+    /// B2: shared provider-path health, updated by the daemon probe task and
+    /// surfaced through `graph_status`.
+    provider_health: crate::provider_health::ProviderHealth,
 }
 
 impl AgentGraphServer {
@@ -239,6 +242,13 @@ impl AgentGraphServer {
             integrity_key_path,
             DEFAULT_MAX_GRAPHS,
         )
+    }
+
+    /// B2: attach the shared provider-path health tracker (daemon-owned probe
+    /// task updates it; `graph_status` surfaces it).
+    pub fn with_provider_health(mut self, health: crate::provider_health::ProviderHealth) -> Self {
+        self.provider_health = health;
+        self
     }
 
     pub fn new_with_max_graphs(
@@ -288,6 +298,7 @@ impl AgentGraphServer {
             store,
             max_graphs,
             tool_router: Self::tool_router(),
+            provider_health: crate::provider_health::ProviderHealth::new(),
         };
 
         // Restore persisted graphs on startup
@@ -774,7 +785,7 @@ impl AgentGraphServer {
     // ── graph_execute ─────────────────────────────────────────────────
 
     #[tool(
-        description = "Execute a registered graph. Sync mode blocks until completion; async mode returns immediately with a run_id."
+        description = "Execute a registered graph. Sync mode blocks until completion; async mode returns immediately with a run_id. DEPRECATED for long runs: prefer graph_run_start (async) + graph_run_get polling — sync mode can abort on client-side read timeouts while the run continues server-side, creating apparent duplicates."
     )]
     fn graph_execute(
         &self,
@@ -1098,6 +1109,7 @@ impl AgentGraphServer {
                 "total_execution_count": run_ids.len(),
                 "base_url": self.safe_provider_label(),
                 "default_model": self.default_model,
+                "provider": self.provider_health.as_json(),
                 "storage_class": if self.store.is_none() {
                     "process_local"
                 } else if durable_integrity {
@@ -2149,7 +2161,9 @@ impl AgentGraphServer {
         self.launch_resumed(consumed, contract, graph, budgets, None)
     }
 
-    #[tool(description = "Wait for an async run to complete, with optional timeout.")]
+    #[tool(
+        description = "Wait for an async run to complete, with optional timeout. Bounded by timeout_ms (default 300000): on expiry returns {status, timed_out: true} cleanly instead of dropping the connection. Canonical flow: graph_run_start -> graph_run_get polling."
+    )]
     fn graph_run_wait(
         &self,
         Parameters(RunWaitParams { run_id, timeout_ms }): Parameters<RunWaitParams>,
