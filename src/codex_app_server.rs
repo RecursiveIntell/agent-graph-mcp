@@ -56,7 +56,7 @@ pub fn collect_text(events: &[Value]) -> String {
                 .is_some_and(|kind| kind == "agentMessage")
         })
         .filter_map(|event| event.pointer("/params/item/text").and_then(Value::as_str))
-        .last()
+        .next_back()
         .unwrap_or_default()
         .to_owned()
 }
@@ -319,6 +319,17 @@ pub fn run_turn(
     let _process_permit = acquire_process()?;
     let deadline = Instant::now() + timeout;
     let model_config = format!("model={model:?}");
+    let reasoning_effort =
+        std::env::var("AGENT_GRAPH_CODEX_REASONING_EFFORT").unwrap_or_else(|_| "high".to_owned());
+    if !matches!(
+        reasoning_effort.as_str(),
+        "minimal" | "low" | "medium" | "high" | "xhigh"
+    ) {
+        return Err(format!(
+            "unsupported Codex reasoning effort: {reasoning_effort}"
+        ));
+    }
+    let reasoning_config = format!("model_reasoning_effort={reasoning_effort:?}");
     let mut command = Command::new(codex_bin);
     command.args([
         "app-server",
@@ -328,7 +339,7 @@ pub fn run_turn(
         "-c",
         "sandbox_mode=\"read-only\"",
         "-c",
-        "model_reasoning_effort=\"low\"",
+        reasoning_config.as_str(),
     ]);
     apply_codex_isolation_overrides(&mut command)?;
     let mut child = unsafe {
@@ -483,7 +494,7 @@ pub fn run_turn(
             }
         }
     })();
-    let _ = pgid_kill(pgid);
+    pgid_kill(pgid);
     let _ = child.wait();
     let stderr = stderr_reader.join().unwrap_or_default();
     attach_stderr_context(result, stderr)
@@ -744,6 +755,17 @@ impl PersistentAppServer {
         drop(listener);
         let listen_url = format!("ws://127.0.0.1:{port}");
         let model_config = format!("model={model:?}");
+        let reasoning_effort = std::env::var("AGENT_GRAPH_CODEX_REASONING_EFFORT")
+            .unwrap_or_else(|_| "high".to_owned());
+        if !matches!(
+            reasoning_effort.as_str(),
+            "minimal" | "low" | "medium" | "high" | "xhigh"
+        ) {
+            return Err(format!(
+                "unsupported Codex reasoning effort: {reasoning_effort}"
+            ));
+        }
+        let reasoning_config = format!("model_reasoning_effort={reasoning_effort:?}");
         let mut command = Command::new(codex_bin);
         command.args([
             "app-server",
@@ -754,7 +776,7 @@ impl PersistentAppServer {
             "-c",
             "sandbox_mode=\"read-only\"",
             "-c",
-            "model_reasoning_effort=\"low\"",
+            reasoning_config.as_str(),
         ]);
         apply_codex_isolation_overrides(&mut command)?;
         let mut child = unsafe {
@@ -805,10 +827,11 @@ impl PersistentAppServer {
                 ));
             }
             match TcpStream::connect(("127.0.0.1", port)) {
-                Ok(stream) => match websocket_handshake(stream) {
-                    Ok(stream) => break stream,
-                    Err(_) => {}
-                },
+                Ok(stream) => {
+                    if let Ok(stream) = websocket_handshake(stream) {
+                        break stream;
+                    }
+                }
                 Err(_) => thread::sleep(Duration::from_millis(100)),
             }
         };

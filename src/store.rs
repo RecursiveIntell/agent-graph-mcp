@@ -18,6 +18,7 @@ use std::sync::Mutex;
 pub struct PersistentStore {
     conn: std::sync::Arc<Mutex<Connection>>,
     integrity_key: Option<std::sync::Arc<[u8]>>,
+    data_dir: PathBuf,
     #[cfg(test)]
     terminal_projection_fault: std::sync::Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
@@ -44,6 +45,64 @@ pub struct CheckpointRecord {
     pub checkpoint_digest: String,
     pub created_at: String,
     pub consumed_at: Option<String>,
+}
+
+pub struct TerminalProjection<'a> {
+    pub run_id: &'a str,
+    pub status: &'a str,
+    pub final_state_json: &'a str,
+    pub total_nodes: usize,
+    pub events: &'a [(u64, String, String)],
+    pub receipt_json: &'a str,
+    pub bundle_json: &'a str,
+}
+
+pub struct ResumeCheckpointRequest<'a> {
+    pub run_id: &'a str,
+    pub graph_id: &'a str,
+    pub graph_version: &'a str,
+    pub next_node_cursor: &'a str,
+    pub state: &'a Value,
+    pub budgets: &'a Value,
+    pub budget_counters: &'a Value,
+    pub dependency_summary: &'a Value,
+    pub terminal_cursor: u64,
+    pub event_cursor: u64,
+}
+
+pub struct CheckpointApprovalRequest<'a> {
+    pub checkpoint_id: &'a str,
+    pub graph_id: &'a str,
+    pub graph_version: &'a str,
+    pub next_node_cursor: &'a str,
+    pub expected_state: &'a Value,
+    pub expected_budgets: &'a Value,
+    pub expected_budget_counters: &'a Value,
+    pub dependency_summary: &'a Value,
+    pub audience: &'a str,
+    pub prompt_digest: &'a str,
+    pub allowed_decisions: &'a [String],
+    pub expires_at: &'a str,
+}
+
+pub struct CheckpointSave<'a> {
+    pub run_id: &'a str,
+    pub node_id: &'a str,
+    pub attempt: u32,
+    pub input_json: &'a str,
+    pub output_json: Option<&'a str>,
+    pub status: &'a str,
+    pub error: Option<&'a str>,
+}
+
+struct RetentionSnapshot {
+    current_state: String,
+    current_reason: Option<String>,
+    current_actor: Option<String>,
+    current_review_after: Option<String>,
+    versions: i64,
+    executions: i64,
+    last_execution_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -496,6 +555,15 @@ pub enum OperatorRetentionResult {
     Replayed { receipt_id: String },
 }
 
+/// Manifest metadata recorded in `archive_manifests` alongside the digest.
+struct LineageManifest {
+    topology_hash: String,
+    spec_digest: String,
+    version_count: i64,
+    execution_count: i64,
+    last_execution_at: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperatorRetentionError {
     NotFound,
@@ -507,6 +575,7 @@ pub enum OperatorRetentionError {
     Referenced,
     ReferencedBySubgraph,
     Tombstoned,
+    LegalHold,
     Persistence,
 }
 
@@ -515,6 +584,7 @@ impl Clone for PersistentStore {
         Self {
             conn: self.conn.clone(),
             integrity_key: self.integrity_key.clone(),
+            data_dir: self.data_dir.clone(),
             #[cfg(test)]
             terminal_projection_fault: self.terminal_projection_fault.clone(),
             #[cfg(test)]
@@ -557,6 +627,7 @@ impl PersistentStore {
         let store = Self {
             conn: std::sync::Arc::new(Mutex::new(conn)),
             integrity_key: Self::load_integrity_key_from(integrity_key_path),
+            data_dir: data_dir.to_path_buf(),
             #[cfg(test)]
             terminal_projection_fault: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                 false,
@@ -656,6 +727,7 @@ impl PersistentStore {
                 graph_name TEXT NOT NULL,
                 graph_hash TEXT NOT NULL,
                 thread_id TEXT,
+                owner_instance_id TEXT,
                 status TEXT NOT NULL,
                 input_json TEXT,
                 budgets_json TEXT,
@@ -711,6 +783,7 @@ impl PersistentStore {
                 receipt_json TEXT NOT NULL,
                 bundle_json TEXT NOT NULL,
                 receipt_digest TEXT NOT NULL,
+                bundle_digest TEXT,
                 persisted_at TEXT NOT NULL DEFAULT (datetime('now')),
                 FOREIGN KEY (run_id) REFERENCES executions(run_id)
             );
@@ -817,6 +890,8 @@ impl PersistentStore {
         .map_err(|e| format!("idempotency quarantine error: {e}"))?;
         for (table, column, definition) in [
             ("executions", "budgets_json", "TEXT"),
+            ("executions", "owner_instance_id", "TEXT"),
+            ("terminal_receipts", "bundle_digest", "TEXT"),
             ("checkpoints", "checkpoint_id", "TEXT"),
             ("checkpoints", "graph_id", "TEXT"),
             ("checkpoints", "graph_version", "TEXT"),
@@ -1173,6 +1248,16 @@ impl PersistentStore {
                 "inbound_subgraph_refs": inbound_subgraph_refs,
                 "tombstoned": tombstoned,
             }));
+            let review_satisfied = review_after.as_deref().map_or(true, |value| {
+                DateTime::parse_from_rfc3339(value)
+                    .map(|review_at| review_at.with_timezone(&Utc) <= Utc::now())
+                    .unwrap_or(false)
+            });
+            let deletion_eligible = state == "delete_approved"
+                && !tombstoned
+                && review_satisfied
+                && executions == 0
+                && inbound_subgraph_refs.is_empty();
             reports.push(GraphRetentionReport {
                 graph_id,
                 state,
@@ -1184,7 +1269,7 @@ impl PersistentStore {
                 version_count: versions as u64,
                 execution_count: executions as u64,
                 last_execution_at,
-                deletion_eligible: executions == 0 && inbound_subgraph_refs.is_empty(),
+                deletion_eligible,
                 inbound_subgraph_refs,
                 state_digest,
                 tombstoned,
@@ -1219,15 +1304,7 @@ impl PersistentStore {
             return Err(OperatorRetentionError::NonceReplayed);
         }
 
-        let snapshot: Option<(
-            String,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            i64,
-            i64,
-            Option<String>,
-        )> = conn
+        let snapshot: Option<RetentionSnapshot> = conn
             .query_row(
                 "SELECT COALESCE(r.state, 'unclassified'), r.reason, r.actor, r.review_after,
                         COUNT(DISTINCT gv.topology_hash), COUNT(DISTINCT e.run_id),
@@ -1240,20 +1317,20 @@ impl PersistentStore {
                  GROUP BY g.name",
                 params![request.graph_id],
                 |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                    ))
+                    Ok(RetentionSnapshot {
+                        current_state: row.get(0)?,
+                        current_reason: row.get(1)?,
+                        current_actor: row.get(2)?,
+                        current_review_after: row.get(3)?,
+                        versions: row.get(4)?,
+                        executions: row.get(5)?,
+                        last_execution_at: row.get(6)?,
+                    })
                 },
             )
             .optional()
             .map_err(|_| OperatorRetentionError::Persistence)?;
-        let Some((
+        let Some(RetentionSnapshot {
             current_state,
             current_reason,
             current_actor,
@@ -1261,7 +1338,7 @@ impl PersistentStore {
             versions,
             executions,
             last_execution_at,
-        )) = snapshot
+        }) = snapshot
         else {
             return Err(OperatorRetentionError::NotFound);
         };
@@ -1285,18 +1362,44 @@ impl PersistentStore {
             "review_after": current_review_after,
             "topology_hashes": versions,
             "execution_count": executions,
-            "last_execution_at": last_execution_at.map_or(serde_json::Value::Null, serde_json::Value::String),
+            "last_execution_at": last_execution_at
+                .as_ref()
+                .map_or(serde_json::Value::Null, |v| serde_json::Value::String(v.clone())),
             "inbound_subgraph_refs": inbound,
             "tombstoned": tombstoned,
         }));
         if current_digest != request.expected_state_digest {
             return Err(OperatorRetentionError::StaleState);
         }
-        if executions > 0 {
+        // Lane A (zero-execution delete): delete_candidate / delete_approved / DeleteGraph.
+        // Lane B (executed purge): archived / expired_pending_review / clear_approved /
+        //                         ClearExecutionLineage. PurgeGraph runs only after lineage
+        //                         has been cleared (executions == 0 by then).
+        let lane_b = matches!(request.action, OperatorAction::ClearExecutionLineage)
+            || (matches!(request.action, OperatorAction::SetGraphRetention)
+                && matches!(
+                    request.state.as_deref(),
+                    Some("archived" | "expired_pending_review" | "clear_approved")
+                ));
+        if executions > 0 && !lane_b {
             return Err(OperatorRetentionError::Referenced);
         }
-        if !inbound.is_empty() {
+        if !inbound.is_empty()
+            && matches!(
+                request.action,
+                OperatorAction::DeleteGraph | OperatorAction::PurgeGraph
+            )
+        {
             return Err(OperatorRetentionError::ReferencedBySubgraph);
+        }
+        if Self::has_active_legal_hold(&conn, &request.graph_id)
+            .map_err(|_| OperatorRetentionError::Persistence)?
+            && matches!(
+                request.action,
+                OperatorAction::ClearExecutionLineage | OperatorAction::PurgeGraph
+            )
+        {
+            return Err(OperatorRetentionError::LegalHold);
         }
 
         let action = serde_json::to_string(&request.action)
@@ -1319,11 +1422,22 @@ impl PersistentStore {
                         | "archived"
                         | "expired_pending_review"
                         | "clear_approved"
-                        | "lineage_cleared"
-                        | "purged"
                         | "delete_candidate"
                 ) {
                     return Err(OperatorRetentionError::InvalidState);
+                }
+                // State-machine transitions. `lineage_cleared` / `purged` are only
+                // reachable via ClearExecutionLineage / PurgeGraph actions, never by
+                // a direct state set.
+                match state {
+                    "active"
+                    | "active_phantom_contaminated"
+                    | "pinned"
+                    | "archived"
+                    | "delete_candidate" => {}
+                    "expired_pending_review" if current_state == "archived" => {}
+                    "clear_approved" if current_state == "expired_pending_review" => {}
+                    _ => return Err(OperatorRetentionError::InvalidTransition),
                 }
                 tx.execute(
                     "INSERT INTO graph_retention (graph_name, state, reason, actor, review_after)
@@ -1375,12 +1489,157 @@ impl PersistentStore {
                 .map_err(|_| OperatorRetentionError::Persistence)?;
             }
             OperatorAction::ClearExecutionLineage => {
-                return Err(OperatorRetentionError::InvalidState);
-                // TODO: implement per spec §4.1 — transactional DELETE of execution data
+                if current_state != "clear_approved" {
+                    return Err(OperatorRetentionError::InvalidTransition);
+                }
+                let run_ids: Vec<String> = {
+                    let mut stmt = tx
+                        .prepare("SELECT run_id FROM executions WHERE graph_name = ?1")
+                        .map_err(|_| OperatorRetentionError::Persistence)?;
+                    let rows = stmt
+                        .query_map(params![request.graph_id], |row| row.get(0))
+                        .map_err(|_| OperatorRetentionError::Persistence)?;
+                    let mut ids = Vec::new();
+                    for row in rows {
+                        ids.push(row.map_err(|_| OperatorRetentionError::Persistence)?);
+                    }
+                    ids
+                };
+                let bundle = Self::build_lineage_bundle(&tx, &request.graph_id, &run_ids)
+                    .map_err(|_| OperatorRetentionError::Persistence)?;
+                let content_digest = digest(&bundle);
+                let version_count: i64 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM graph_versions WHERE graph_name = ?1",
+                        params![request.graph_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| OperatorRetentionError::Persistence)?;
+                let (topology_hash, spec_json): (String, String) = tx
+                    .query_row(
+                        "SELECT topology_hash, spec_json FROM graphs WHERE name = ?1",
+                        params![request.graph_id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(|_| OperatorRetentionError::NotFound)?;
+                let spec_digest = digest(
+                    &serde_json::from_str::<Value>(&spec_json)
+                        .unwrap_or_else(|_| Value::String(spec_json.clone())),
+                );
+                self.write_lineage_archive(
+                    &tx,
+                    &request.graph_id,
+                    &content_digest,
+                    &bundle,
+                    LineageManifest {
+                        topology_hash,
+                        spec_digest,
+                        version_count,
+                        execution_count: executions,
+                        last_execution_at: last_execution_at.clone(),
+                    },
+                )
+                .map_err(|_| OperatorRetentionError::Persistence)?;
+                // Delete lineage child-first (FK order). Table names come from a
+                // hardcoded list — never from request input.
+                for table in [
+                    "approval_requests",
+                    "checkpoints",
+                    "events",
+                    "template_outcome_links",
+                    "terminal_receipts",
+                    "run_publication_state",
+                    "executions",
+                ] {
+                    for rid in &run_ids {
+                        tx.execute(
+                            &format!("DELETE FROM {table} WHERE run_id = ?1"),
+                            params![rid],
+                        )
+                        .map_err(|_| OperatorRetentionError::Persistence)?;
+                    }
+                }
+                {
+                    let idem_keys: Vec<String> = {
+                        let mut stmt = tx
+                            .prepare(
+                                "SELECT idempotency_key FROM executions WHERE graph_name = ?1 AND idempotency_key IS NOT NULL",
+                            )
+                            .map_err(|_| OperatorRetentionError::Persistence)?;
+                        let rows = stmt
+                            .query_map(params![request.graph_id], |row| row.get::<_, String>(0))
+                            .map_err(|_| OperatorRetentionError::Persistence)?;
+                        let mut keys = Vec::new();
+                        for row in rows {
+                            keys.push(row.map_err(|_| OperatorRetentionError::Persistence)?);
+                        }
+                        keys
+                    };
+                    for key in &idem_keys {
+                        tx.execute("DELETE FROM idempotency_keys WHERE key = ?1", params![key])
+                            .map_err(|_| OperatorRetentionError::Persistence)?;
+                    }
+                }
+                tx.execute(
+                    "UPDATE graph_retention SET state='lineage_cleared', updated_at=datetime('now'), actor=?2, reason=?3 WHERE graph_name=?1",
+                    params![
+                        request.graph_id,
+                        actor,
+                        request.reason.as_deref().unwrap_or("operator lineage clear")
+                    ],
+                )
+                .map_err(|_| OperatorRetentionError::Persistence)?;
             }
             OperatorAction::PurgeGraph => {
-                return Err(OperatorRetentionError::InvalidTransition);
-                // TODO: implement per spec §4.2 — tombstone + graph deletion
+                if current_state != "lineage_cleared" {
+                    return Err(OperatorRetentionError::InvalidTransition);
+                }
+                let remaining: i64 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM executions WHERE graph_name = ?1",
+                        params![request.graph_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| OperatorRetentionError::Persistence)?;
+                if remaining > 0 {
+                    return Err(OperatorRetentionError::Referenced);
+                }
+                let topology_hash: String = tx
+                    .query_row(
+                        "SELECT topology_hash FROM graphs WHERE name=?1",
+                        params![request.graph_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| OperatorRetentionError::NotFound)?;
+                tx.execute(
+                    "INSERT INTO graph_tombstones (graph_name, topology_hash, reason, actor) VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        request.graph_id,
+                        topology_hash,
+                        request.reason.as_deref().unwrap_or("operator purge"),
+                        actor
+                    ],
+                )
+                .map_err(|_| OperatorRetentionError::Persistence)?;
+                tx.execute(
+                    "DELETE FROM graph_versions WHERE graph_name = ?1",
+                    params![request.graph_id],
+                )
+                .map_err(|_| OperatorRetentionError::Persistence)?;
+                tx.execute(
+                    "DELETE FROM graphs WHERE name = ?1",
+                    params![request.graph_id],
+                )
+                .map_err(|_| OperatorRetentionError::Persistence)?;
+                tx.execute(
+                    "UPDATE graph_retention SET state='purged', updated_at=datetime('now'), actor=?2, reason=?3 WHERE graph_name=?1",
+                    params![
+                        request.graph_id,
+                        actor,
+                        request.reason.as_deref().unwrap_or("operator purge")
+                    ],
+                )
+                .map_err(|_| OperatorRetentionError::Persistence)?;
             }
             OperatorAction::PromoteTemplate => {
                 return Err(OperatorRetentionError::InvalidAction);
@@ -1422,6 +1681,237 @@ impl PersistentStore {
         tx.commit()
             .map_err(|_| OperatorRetentionError::Persistence)?;
         Ok(OperatorRetentionResult::Applied { receipt_id })
+    }
+
+    /// True when an unexpired legal hold exists for the graph.
+    fn has_active_legal_hold(conn: &Connection, graph: &str) -> Result<bool, String> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM legal_holds WHERE graph_name = ?1
+               AND (expires_at IS NULL OR expires_at > datetime('now')))",
+            params![graph],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("legal hold query error: {e}"))
+    }
+
+    /// Row collector for lineage export. Column values are read as generic
+    /// SQLite values so INTEGER/TEXT/NULL columns serialize without per-column
+    /// typing.
+    fn collect_rows(conn: &Connection, sql: &str, id: &str) -> Result<Vec<Value>, String> {
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|e| format!("lineage prepare error: {e}"))?;
+        let cols: Vec<String> = (0..stmt.column_count())
+            .map(|i| stmt.column_name(i).unwrap_or("").to_string())
+            .collect();
+        let rows = stmt
+            .query_map(params![id], |row| {
+                let mut map = serde_json::Map::new();
+                for (i, col) in cols.iter().enumerate() {
+                    let v: rusqlite::types::Value = row.get(i)?;
+                    let json = match v {
+                        rusqlite::types::Value::Null => Value::Null,
+                        rusqlite::types::Value::Integer(n) => Value::from(n),
+                        rusqlite::types::Value::Real(f) => Value::from(f),
+                        rusqlite::types::Value::Text(s) => Value::String(s),
+                        rusqlite::types::Value::Blob(b) => {
+                            Value::String(format!("<blob:{} bytes>", b.len()))
+                        }
+                    };
+                    map.insert(col.clone(), json);
+                }
+                Ok(Value::Object(map))
+            })
+            .map_err(|e| format!("lineage query error: {e}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| format!("lineage row error: {e}"))?);
+        }
+        Ok(out)
+    }
+
+    /// Build the full execution-lineage bundle for a graph — every row that
+    /// `ClearExecutionLineage` is about to delete, so the archive is a faithful
+    /// independent witness before any destructive DELETE runs.
+    fn build_lineage_bundle(
+        conn: &Connection,
+        graph: &str,
+        run_ids: &[String],
+    ) -> Result<Value, String> {
+        let mut runs = Vec::new();
+        let mut idem_keys = Vec::new();
+        for run_id in run_ids {
+            let rows = Self::collect_rows(
+                conn,
+                "SELECT run_id, graph_name, graph_hash, thread_id, owner_instance_id, status,
+                        input_json, budgets_json, final_state_json, started_at, finished_at,
+                        total_nodes, failed_attempts, idempotency_key
+                 FROM executions WHERE run_id = ?1",
+                run_id,
+            )?;
+            if let Some(run) = rows.into_iter().next() {
+                if let Some(key) = run.get("idempotency_key").and_then(Value::as_str) {
+                    if !key.is_empty() {
+                        idem_keys.push(key.to_string());
+                    }
+                }
+                runs.push(run);
+            }
+        }
+        let mut events = Vec::new();
+        let mut checkpoints = Vec::new();
+        let mut receipts = Vec::new();
+        let mut approvals = Vec::new();
+        let mut outcome_links = Vec::new();
+        let mut publication = Vec::new();
+        for run_id in run_ids {
+            events.extend(Self::collect_rows(
+                conn,
+                "SELECT run_id, seq, event_type, event_json, emitted_at FROM events WHERE run_id = ?1",
+                run_id,
+            )?);
+            checkpoints.extend(Self::collect_rows(
+                conn,
+                "SELECT run_id, node_id, attempt, input_json, output_json, status, error,
+                        recorded_at, checkpoint_id, graph_id, graph_version, next_cursor,
+                        state_json, state_digest, budgets_json, budget_counters_json,
+                        dependency_json, dependency_digest, terminal_cursor, event_cursor,
+                        checkpoint_digest, created_at, consumed_at
+                 FROM checkpoints WHERE run_id = ?1",
+                run_id,
+            )?);
+            receipts.extend(Self::collect_rows(
+                conn,
+                "SELECT run_id, receipt_json, bundle_json, receipt_digest, bundle_digest, persisted_at
+                 FROM terminal_receipts WHERE run_id = ?1",
+                run_id,
+            )?);
+            approvals.extend(Self::collect_rows(
+                conn,
+                "SELECT approval_id, run_id, node_id, checkpoint_id, graph_id, graph_version,
+                        checkpoint_digest, audience, prompt, prompt_digest, allowed_decisions,
+                        status, decision, decided_by, decided_at, expires_at, created_at
+                 FROM approval_requests WHERE run_id = ?1",
+                run_id,
+            )?);
+            outcome_links.extend(Self::collect_rows(
+                conn,
+                "SELECT template_id, run_id, terminal_receipt_id, receipt_digest, disposition,
+                        evidence_digest, recorded_at
+                 FROM template_outcome_links WHERE run_id = ?1",
+                run_id,
+            )?);
+            publication.extend(Self::collect_rows(
+                conn,
+                "SELECT run_id, state, updated_at, reason FROM run_publication_state WHERE run_id = ?1",
+                run_id,
+            )?);
+        }
+        let mut idempotency = Vec::new();
+        for key in &idem_keys {
+            idempotency.extend(Self::collect_rows(
+                conn,
+                "SELECT key, request_digest, result_json, valid, created_at
+                 FROM idempotency_keys WHERE key = ?1",
+                key,
+            )?);
+        }
+        Ok(serde_json::json!({
+            "archive_version": 1,
+            "graph": graph,
+            "created_at": Utc::now().to_rfc3339(),
+            "runs": runs,
+            "events": events,
+            "checkpoints": checkpoints,
+            "terminal_receipts": receipts,
+            "approval_requests": approvals,
+            "template_outcome_links": outcome_links,
+            "run_publication_state": publication,
+            "idempotency_keys": idempotency,
+        }))
+    }
+
+    /// Write the lineage bundle to `{data_dir}/archive/lineage-<graph>-<digest>.json`
+    /// (plus a `.hmac` sidecar when an integrity key is configured), and record the
+    /// manifest row. The archive file is the independent witness for the rows that
+    /// `ClearExecutionLineage` then deletes.
+    fn write_lineage_archive(
+        &self,
+        conn: &Connection,
+        graph: &str,
+        content_digest: &str,
+        bundle: &Value,
+        manifest: LineageManifest,
+    ) -> Result<(), String> {
+        let archive_dir = self.data_dir.join("archive");
+        std::fs::create_dir_all(&archive_dir)
+            .map_err(|e| format!("archive directory error: {e}"))?;
+        let json = serde_json::to_string_pretty(bundle)
+            .map_err(|e| format!("archive serialize error: {e}"))?;
+        let path = archive_dir.join(format!("lineage-{graph}-{content_digest}.json"));
+        std::fs::write(&path, &json).map_err(|e| format!("archive write error: {e}"))?;
+        if let Some(key) = self.integrity_key.as_deref() {
+            let hmac = hmac_sha256(bundle, key);
+            std::fs::write(path.with_extension("json.hmac"), hmac)
+                .map_err(|e| format!("archive hmac write error: {e}"))?;
+        }
+        conn.execute(
+            "INSERT INTO archive_manifests
+                (graph_name, graph_version, spec_digest, version_count,
+                 last_execution_at, execution_count, content_digest)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(graph_name) DO UPDATE SET
+                graph_version = excluded.graph_version,
+                spec_digest = excluded.spec_digest,
+                version_count = excluded.version_count,
+                last_execution_at = excluded.last_execution_at,
+                execution_count = excluded.execution_count,
+                content_digest = excluded.content_digest",
+            params![
+                graph,
+                manifest.topology_hash,
+                manifest.spec_digest,
+                manifest.version_count,
+                manifest.last_execution_at,
+                manifest.execution_count,
+                content_digest
+            ],
+        )
+        .map_err(|e| format!("archive manifest error: {e}"))?;
+        Ok(())
+    }
+
+    /// Verify an archived lineage bundle: recompute the content digest from the
+    /// archive file and compare against the manifest. Returns true when intact.
+    pub fn verify_archived_lineage(&self, graph: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().map_err(|e| format!("lock error: {e}"))?;
+        let (content_digest, execution_count): (String, i64) = conn
+            .query_row(
+                "SELECT content_digest, execution_count FROM archive_manifests WHERE graph_name = ?1",
+                params![graph],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| format!("archive manifest query error: {e}"))?
+            .ok_or_else(|| format!("no archive manifest for '{graph}'"))?;
+        let path = self
+            .data_dir
+            .join("archive")
+            .join(format!("lineage-{graph}-{content_digest}.json"));
+        let json =
+            std::fs::read_to_string(&path).map_err(|e| format!("archive file read error: {e}"))?;
+        let bundle: Value = match serde_json::from_str(&json) {
+            Ok(v) => v,
+            Err(_) => return Ok(false),
+        };
+        if digest(&bundle) != content_digest {
+            return Ok(false);
+        }
+        let run_count = bundle
+            .get("runs")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len) as i64;
+        Ok(run_count == execution_count)
     }
 
     pub fn set_graph_retention(
@@ -1655,14 +2145,41 @@ impl PersistentStore {
         budgets_json: Option<&str>,
     ) -> Result<(), String> {
         let conn = self.conn.lock().map_err(|e| format!("lock error: {e}"))?;
+        let daemon_table_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='daemon_instances')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("save_execution daemon schema query error: {e}"))?;
+        let owner_instance_id = if daemon_table_exists {
+            conn.query_row(
+                "SELECT instance_id FROM daemon_instances ORDER BY generation DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|e| format!("save_execution daemon owner query error: {e}"))?
+        } else {
+            None
+        };
         conn.execute(
-            "INSERT INTO executions (run_id, graph_name, graph_hash, status, input_json, budgets_json, started_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
+            "INSERT INTO executions (run_id, graph_name, graph_hash, owner_instance_id, status, input_json, budgets_json, started_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))
              ON CONFLICT(run_id) DO UPDATE SET
                 status = excluded.status,
+                owner_instance_id = COALESCE(excluded.owner_instance_id, executions.owner_instance_id),
                 budgets_json = COALESCE(excluded.budgets_json, executions.budgets_json),
                 finished_at = CASE WHEN excluded.status IN ('completed','failed','cancelled') THEN datetime('now') ELSE finished_at END",
-            params![run_id, graph_name, graph_hash, status, input_json, budgets_json],
+            params![
+                run_id,
+                graph_name,
+                graph_hash,
+                owner_instance_id,
+                status,
+                input_json,
+                budgets_json,
+            ],
         )
         .map_err(|e| format!("save_execution error: {e}"))?;
         Ok(())
@@ -1703,20 +2220,26 @@ impl PersistentStore {
 
     pub fn persist_terminal_projection(
         &self,
-        run_id: &str,
-        status: &str,
-        final_state_json: &str,
-        total_nodes: usize,
-        events: &[(u64, String, String)],
-        receipt_json: &str,
-        bundle_json: &str,
+        projection: TerminalProjection<'_>,
     ) -> Result<String, String> {
+        let TerminalProjection {
+            run_id,
+            status,
+            final_state_json,
+            total_nodes,
+            events,
+            receipt_json,
+            bundle_json,
+        } = projection;
         let key = self
             .require_integrity_key()
             .map_err(|_| "INTEGRITY_KEY_REQUIRED".to_owned())?;
         let receipt: Value = serde_json::from_str(receipt_json)
             .map_err(|e| format!("terminal receipt JSON error: {e}"))?;
+        let bundle: Value = serde_json::from_str(bundle_json)
+            .map_err(|e| format!("terminal bundle JSON error: {e}"))?;
         let receipt_digest = hmac_sha256(&receipt, key);
+        let bundle_digest = hmac_sha256(&bundle, key);
         let mut conn = self.conn.lock().map_err(|e| format!("lock error: {e}"))?;
         let tx = conn
             .transaction()
@@ -1747,9 +2270,9 @@ impl PersistentStore {
             return Err("injected terminal projection failure after events".into());
         }
         tx.execute(
-            "INSERT INTO terminal_receipts (run_id, receipt_json, bundle_json, receipt_digest) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(run_id) DO UPDATE SET receipt_json=excluded.receipt_json, bundle_json=excluded.bundle_json, receipt_digest=excluded.receipt_digest, persisted_at=datetime('now')",
-            params![run_id, receipt_json, bundle_json, receipt_digest],
+            "INSERT INTO terminal_receipts (run_id, receipt_json, bundle_json, receipt_digest, bundle_digest) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(run_id) DO UPDATE SET receipt_json=excluded.receipt_json, bundle_json=excluded.bundle_json, receipt_digest=excluded.receipt_digest, bundle_digest=excluded.bundle_digest, persisted_at=datetime('now')",
+            params![run_id, receipt_json, bundle_json, receipt_digest, bundle_digest],
         ).map_err(|e| format!("terminal receipt insert error: {e}"))?;
         tx.commit()
             .map_err(|e| format!("terminal transaction commit error: {e}"))?;
@@ -1761,20 +2284,41 @@ impl PersistentStore {
             .require_integrity_key()
             .map_err(|_| "INTEGRITY_KEY_REQUIRED".to_owned())?;
         let conn = self.conn.lock().map_err(|e| format!("lock error: {e}"))?;
-        let row: Result<(String, String), _> = conn.query_row(
-            "SELECT receipt_json, receipt_digest FROM terminal_receipts WHERE run_id = ?1",
+        let row: Result<(String, String, String, Option<String>), _> = conn.query_row(
+            "SELECT receipt_json, bundle_json, receipt_digest, bundle_digest FROM terminal_receipts WHERE run_id = ?1",
             params![run_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         );
         match row {
-            Ok((receipt_json, receipt_digest)) => {
+            Ok((receipt_json, bundle_json, receipt_digest, bundle_digest)) => {
                 let receipt: Value = serde_json::from_str(&receipt_json)
                     .map_err(|e| format!("stored receipt JSON error: {e}"))?;
+                let bundle: Value = serde_json::from_str(&bundle_json)
+                    .map_err(|e| format!("stored bundle JSON error: {e}"))?;
                 if hmac_sha256(&receipt, key) != receipt_digest {
                     return Err("RECEIPT_INTEGRITY_FAILURE".into());
                 }
+                let Some(bundle_digest) = bundle_digest else {
+                    return Err("BUNDLE_INTEGRITY_UNAVAILABLE".into());
+                };
+                if hmac_sha256(&bundle, key) != bundle_digest
+                    || crate::evidence::verify(&bundle)
+                        .get("verified")
+                        .and_then(Value::as_bool)
+                        != Some(true)
+                {
+                    return Err("BUNDLE_INTEGRITY_FAILURE".into());
+                }
+                let payload = bundle
+                    .get("payload")
+                    .ok_or_else(|| "BUNDLE_INTEGRITY_FAILURE".to_owned())?;
+                if payload.get("run_id").and_then(Value::as_str) != Some(run_id)
+                    || payload.get("graph_version") != receipt.get("graph_version")
+                {
+                    return Err("BUNDLE_RECEIPT_MISMATCH".into());
+                }
                 Ok(Some(
-                    serde_json::json!({"receipt":receipt,"receipt_digest":receipt_digest,"storage_class":"sqlite_terminal_receipt","replay_capability":"integrity_only"}),
+                    serde_json::json!({"receipt":receipt,"bundle":bundle,"receipt_digest":receipt_digest,"bundle_digest":bundle_digest,"storage_class":"sqlite_terminal_receipt","replay_capability":"integrity_only"}),
                 ))
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -1785,14 +2329,93 @@ impl PersistentStore {
     /// A server restart cannot resume an in-flight graph. Make that interruption
     /// explicit instead of leaving a permanently misleading `running` row.
     pub fn recover_incomplete_executions(&self) -> Result<(), String> {
-        let conn = self.conn.lock().map_err(|e| format!("lock error: {e}"))?;
-        conn.execute(
-            "UPDATE executions
-             SET status = 'interrupted_non_resumable', finished_at = datetime('now')
-             WHERE status IN ('accepted', 'running')",
-            [],
-        )
-        .map_err(|e| format!("recover executions error: {e}"))?;
+        let mut conn = self.conn.lock().map_err(|e| format!("lock error: {e}"))?;
+        let has_executions: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='executions')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("recover schema query error: {e}"))?;
+        if !has_executions {
+            return Ok(());
+        }
+        let interrupted = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT run_id, graph_name, graph_hash, status
+                     FROM executions WHERE status IN ('accepted', 'running')",
+                )
+                .map_err(|e| format!("recover execution query error: {e}"))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(|e| format!("recover execution rows error: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("recover execution row error: {e}"))?
+        };
+        if interrupted.is_empty() {
+            return Ok(());
+        }
+        let key = self.integrity_key.as_deref();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("recover transaction error: {e}"))?;
+        for (run_id, graph_name, graph_hash, prior_status) in interrupted {
+            tx.execute(
+                "UPDATE executions
+                 SET status = 'interrupted_non_resumable', finished_at = datetime('now')
+                 WHERE run_id = ?1 AND status IN ('accepted', 'running')",
+                params![run_id],
+            )
+            .map_err(|e| format!("recover execution update error: {e}"))?;
+            if let Some(key) = key {
+                let receipt = serde_json::json!({
+                    "schema": "agent-graph-recovery-receipt-v1",
+                    "run_id": run_id,
+                    "graph_id": graph_name,
+                    "graph_version": graph_hash,
+                    "status": "interrupted_non_resumable",
+                    "success": false,
+                    "recovery": {
+                        "prior_status": prior_status,
+                        "reason": "daemon_restart",
+                        "resumable": false
+                    }
+                });
+                let bundle = crate::evidence::bundle(
+                    &run_id,
+                    &graph_hash,
+                    &Value::Null,
+                    &Value::Null,
+                    &receipt,
+                );
+                let receipt_json = serde_json::to_string(&receipt)
+                    .map_err(|e| format!("recover receipt serialization error: {e}"))?;
+                let bundle_json = serde_json::to_string(&bundle)
+                    .map_err(|e| format!("recover bundle serialization error: {e}"))?;
+                let receipt_digest = hmac_sha256(&receipt, key);
+                let bundle_digest = hmac_sha256(&bundle, key);
+                tx.execute(
+                    "INSERT INTO terminal_receipts (run_id, receipt_json, bundle_json, receipt_digest, bundle_digest)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(run_id) DO UPDATE SET receipt_json=excluded.receipt_json,
+                         bundle_json=excluded.bundle_json, receipt_digest=excluded.receipt_digest,
+                         bundle_digest=excluded.bundle_digest,
+                         persisted_at=datetime('now')",
+                    params![run_id, receipt_json, bundle_json, receipt_digest, bundle_digest],
+                )
+                .map_err(|e| format!("recover receipt insert error: {e}"))?;
+            }
+        }
+        tx.commit()
+            .map_err(|e| format!("recover transaction commit error: {e}"))?;
         Ok(())
     }
 
@@ -1896,17 +2519,20 @@ impl PersistentStore {
 
     pub fn create_resume_checkpoint(
         &self,
-        run_id: &str,
-        graph_id: &str,
-        graph_version: &str,
-        next_node_cursor: &str,
-        state: &Value,
-        budgets: &Value,
-        budget_counters: &Value,
-        dependency_summary: &Value,
-        terminal_cursor: u64,
-        event_cursor: u64,
+        request: ResumeCheckpointRequest<'_>,
     ) -> Result<CheckpointRecord, CheckpointError> {
+        let ResumeCheckpointRequest {
+            run_id,
+            graph_id,
+            graph_version,
+            next_node_cursor,
+            state,
+            budgets,
+            budget_counters,
+            dependency_summary,
+            terminal_cursor,
+            event_cursor,
+        } = request;
         let key = self
             .require_integrity_key()
             .map_err(|_| CheckpointError::IntegrityKeyRequired)?;
@@ -2074,19 +2700,22 @@ impl PersistentStore {
 
     pub fn create_checkpoint_approval(
         &self,
-        checkpoint_id: &str,
-        graph_id: &str,
-        graph_version: &str,
-        next_node_cursor: &str,
-        expected_state: &Value,
-        expected_budgets: &Value,
-        expected_budget_counters: &Value,
-        dependency_summary: &Value,
-        audience: &str,
-        prompt_digest: &str,
-        allowed_decisions: &[String],
-        expires_at: &str,
+        request: CheckpointApprovalRequest<'_>,
     ) -> Result<ApprovalRecord, ApprovalError> {
+        let CheckpointApprovalRequest {
+            checkpoint_id,
+            graph_id,
+            graph_version,
+            next_node_cursor,
+            expected_state,
+            expected_budgets,
+            expected_budget_counters,
+            dependency_summary,
+            audience,
+            prompt_digest,
+            allowed_decisions,
+            expires_at,
+        } = request;
         let key = self
             .require_integrity_key()
             .map_err(|_| ApprovalError::IntegrityKeyRequired)?;
@@ -2453,16 +3082,16 @@ impl PersistentStore {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    pub fn save_checkpoint(
-        &self,
-        run_id: &str,
-        node_id: &str,
-        attempt: u32,
-        input_json: &str,
-        output_json: Option<&str>,
-        status: &str,
-        error: Option<&str>,
-    ) -> Result<(), String> {
+    pub fn save_checkpoint(&self, checkpoint: CheckpointSave<'_>) -> Result<(), String> {
+        let CheckpointSave {
+            run_id,
+            node_id,
+            attempt,
+            input_json,
+            output_json,
+            status,
+            error,
+        } = checkpoint;
         let conn = self.conn.lock().map_err(|e| format!("lock error: {e}"))?;
         conn.execute(
             "INSERT INTO checkpoints (run_id, node_id, attempt, input_json, output_json, status, error)
@@ -2634,6 +3263,40 @@ mod tests {
     }
 
     #[test]
+    fn retention_eligibility_requires_delete_approval() {
+        let temp = tempfile::tempdir().expect("graph database");
+        let store = PersistentStore::open(temp.path()).expect("store");
+        store
+            .save_graph("retention-gate", "{}", "version", false)
+            .expect("graph");
+        let report = store
+            .graph_retention_review(Some("retention-gate"), None, 1)
+            .expect("review")
+            .pop()
+            .expect("report");
+        assert_eq!(report.state, "active");
+        assert!(!report.deletion_eligible);
+        store
+            .set_graph_retention("retention-gate", "delete_candidate", "test", "unit", None)
+            .expect("candidate");
+        let report = store
+            .graph_retention_review(Some("retention-gate"), None, 1)
+            .expect("review")
+            .pop()
+            .expect("report");
+        assert!(!report.deletion_eligible);
+        store
+            .set_graph_retention("retention-gate", "delete_approved", "test", "unit", None)
+            .expect("approved");
+        let report = store
+            .graph_retention_review(Some("retention-gate"), None, 1)
+            .expect("review")
+            .pop()
+            .expect("report");
+        assert!(report.deletion_eligible);
+    }
+
+    #[test]
     fn checkpoint_persistence_fault_leaves_no_resumable_row() {
         configure_test_integrity_key();
         let temp = tempfile::tempdir().expect("checkpoint database");
@@ -2652,22 +3315,380 @@ mod tests {
             )
             .expect("execution");
         store.fail_checkpoint_persistence();
-        let result = store.create_resume_checkpoint(
-            "run-checkpoint-fault",
-            "checkpoint-fault",
-            "version",
-            "entry",
-            &serde_json::json!({"__input__":null}),
-            &Value::Null,
-            &serde_json::json!({"nodes":0,"llm_calls":0,"wall_clock_ms":0}),
-            &serde_json::json!({"eligible":true}),
-            0,
-            0,
-        );
+        let result = store.create_resume_checkpoint(ResumeCheckpointRequest {
+            run_id: "run-checkpoint-fault",
+            graph_id: "checkpoint-fault",
+            graph_version: "version",
+            next_node_cursor: "entry",
+            state: &serde_json::json!({"__input__":null}),
+            budgets: &Value::Null,
+            budget_counters: &serde_json::json!({"nodes":0,"llm_calls":0,"wall_clock_ms":0}),
+            dependency_summary: &serde_json::json!({"eligible":true}),
+            terminal_cursor: 0,
+            event_cursor: 0,
+        });
         assert_eq!(result, Err(CheckpointError::Persistence));
         assert_eq!(
             store.load_resume_checkpoint(None, Some("run-checkpoint-fault")),
             Ok(None)
         );
+    }
+
+    #[test]
+    fn new_execution_binds_to_the_latest_daemon_instance() {
+        let temp = tempfile::tempdir().expect("execution database");
+        let store = PersistentStore::open(temp.path()).expect("store");
+        store
+            .save_graph("owner-bound", "{}", "version", false)
+            .expect("graph");
+        {
+            let conn = store.conn.lock().expect("store connection");
+            conn.execute_batch(
+                "CREATE TABLE daemon_instances (
+                    instance_id TEXT PRIMARY KEY,
+                    generation INTEGER NOT NULL UNIQUE
+                );
+                INSERT INTO daemon_instances(instance_id, generation)
+                    VALUES ('daemon-current', 7);",
+            )
+            .expect("daemon owner");
+        }
+        store
+            .save_execution("run-owner-bound", "owner-bound", "version", "running", "{}")
+            .expect("execution");
+        let owner: String = store
+            .conn
+            .lock()
+            .expect("store connection")
+            .query_row(
+                "SELECT owner_instance_id FROM executions WHERE run_id = 'run-owner-bound'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("owner instance");
+        assert_eq!(owner, "daemon-current");
+    }
+
+    // ── Retention/purge lifecycle (Lane B) tests ─────────────────────────────
+
+    static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn fresh_nonce() -> String {
+        format!(
+            "test-{}-{}",
+            std::process::id(),
+            NONCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        )
+    }
+
+    fn open_store_with_daemon_schema() -> (tempfile::TempDir, PersistentStore) {
+        let temp = tempfile::tempdir().expect("graph database");
+        let store = PersistentStore::open(temp.path()).expect("store");
+        {
+            let mut conn = store.conn.lock().expect("store connection");
+            crate::migrations::apply(&mut conn, "unit-test-binary").expect("daemon schema");
+        }
+        (temp, store)
+    }
+
+    fn op_request(
+        store: &PersistentStore,
+        graph: &str,
+        action: OperatorAction,
+        state: Option<&str>,
+        reason: Option<&str>,
+    ) -> OperatorRetentionRequest {
+        let report = store
+            .graph_retention_review(Some(graph), None, 1)
+            .expect("retention review")
+            .pop()
+            .expect("report");
+        OperatorRetentionRequest {
+            request_digest: format!("sha256:test-{}", fresh_nonce()),
+            action,
+            graph_id: graph.into(),
+            expected_state_digest: report.state_digest,
+            nonce: fresh_nonce(),
+            operator_uid: 1000,
+            daemon_instance_id: "unit-test-daemon".into(),
+            issued_at: "2026-01-01T00:00:00Z".into(),
+            expires_at: "2099-01-01T00:00:00Z".into(),
+            state: state.map(str::to_owned),
+            reason: reason.map(str::to_owned),
+            review_after: None,
+        }
+    }
+
+    fn advance_lane_b(store: &PersistentStore, graph: &str) {
+        for state in ["archived", "expired_pending_review", "clear_approved"] {
+            store
+                .apply_operator_retention(&op_request(
+                    store,
+                    graph,
+                    OperatorAction::SetGraphRetention,
+                    Some(state),
+                    Some("test advance"),
+                ))
+                .expect("advance lane B");
+        }
+    }
+
+    #[test]
+    fn executed_graph_reaches_archived_and_expired_pending_review() {
+        let (_temp, store) = open_store_with_daemon_schema();
+        store
+            .save_graph("executed-arch", "{}", "v1", false)
+            .expect("graph");
+        store
+            .save_execution_with_budgets(
+                "run-executed-arch",
+                "executed-arch",
+                "v1",
+                "completed",
+                "{}",
+                Some("null"),
+            )
+            .expect("execution");
+        assert!(matches!(
+            store.apply_operator_retention(&op_request(
+                &store,
+                "executed-arch",
+                OperatorAction::SetGraphRetention,
+                Some("archived"),
+                Some("retire")
+            )),
+            Ok(OperatorRetentionResult::Applied { .. })
+        ));
+        assert!(matches!(
+            store.apply_operator_retention(&op_request(
+                &store,
+                "executed-arch",
+                OperatorAction::SetGraphRetention,
+                Some("expired_pending_review"),
+                Some("review window expired")
+            )),
+            Ok(OperatorRetentionResult::Applied { .. })
+        ));
+        let report = store
+            .graph_retention_review(Some("executed-arch"), None, 1)
+            .expect("review")
+            .pop()
+            .expect("report");
+        assert_eq!(report.state, "expired_pending_review");
+        // Lane A still refuses executed graphs.
+        assert!(matches!(
+            store.apply_operator_retention(&op_request(
+                &store,
+                "executed-arch",
+                OperatorAction::SetGraphRetention,
+                Some("delete_candidate"),
+                Some("must fail")
+            )),
+            Err(OperatorRetentionError::Referenced)
+        ));
+    }
+
+    #[test]
+    fn purge_lifecycle_exports_archive_clears_lineage_and_purges() {
+        let (temp, store) = open_store_with_daemon_schema();
+        store
+            .save_graph("purge-me", "{}", "v1", false)
+            .expect("graph");
+        store
+            .save_execution_with_budgets(
+                "run-purge-1",
+                "purge-me",
+                "v1",
+                "completed",
+                "{\"q\":1}",
+                Some("null"),
+            )
+            .expect("execution");
+        advance_lane_b(&store, "purge-me");
+        // Purge before lineage is cleared must fail.
+        assert!(matches!(
+            store.apply_operator_retention(&op_request(
+                &store,
+                "purge-me",
+                OperatorAction::PurgeGraph,
+                None,
+                Some("too early")
+            )),
+            Err(OperatorRetentionError::Referenced)
+        ));
+        // Clear lineage: exports archive, deletes rows, advances state.
+        assert!(matches!(
+            store.apply_operator_retention(&op_request(
+                &store,
+                "purge-me",
+                OperatorAction::ClearExecutionLineage,
+                None,
+                Some("export + clear")
+            )),
+            Ok(OperatorRetentionResult::Applied { .. })
+        ));
+        let executions: i64 = store
+            .conn
+            .lock()
+            .expect("conn")
+            .query_row(
+                "SELECT COUNT(*) FROM executions WHERE graph_name = 'purge-me'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("execution count");
+        assert_eq!(executions, 0);
+        let manifest: String = store
+            .conn
+            .lock()
+            .expect("conn")
+            .query_row(
+                "SELECT content_digest FROM archive_manifests WHERE graph_name = 'purge-me'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("manifest");
+        assert!(!manifest.is_empty());
+        assert!(store
+            .verify_archived_lineage("purge-me")
+            .expect("archive verify"));
+        let archive_file = temp
+            .path()
+            .join("archive")
+            .join(format!("lineage-purge-me-{manifest}.json"));
+        assert!(archive_file.exists());
+        assert!(matches!(
+            store.apply_operator_retention(&op_request(
+                &store,
+                "purge-me",
+                OperatorAction::PurgeGraph,
+                None,
+                Some("purge")
+            )),
+            Ok(OperatorRetentionResult::Applied { .. })
+        ));
+        let conn = store.conn.lock().expect("conn");
+        let graph_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM graphs WHERE name = 'purge-me'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("graph count");
+        assert_eq!(graph_rows, 0);
+        let tombstoned: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM graph_tombstones WHERE graph_name = 'purge-me'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("tombstone count");
+        assert_eq!(tombstoned, 1);
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM graph_retention WHERE graph_name = 'purge-me'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("retention state");
+        assert_eq!(state, "purged");
+        drop(conn);
+        assert!(store.save_graph("purge-me", "{}", "v2", false).is_err());
+    }
+
+    #[test]
+    fn legal_hold_blocks_lineage_clear() {
+        let (_temp, store) = open_store_with_daemon_schema();
+        store.save_graph("held", "{}", "v1", false).expect("graph");
+        store
+            .save_execution_with_budgets("run-held", "held", "v1", "completed", "{}", Some("null"))
+            .expect("execution");
+        advance_lane_b(&store, "held");
+        store
+            .conn
+            .lock()
+            .expect("conn")
+            .execute(
+                "INSERT INTO legal_holds (hold_id, graph_name, reason, expires_at)
+                 VALUES ('hold-1', 'held', 'litigation', '2099-01-01')",
+                [],
+            )
+            .expect("legal hold");
+        assert!(matches!(
+            store.apply_operator_retention(&op_request(
+                &store,
+                "held",
+                OperatorAction::ClearExecutionLineage,
+                None,
+                Some("blocked by hold")
+            )),
+            Err(OperatorRetentionError::LegalHold)
+        ));
+    }
+
+    #[test]
+    fn purge_requires_lineage_cleared_first() {
+        let (_temp, store) = open_store_with_daemon_schema();
+        store
+            .save_graph("purge-early", "{}", "v1", false)
+            .expect("graph");
+        advance_lane_b(&store, "purge-early");
+        assert!(matches!(
+            store.apply_operator_retention(&op_request(
+                &store,
+                "purge-early",
+                OperatorAction::PurgeGraph,
+                None,
+                Some("early purge")
+            )),
+            Err(OperatorRetentionError::InvalidTransition)
+        ));
+    }
+
+    #[test]
+    fn verify_archived_lineage_detects_tamper() {
+        let (temp, store) = open_store_with_daemon_schema();
+        store
+            .save_graph("tamper", "{}", "v1", false)
+            .expect("graph");
+        store
+            .save_execution_with_budgets(
+                "run-tamper",
+                "tamper",
+                "v1",
+                "completed",
+                "{}",
+                Some("null"),
+            )
+            .expect("execution");
+        advance_lane_b(&store, "tamper");
+        store
+            .apply_operator_retention(&op_request(
+                &store,
+                "tamper",
+                OperatorAction::ClearExecutionLineage,
+                None,
+                Some("export"),
+            ))
+            .expect("clear lineage");
+        assert!(store.verify_archived_lineage("tamper").expect("intact"));
+        let digest: String = store
+            .conn
+            .lock()
+            .expect("conn")
+            .query_row(
+                "SELECT content_digest FROM archive_manifests WHERE graph_name = 'tamper'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("digest");
+        let path = temp
+            .path()
+            .join("archive")
+            .join(format!("lineage-tamper-{digest}.json"));
+        let mut contents = std::fs::read_to_string(&path).expect("read archive");
+        contents = contents.replace("\"archive_version\": 1", "\"archive_version\": 2");
+        std::fs::write(&path, contents).expect("tamper");
+        assert!(!store.verify_archived_lineage("tamper").expect("tampered"));
     }
 }

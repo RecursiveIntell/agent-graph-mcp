@@ -60,6 +60,7 @@ impl DaemonLock {
         let path = data_dir.join("daemon.lock");
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .mode(0o600)
@@ -76,7 +77,7 @@ impl DaemonLock {
 }
 impl Drop for DaemonLock {
     fn drop(&mut self) {
-        let _ = self.file.unlock();
+        let _ = fs2::FileExt::unlock(&self.file);
         let _ = self.file.sync_all();
     }
 }
@@ -175,6 +176,11 @@ pub fn open_owned(
 }
 
 /// Persist the integrity mode and reject mixed keyless/key-enabled restarts.
+///
+/// The process-boundary fixture includes this module directly but does not exercise
+/// startup-mode enforcement; retain the explicit production API without masking
+/// dead code in normal builds.
+#[cfg_attr(test, allow(dead_code))]
 pub fn enforce_startup_mode(conn: &Connection, key_enabled: bool) -> rusqlite::Result<()> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS daemon_startup_mode (mode TEXT PRIMARY KEY CHECK(mode IN ('keyless','key-enabled')));")?;
     let expected = if key_enabled {

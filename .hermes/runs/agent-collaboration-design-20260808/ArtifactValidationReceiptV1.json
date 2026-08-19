@@ -1,0 +1,48 @@
+{
+  "artifact": {
+    "bytes": 44844,
+    "kind": "markdown",
+    "path": "/home/sikmindz/Coding/agent-graph-mcp-release/.hermes/plans/agent-collaboration-protocol-20260808.md",
+    "sha256": "sha256:8f2f192099467970ce8be9ccf60cc60227278a90b26072fbd30f503c4fe3fe35"
+  },
+  "checks": [
+    {
+      "evidence": {
+        "bytes": 44844,
+        "kind": "markdown",
+        "path": "/home/sikmindz/Coding/agent-graph-mcp-release/.hermes/plans/agent-collaboration-protocol-20260808.md",
+        "sha256": "sha256:8f2f192099467970ce8be9ccf60cc60227278a90b26072fbd30f503c4fe3fe35"
+      },
+      "name": "exists-and-hash",
+      "status": "PASS"
+    },
+    {
+      "evidence": {
+        "characters": 44794
+      },
+      "name": "text-decode",
+      "status": "PASS"
+    },
+    {
+      "evidence": {
+        "missing": []
+      },
+      "name": "local-links-and-assets",
+      "status": "PASS"
+    },
+    {
+      "evidence": {
+        "hits": []
+      },
+      "name": "placeholder-and-tool-token-scan",
+      "status": "PASS"
+    }
+  ],
+  "created_at": "2026-08-08T20:08:56.670491+00:00",
+  "defects": [],
+  "manual_checks": [],
+  "overall_status": "PASS",
+  "repair_authority_required": false,
+  "schema": "ArtifactValidationReceiptV1",
+  "version": 1
+}

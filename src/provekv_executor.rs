@@ -147,15 +147,15 @@ impl ModelInvocationExecutor for ProveKvExecutor {
                     vec![provekv::HybridComponent {
                         name: format!("{}-shared_attn_k", key.1),
                         version: "1.0".into(),
-                        digest: format!("sha256:shared_base"),
+                        digest: "sha256:shared_base".to_string(),
                     }],
                     vec![provekv::HybridPageRef {
                         page_id: format!("{}-pg0", key.1),
-                        digest: format!("sha256:dpg0"),
+                        digest: "sha256:dpg0".to_string(),
                     }],
                     vec![],
-                    format!("sha256:policy_demo"),
-                    format!("sha256:version_demo"),
+                    "sha256:policy_demo".to_string(),
+                    "sha256:version_demo".to_string(),
                 );
                 store
                     .commit_root(manifest)
@@ -273,7 +273,7 @@ mod tests {
         let executor = temp_executor();
         let handle = executor.acquire("r1", "n1", 0);
         assert!(handle.is_some(), "demo mode should return a handle");
-        assert!(handle.unwrap().lease_digest.len() > 0);
+        assert!(!handle.unwrap().lease_digest.is_empty());
     }
 
     #[test]

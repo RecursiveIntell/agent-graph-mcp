@@ -2,7 +2,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
-pub const CURRENT_VERSION: i64 = 4;
+pub const CURRENT_VERSION: i64 = 5;
 pub const LEGACY_OWNER_UNKNOWN: &str = "legacy_owner_unknown";
 
 #[allow(dead_code)]
@@ -42,17 +42,48 @@ pub fn apply(conn: &mut Connection, binary_digest: &str) -> rusqlite::Result<()>
                 tx.execute("UPDATE executions SET owner_instance_id = ?1 WHERE owner_instance_id IS NULL AND status IN ('accepted','running')", [LEGACY_OWNER_UNKNOWN])?;
             }
         }
-
-        // v4: deletion governance — phantom remediation + retention lifecycle
-        let has_superseded: Option<i64> = tx
+        // v5: authenticate the independently persisted terminal bundle.
+        let has_terminal_receipts: Option<i64> = tx
             .query_row(
-                "SELECT 1 FROM pragma_table_info('executions') WHERE name='superseded_by'",
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='terminal_receipts'",
                 [],
                 |r| r.get(0),
             )
             .optional()?;
-        if has_superseded.is_none() {
-            tx.execute_batch("ALTER TABLE executions ADD COLUMN superseded_by TEXT DEFAULT NULL;")?;
+        if has_terminal_receipts.is_some() {
+            let has_bundle_digest: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM pragma_table_info('terminal_receipts') WHERE name='bundle_digest'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if has_bundle_digest.is_none() {
+                tx.execute_batch("ALTER TABLE terminal_receipts ADD COLUMN bundle_digest TEXT;")?;
+            }
+        }
+
+        // v4: deletion governance — phantom remediation + retention lifecycle
+        let has_executions: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='executions'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if has_executions.is_some() {
+            let has_superseded: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM pragma_table_info('executions') WHERE name='superseded_by'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if has_superseded.is_none() {
+                tx.execute_batch(
+                    "ALTER TABLE executions ADD COLUMN superseded_by TEXT DEFAULT NULL;",
+                )?;
+            }
         }
         tx.execute_batch(
             "CREATE TABLE IF NOT EXISTS legal_holds (\
@@ -93,7 +124,7 @@ pub fn migration_digest(binary_digest: &str) -> String {
 }
 
 #[allow(dead_code)]
-pub fn owner_for_new_run<'a>(owner: &'a str) -> rusqlite::Result<&'a str> {
+pub fn owner_for_new_run(owner: &str) -> rusqlite::Result<&str> {
     if owner.is_empty() {
         Err(rusqlite::Error::InvalidParameterName(
             "owner_instance_id".into(),
@@ -124,6 +155,45 @@ mod tests {
             c.query_row::<i64, _, _>("SELECT count(*) FROM schema_migrations", [], |r| r.get(0))
                 .unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn bundle_digest_column_is_added_by_version_five() {
+        let mut c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE terminal_receipts(
+                run_id TEXT PRIMARY KEY,
+                receipt_json TEXT NOT NULL,
+                bundle_json TEXT NOT NULL,
+                receipt_digest TEXT NOT NULL
+            );
+            CREATE TABLE schema_migrations(
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                migration_digest TEXT NOT NULL
+            );
+            INSERT INTO schema_migrations(version,migration_digest)
+                VALUES (4,'legacy');",
+        )
+        .unwrap();
+        apply(&mut c, "bin").unwrap();
+        let has_bundle_digest: i64 = c
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('terminal_receipts') WHERE name='bundle_digest'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_bundle_digest, 1);
+        assert_eq!(
+            c.query_row::<i64, _, _>(
+                "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap(),
+            CURRENT_VERSION
         );
     }
 }

@@ -1,0 +1,56 @@
+{
+  "schema": "PlanningCloseoutReceiptV1",
+  "status": "PASS",
+  "scope": "from first planning-council request serialization through final plan validation and controller closeout; excludes pre-request conversational/context preparation",
+  "started_at": "2026-08-08T23:38:29.647186+00:00",
+  "ended_at": "2026-08-08T23:53:48.776932+00:00",
+  "measured_elapsed_ms": 919130,
+  "measured_elapsed_hms": "00:15:19.130",
+  "council": {
+    "graph_id": "governed-agent-proof-plan-12-20260808-v2",
+    "graph_version": "sha256:5f9c264cda6f6111b2fd8f229316d78739cd6b524baa1df3d3e80d16d1018a09",
+    "run_id": "run-19fe3be6015-1",
+    "llm_calls": 12,
+    "distinct_successful_nodes": 12,
+    "wall_clock_ms": 153816,
+    "wall_clock_hms": "00:02:33.816",
+    "evidence_authority": "structural_unverified"
+  },
+  "plan": {
+    "path": "/home/sikmindz/Coding/agent-graph-mcp-release/.hermes/plans/governed-agent-reliability-proof-20260808.md",
+    "sha256": "sha256:75e09ebc8924d6a5c41f36084e2fdf1d4913fca7f3229674da954d5ac5dbc03f",
+    "validation_status": "PASS"
+  },
+  "implementation_estimate": {
+    "labor_hours_low_likely_high": [
+      74,
+      144,
+      240
+    ],
+    "critical_path_hours_with_20pct_reserve_low_likely_high": [
+      69.6,
+      134.4,
+      230.4
+    ],
+    "working_days_low_likely_high": [
+      8.7,
+      16.8,
+      28.8
+    ],
+    "calendar_days_low_likely_high": [
+      12.2,
+      23.5,
+      40.3
+    ],
+    "likely_to_first_outreach_calendar_days": 24,
+    "likely_to_initial_signal_calendar_days": 38,
+    "initial_signal_calendar_range_days": [
+      19,
+      61
+    ]
+  },
+  "limitations": [
+    "Council receipt authority is structural_unverified; controller reconciled the final plan against current files.",
+    "No implementation, publication, push, deployment, or outreach was performed."
+  ]
+}

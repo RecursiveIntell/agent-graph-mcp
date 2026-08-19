@@ -1,0 +1,28 @@
+{
+  "changed_paths": [],
+  "checks": [
+    {
+      "gate_id": "G-000",
+      "status": "NOT_RUN"
+    }
+  ],
+  "commands": [],
+  "complete": false,
+  "goal": "Prove and fix Codex App Server swarm memory ballooning without widening scope",
+  "non_goals": [],
+  "remaining_delta": [
+    "Review preflight",
+    "Populate owner map",
+    "Define phase contracts",
+    "Define validation and rollback"
+  ],
+  "rollback": "No source changes were made by scaffold_pass.py.",
+  "schema": "ChangeReceiptV1",
+  "source_identity": {
+    "branch": "main",
+    "head": "aaaa52f09b7aca4b4515af6f3f82712a0145e61e",
+    "root": "/home/sikmindz/Coding/agent-graph-mcp-release"
+  },
+  "task_id": "20260808T151111Z-prove-and-fix-codex-app-server-swarm-memory-ballooning-without-w",
+  "version": 1
+}

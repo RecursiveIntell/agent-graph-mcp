@@ -97,17 +97,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         allowed_uids,
                         instance_id,
                     );
-                    loop {
-                        match op_listener.accept().await {
-                            Ok((stream, _)) => {
-                                let svc = service.clone();
-                                tokio::spawn(async move {
-                                    let _ = agent_graph_mcp::operator::serve_connection(stream, svc)
-                                        .await;
-                                });
-                            }
-                            Err(_) => break,
-                        }
+                    while let Ok((stream, _)) = op_listener.accept().await {
+                        let svc = service.clone();
+                        tokio::spawn(async move {
+                            let _ = agent_graph_mcp::operator::serve_connection(stream, svc).await;
+                        });
                     }
                 }
             });

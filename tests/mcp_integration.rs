@@ -446,6 +446,62 @@ fn durable_llm_receipt_preserves_typed_invocation_and_terminal_provenance_after_
     assert_eq!(invocations[0]["configured_model"], "fake-model");
     assert_eq!(invocations[0]["outcome"], "succeeded");
     assert_eq!(persisted["budget_counters"]["llm_calls"], 1);
+
+    let status_run = restarted.call("graph_status", json!({"resource":"run","run_id":run_id}));
+    assert_eq!(status_run["ok"], true, "{status_run}");
+    assert_eq!(status_run["data"]["run_id"], run_id, "{status_run}");
+    assert_eq!(status_run["data"]["status"], "completed", "{status_run}");
+
+    let status_receipt = restarted.call(
+        "graph_status",
+        json!({"resource":"receipt","run_id":run_id}),
+    );
+    assert_eq!(status_receipt["ok"], true, "{status_receipt}");
+    assert_eq!(
+        status_receipt["data"]["schema"], "agent-graph-mcp-receipt-v2",
+        "{status_receipt}"
+    );
+
+    let recovered = restarted.call("graph_run_get", json!({"run_id":run_id}));
+    assert_eq!(recovered["ok"], true, "{recovered}");
+    assert_eq!(recovered["data"]["run_id"], run_id, "{recovered}");
+    assert_eq!(recovered["data"]["status"], "completed", "{recovered}");
+    assert_eq!(
+        recovered["data"]["state"]["answer"],
+        "deterministic LLM output"
+    );
+    assert_eq!(
+        recovered["data"]["bundle"]["payload"]["output"]["answer"],
+        "deterministic LLM output"
+    );
+
+    let status_bundle =
+        restarted.call("graph_status", json!({"resource":"bundle","run_id":run_id}));
+    assert_eq!(status_bundle["ok"], true, "{status_bundle}");
+    assert_eq!(
+        status_bundle["data"]["payload"]["output"]["answer"], "deterministic LLM output",
+        "{status_bundle}"
+    );
+
+    let unknown = restarted.call("graph_run_get", json!({"run_id":"run-does-not-exist"}));
+    assert_eq!(unknown["error"], "run 'run-does-not-exist' not found");
+
+    drop(restarted);
+    let mut restarted_again = Mcp::new_with_data_dir_and_fake_codex(&data_dir, &fake_codex_bin_dir);
+    let second_read =
+        restarted_again.call("graph_status", json!({"resource":"run","run_id":run_id}));
+    assert_eq!(second_read["ok"], true, "{second_read}");
+    assert_eq!(second_read["data"]["run_id"], run_id, "{second_read}");
+    assert_eq!(
+        second_read["data"]["state"]["answer"],
+        "deterministic LLM output"
+    );
+    let second_receipt = restarted_again.call("graph_run_receipt", json!({"run_id":run_id}));
+    assert_eq!(second_receipt["ok"], true, "{second_receipt}");
+    assert_eq!(
+        second_receipt["data"]["receipt"]["terminal_output"]["state_key"], "answer",
+        "{second_receipt}"
+    );
 }
 
 #[test]
@@ -471,8 +527,16 @@ fn live_run_receipt_uses_canonical_wrapper_shape() {
     assert_eq!(completed["data"]["status"], "completed", "{completed}");
     let receipt = mcp.call("graph_run_receipt", json!({"run_id":run_id}));
     let data = &receipt["data"];
-    assert_eq!(data["storage_class"], "volatile_live", "{receipt}");
-    assert!(data["receipt_digest"].is_null(), "{receipt}");
+    assert_eq!(
+        data["storage_class"], "sqlite_terminal_receipt",
+        "{receipt}"
+    );
+    assert!(
+        data["receipt_digest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("hmac-sha256:")),
+        "{receipt}"
+    );
     assert_eq!(
         data["receipt"]["schema"], "agent-graph-mcp-receipt-v2",
         "{receipt}"
@@ -570,8 +634,11 @@ fn configured_graph_capacity_controls_admission_and_status() {
     assert_eq!(first["graph_id"], "capacity-one");
 
     let rejected = mcp.call("graph_create", graph("capacity-two"));
-    assert_eq!(rejected["error_code"], "LIMIT_EXCEEDED");
-    assert_eq!(rejected["error"], "graph limit (1) reached");
+    assert_eq!(rejected["error_code"], "CAPACITY_EXHAUSTED");
+    assert_eq!(
+        rejected["error"],
+        "graph capacity (1) exhausted — 1 graphs registered"
+    );
 
     let status = mcp.call("graph_status", json!({"resource":"server"}));
     assert_eq!(status["data"]["graph_count"], 1);
@@ -600,7 +667,7 @@ fn model_mcp_rejects_lifecycle_mutations_without_deleting_the_graph() {
     assert_eq!(review["ok"], true);
     assert_eq!(review["data"]["graphs"][0]["state"], "active");
     assert_eq!(review["data"]["graphs"][0]["execution_count"], 0);
-    assert_eq!(review["data"]["graphs"][0]["deletion_eligible"], true);
+    assert_eq!(review["data"]["graphs"][0]["deletion_eligible"], false);
 
     let premature = mcp.call(
         "graph_create",
@@ -729,12 +796,7 @@ fn approval_tools_require_durable_sqlite_state() {
         let response = mcp.call(tool, arguments);
         // AG-002: approval tools removed from model MCP tool set; now return METHOD_NOT_FOUND
         assert!(
-            response
-                .get("ok")
-                .map(|v| v.as_bool())
-                .flatten()
-                .unwrap_or(true)
-                == false
+            !response.get("ok").and_then(|v| v.as_bool()).unwrap_or(true)
                 || response.get("ok").is_none()
                 || response["ok"].is_null(),
             "{tool} must fail closed"
@@ -1051,6 +1113,37 @@ fn tampered_terminal_receipt_fails_closed_after_mcp_restart() {
     assert_eq!(receipt["ok"], false);
     assert_eq!(receipt["error_code"], "RECEIPT_INTEGRITY_FAILURE");
     assert!(!receipt.to_string().contains("never disclose"));
+}
+
+#[test]
+fn tampered_terminal_bundle_fails_closed_after_mcp_restart() {
+    let temp = tempfile::tempdir().expect("temp graph database");
+    let run_id = {
+        let mut first = Mcp::new_with_data_dir(temp.path());
+        first.call("graph_create", json!({"spec":{"name":"tampered-bundle","entry":"x","nodes":[{"id":"x","type":"passthrough"}],"edges":[{"from":"x","to":"END"}]}}));
+        let completed = first.call(
+            "graph_execute",
+            json!({"graph_id":"tampered-bundle","input":{"request":"integrity"}}),
+        );
+        completed["run_id"].as_str().expect("run id").to_owned()
+    };
+
+    let connection = Connection::open(temp.path().join("agent-graph.db")).expect("database");
+    connection
+        .execute(
+            "UPDATE terminal_receipts SET bundle_json = ?1 WHERE run_id = ?2",
+            rusqlite::params![
+                json!({"payload":{"run_id":run_id},"integrity":"sha256:tampered"}).to_string(),
+                &run_id
+            ],
+        )
+        .expect("tamper bundle JSON without digest update");
+    drop(connection);
+
+    let mut restarted = Mcp::new_with_data_dir(temp.path());
+    let receipt = restarted.call("graph_run_receipt", json!({"run_id":run_id}));
+    assert_eq!(receipt["ok"], false, "bundle tamper response: {receipt}");
+    assert_eq!(receipt["error_code"], "BUNDLE_INTEGRITY_FAILURE");
 }
 
 #[test]
@@ -1789,20 +1882,29 @@ fn witness_receipt_projection_preserves_reference_only_across_restart() {
         let locator_digest = agent_graph_mcp::evidence::digest(&json!(witness.locator));
         let receipt = json!({
             "schema":"agent-graph-mcp-receipt-v1",
+            "run_id":run_id,
+            "graph_version":"graph-version",
             "dependency_envelopes":[{"witness_id":witness.witness_id,"digest":witness.digest,"locator_digest":locator_digest}],
             "dependency_envelopes_complete":true,
             "evidence_authority":"local_capture_receipt_only; source_authority_not_verified"
         });
+        let bundle = agent_graph_mcp::evidence::bundle(
+            run_id,
+            "graph-version",
+            &json!({}),
+            &json!({}),
+            &receipt,
+        );
         store
-            .persist_terminal_projection(
+            .persist_terminal_projection(agent_graph_mcp::store::TerminalProjection {
                 run_id,
-                "completed",
-                "{}",
-                0,
-                &[],
-                &receipt.to_string(),
-                &json!({"receipt":receipt}).to_string(),
-            )
+                status: "completed",
+                final_state_json: "{}",
+                total_nodes: 0,
+                events: &[],
+                receipt_json: &receipt.to_string(),
+                bundle_json: &bundle.to_string(),
+            })
             .expect("terminal receipt");
         (
             run_id.to_owned(),
@@ -2135,16 +2237,21 @@ fn resume_rejects_non_deterministic_or_non_linear_specs() {
     ];
     for (label, spec) in cases {
         let created = mcp.call("graph_create", json!({"spec":spec}));
-        // subgraph, approval, and tool are accepted but resume-ineligible.
-        // external is rejected at creation (UNSUPPORTED_NODE_TYPE).
-        if label == "external" {
+        // declarative Parallel is rejected at creation; explicit fan-out edges
+        // plus Join are the supported executable contract.
+        if label == "external" || label == "parallel" {
             assert_eq!(
                 created["ok"], false,
-                "{label} graph should be rejected at creation as unsupported node type"
+                "{label} graph should be rejected at creation"
             );
             assert_eq!(
-                created["error_code"], "UNSUPPORTED_NODE_TYPE",
-                "{label} graph should return UNSUPPORTED_NODE_TYPE"
+                created["error_code"],
+                if label == "parallel" {
+                    "UNSUPPORTED_PARALLEL"
+                } else {
+                    "UNSUPPORTED_NODE_TYPE"
+                },
+                "{label} graph should return its typed unsupported error"
             );
         } else {
             assert_eq!(
@@ -2353,7 +2460,7 @@ fn daemon_socket_proxy_lifecycle() {
     let rejected = recv_frame(&mut stream);
     assert_eq!(
         rejected["result"]["structuredContent"]["error_code"],
-        "LIMIT_EXCEEDED"
+        "CAPACITY_EXHAUSTED"
     );
 
     send_frame(

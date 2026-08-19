@@ -1,0 +1,6 @@
+rollback_stage=/home/sikmindz/.hermes/staging/agent-graph-persistent-appserver-20260808T123553Z
+live_pid=272619
+a0c085d58649505847681053bf93a5ee79bfb42e8b4384c1908cbae8f8648f66  target/release/agent-graph-mcp
+f2572702b5c45a0f1b3a7de65c76039518e6e06d36e4061e3f48d771d626fe3f  target/release/agent-graph-mcpd
+a0c085d58649505847681053bf93a5ee79bfb42e8b4384c1908cbae8f8648f66  /home/sikmindz/.local/bin/agent-graph-mcp
+f2572702b5c45a0f1b3a7de65c76039518e6e06d36e4061e3f48d771d626fe3f  /home/sikmindz/.local/bin/agent-graph-mcpd

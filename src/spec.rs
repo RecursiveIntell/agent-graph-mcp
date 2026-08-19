@@ -16,6 +16,18 @@ pub const MAX_INPUT_BYTES: usize = 64 * 1024;
 pub const MAX_OUTPUT_BYTES: usize = 128 * 1024;
 pub const MAX_STATE_BYTES: usize = 2 * 1024 * 1024;
 
+/// The configured node-timeout contract remains bounded at two minutes, while
+/// daemon execution receives twice that allowance. Applying this during
+/// compilation affects every run—including historical, immutable graph specs—
+/// without rewriting their declared configuration or version hashes.
+pub const GRAPH_RUN_TIMEOUT_MULTIPLIER: u64 = 2;
+
+/// Returns the daemon-wide effective timeout for a validated node timeout.
+/// Saturation makes a future expanded config range fail-safe.
+pub fn effective_node_timeout_ms(configured_timeout_ms: u64) -> u64 {
+    configured_timeout_ms.saturating_mul(GRAPH_RUN_TIMEOUT_MULTIPLIER)
+}
+
 pub fn validate_max_graphs(max_graphs: usize) -> Result<usize, String> {
     if (1..=MAX_GRAPHS_HARD_LIMIT).contains(&max_graphs) {
         Ok(max_graphs)
@@ -124,6 +136,78 @@ pub enum ReducerKind {
 }
 
 impl GraphSpec {
+    /// Resolve the state key that represents the graph's terminal output.
+    ///
+    /// New graphs should declare `output_key` explicitly.  For historical
+    /// graphs, a single END predecessor with a declared node output key is a
+    /// safe inference; multiple terminal branches are intentionally rejected
+    /// because their legacy `__input__` writes are schedule-dependent.
+    pub fn effective_output_key(&self) -> Result<(String, &'static str), String> {
+        if let Some(key) = self.output_key.as_deref() {
+            return Ok((key.to_owned(), "declared_output_key"));
+        }
+
+        let terminal_ids: Vec<&str> = self
+            .edges
+            .iter()
+            .filter(|edge| edge.to == "END")
+            .map(|edge| edge.from.as_str())
+            .collect();
+        let Some(terminal_id) = terminal_ids.first().copied() else {
+            return Ok(("__input__".to_owned(), "legacy_input_fallback"));
+        };
+        if terminal_ids.iter().any(|id| *id != terminal_id) {
+            let router_controls_all_terminals = self.nodes.iter().any(|node| {
+                if node.node_type != NodeType::Router {
+                    return false;
+                }
+                let mut targets = BTreeSet::new();
+                if let Some(rules) = node.config.get("rules").and_then(Value::as_array) {
+                    for rule in rules {
+                        if let Some(values) = rule.get("targets").and_then(Value::as_array) {
+                            targets.extend(values.iter().filter_map(Value::as_str));
+                        }
+                    }
+                }
+                if let Some(values) = node.config.get("default").and_then(Value::as_array) {
+                    targets.extend(values.iter().filter_map(Value::as_str));
+                }
+                terminal_ids.iter().all(|id| targets.contains(id))
+            });
+            if !router_controls_all_terminals {
+                return Err(
+                    "ambiguous terminal output: graph has multiple END branches; declare output_key and an explicit join"
+                        .into(),
+                );
+            }
+            return Ok(("__input__".to_owned(), "router_controlled_legacy_fallback"));
+        }
+
+        let node = self
+            .nodes
+            .iter()
+            .find(|node| node.id == terminal_id)
+            .ok_or_else(|| format!("terminal node '{terminal_id}' not found"))?;
+        let key = node
+            .config
+            .get("output_key")
+            .and_then(Value::as_str)
+            .filter(|key| !key.is_empty())
+            .or_else(|| {
+                (node.node_type == NodeType::Join)
+                    .then(|| node.config.get("output").and_then(Value::as_str))
+                    .flatten()
+            });
+        Ok((
+            key.unwrap_or("__input__").to_owned(),
+            if key.is_some() {
+                "inferred_terminal_node"
+            } else {
+                "legacy_input_fallback"
+            },
+        ))
+    }
+
     /// Return the executable contract for every declared node type.
     /// Reserved effectful classes are deliberately rejected before registration.
     pub fn executable_node_type(node_type: &NodeType) -> Result<&'static str, String> {
@@ -133,7 +217,10 @@ impl GraphSpec {
             NodeType::Passthrough => Ok("passthrough"),
             NodeType::StateTransform => Ok("state_transform"),
             NodeType::Join => Ok("join"),
-            NodeType::Parallel => Ok("parallel"),
+            NodeType::Parallel => Err(
+                "UNSUPPORTED_PARALLEL: declarative parallel nodes are not executable; use explicit fan-out edges and a Join node"
+                    .into(),
+            ),
             NodeType::Subgraph => Ok("subgraph"),
             NodeType::HumanApproval => Ok("human_approval"),
             NodeType::External => Err("UNSUPPORTED_NODE_TYPE: external".into()),
@@ -323,8 +410,8 @@ pub fn validate(spec: &GraphSpec) -> Result<(), String> {
     if iterations == 0 || iterations > MAX_ITERATIONS {
         return Err(format!("max_iterations must be 1..={MAX_ITERATIONS}"));
     }
-    if spec.max_parallelism.unwrap_or(8) == 0 || spec.max_parallelism.unwrap_or(8) > 32 {
-        return Err("max_parallelism must be 1..=32".into());
+    if spec.max_parallelism.unwrap_or(8) == 0 || spec.max_parallelism.unwrap_or(8) > 100 {
+        return Err("max_parallelism must be 1..=100".into());
     }
     let ids: BTreeSet<_> = spec.nodes.iter().map(|n| n.id.as_str()).collect();
     if ids.len() != spec.nodes.len() {
@@ -335,6 +422,11 @@ pub fn validate(spec: &GraphSpec) -> Result<(), String> {
     }
     if spec.output_key.as_deref().is_some_and(str::is_empty) {
         return Err("output_key must not be empty when provided".into());
+    }
+    if spec.output_key.is_none() {
+        // Validate the inference now so a historical graph cannot reach the
+        // scheduler and report success from a nondeterministic last writer.
+        spec.effective_output_key()?;
     }
     for node in &spec.nodes {
         if !valid_id(&node.id) {
@@ -380,20 +472,13 @@ fn validate_state_write_conflicts(spec: &GraphSpec) -> Result<(), String> {
         let mut keys = Vec::new();
         match node.node_type {
             NodeType::Llm | NodeType::HumanApproval | NodeType::Subgraph => {
-                if let Some(key) = node
+                let configured_key = node
                     .config
-                    .get(if node.node_type == NodeType::Llm {
-                        "output_key"
-                    } else if node.node_type == NodeType::HumanApproval {
-                        "output_key"
-                    } else {
-                        "output_key"
-                    })
+                    .get("output_key")
                     .and_then(Value::as_str)
                     .filter(|key| !key.is_empty())
-                {
-                    keys.push(key.to_owned());
-                }
+                    .unwrap_or("__input__");
+                keys.push(configured_key.to_owned());
             }
             NodeType::StateTransform => {
                 if let Some(operations) = node.config.get("operations").and_then(Value::as_array) {
@@ -431,6 +516,12 @@ fn validate_state_write_conflicts(spec: &GraphSpec) -> Result<(), String> {
                     ancestor != a && ancestor != b && reach[ancestor][a] && reach[ancestor][b]
                 });
                 if shared_ancestor {
+                    if key == "__input__" {
+                        return Err(format!(
+                            "state key '__input__' is written by unordered parallel nodes '{}' and '{}'; declare distinct output_key values and an explicit join",
+                            ids[a], ids[b]
+                        ));
+                    }
                     return Err(format!(
                         "state key '{}' is written by unordered parallel nodes '{}' and '{}'; declare reducers.{}",
                         key, ids[a], ids[b], ""
@@ -666,15 +757,14 @@ fn validate_node(node: &NodeSpec, ids: &BTreeSet<&str>) -> Result<(), String> {
             }
         }
     }
-    if node.node_type == NodeType::Subgraph {
-        if node
+    if node.node_type == NodeType::Subgraph
+        && node
             .config
             .get("graph_name")
             .and_then(Value::as_str)
-            .is_none()
-        {
-            return Err(format!("subgraph '{}' requires config.graph_name", node.id));
-        }
+            .map_or(true, str::is_empty)
+    {
+        return Err(format!("subgraph '{}' requires config.graph_name", node.id));
     }
     if node.node_type == NodeType::HumanApproval {
         if node
@@ -791,12 +881,12 @@ fn reject_dangerous_keys(value: &Value) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_and_validate;
+    use super::{effective_node_timeout_ms, parse_and_validate};
     use serde_json::{json, Value};
 
     fn parallel(reducers: Value) -> Value {
         json!({
-            "name":"conflict", "entry":"fork", "reducers": reducers,
+            "name":"conflict", "entry":"fork", "output_key":"shared", "reducers": reducers,
             "nodes":[
                 {"id":"fork","type":"passthrough"},
                 {"id":"left","type":"state_transform","config":{"operations":[{"op":"set","path":"shared","value":"left"}]}},
@@ -807,9 +897,22 @@ mod tests {
     }
 
     #[test]
+    fn global_timeout_policy_doubles_default_and_explicit_node_budgets() {
+        assert_eq!(effective_node_timeout_ms(120_000), 240_000);
+        assert_eq!(effective_node_timeout_ms(2_000), 4_000);
+    }
+
+    #[test]
+    fn global_timeout_policy_saturates() {
+        assert_eq!(effective_node_timeout_ms(u64::MAX), u64::MAX);
+    }
+
+    #[test]
     fn unordered_parallel_writes_require_reducer() {
         let error = parse_and_validate(&parallel(json!({}))).expect_err("conflict rejected");
-        assert!(error.contains("unordered parallel nodes"));
+        assert!(
+            error.contains("unordered parallel nodes") || error.contains("multiple END branches")
+        );
         assert!(parse_and_validate(&parallel(json!({"shared":"append"}))).is_ok());
     }
 
@@ -823,6 +926,42 @@ mod tests {
             ], "edges":[{"from":"left","to":"right"},{"from":"right","to":"END"}]
         });
         assert!(parse_and_validate(&spec).is_ok());
+    }
+
+    #[test]
+    fn unordered_legacy_llm_writes_to_input_are_rejected() {
+        let spec = json!({
+            "name": "legacy-parallel-llm",
+            "entry": "fork",
+            "nodes": [
+                {"id": "fork", "type": "passthrough"},
+                {"id": "left", "type": "llm", "prompt": "left"},
+                {"id": "right", "type": "llm", "prompt": "right"}
+            ],
+            "edges": [
+                {"from": "fork", "to": "left"},
+                {"from": "fork", "to": "right"},
+                {"from": "left", "to": "END"},
+                {"from": "right", "to": "END"}
+            ]
+        });
+        let error = parse_and_validate(&spec).expect_err("ambiguous legacy fanout rejected");
+        assert!(error.contains("multiple END branches") || error.contains("__input__"));
+    }
+
+    #[test]
+    fn historical_single_terminal_node_output_is_inferred() {
+        let spec = json!({
+            "name": "legacy-serial-llm",
+            "entry": "probe",
+            "nodes": [{"id": "probe", "type": "llm", "prompt": "probe", "config": {"output_key": "result"}}],
+            "edges": [{"from": "probe", "to": "END"}]
+        });
+        let spec = parse_and_validate(&spec).expect("single terminal legacy graph remains valid");
+        assert_eq!(
+            spec.effective_output_key().expect("inferred output"),
+            ("result".to_owned(), "inferred_terminal_node")
+        );
     }
 
     #[test]

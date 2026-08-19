@@ -22,6 +22,24 @@ use crate::store::PersistentStore;
 const MAX_RUNS: usize = 100;
 const MAX_ACTIVE_RUNS: usize = 8;
 
+pub struct ResumedRun {
+    pub run_id: String,
+    pub graph_id: String,
+    pub graph_version: String,
+    pub input: Value,
+    pub state: Value,
+    pub budgets: Option<RunBudgets>,
+    pub checkpoint_id: String,
+    pub checkpoint_digest: String,
+    pub approval: Option<Value>,
+}
+
+struct ExecuteOptions {
+    store: Option<PersistentStore>,
+    initial_state: Option<Value>,
+    initial_counters: BudgetCounters,
+}
+
 fn is_terminal(status: &str) -> bool {
     matches!(
         status,
@@ -132,6 +150,72 @@ impl RunBudgets {
     pub fn requested_value(&self) -> Value {
         serde_json::to_value(self).unwrap_or(Value::Null)
     }
+}
+
+fn execution_error_code(error: &str) -> &'static str {
+    if error.contains("BUDGET")
+        || error.contains("MAX_NODES_EXCEEDED")
+        || error.contains("max nodes")
+        || error.contains("wall-clock")
+    {
+        "BUDGET_EXHAUSTED"
+    } else if error.contains("Cancelled") || error.contains("cancellation") {
+        "CANCELLATION_REQUESTED"
+    } else if error.contains("WITNESS_") {
+        "EVIDENCE_FAILURE"
+    } else if error.contains("no usable assistant result")
+        || error.contains("provider")
+        || error.contains("codex-app-server")
+        || error.contains("assistant text")
+        || error.contains("HTTP")
+    {
+        "PROVIDER_FAILURE"
+    } else if error.contains("broker") {
+        "TOOL_EXECUTION_FAILURE"
+    } else {
+        "EXECUTION_FAILURE"
+    }
+}
+
+fn terminalize_early_failure(manager: &RunManager, run_id: &str, error: String) {
+    let _ = manager.update(run_id, |record| {
+        let receipt = serde_json::json!({
+            "schema": "agent-graph-mcp-receipt-v2",
+            "run_id": record.run_id,
+            "trace": record.trace,
+            "graph_version": record.graph_version,
+            "input_digest": digest(&record.input),
+            "output_digest": digest(&Value::Null),
+            "status": "failed",
+            "success": false,
+            "error": error,
+            "error_code": execution_error_code(&error),
+            "persistence_status": "pending",
+            "budgets": record
+                .budgets
+                .as_ref()
+                .map(RunBudgets::requested_value)
+                .unwrap_or(Value::Null),
+            "budget_counters": record.budget_counters,
+            "budget_exhausted": record.budget_exhausted,
+            "replay_capability": "integrity_only"
+        });
+        let artifact = bundle(
+            &record.run_id,
+            &record.graph_version,
+            &record.input,
+            &record.state,
+            &receipt,
+        );
+        record.status = "failed".into();
+        record.success = Some(false);
+        record.error = receipt
+            .get("error")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        record.receipt = receipt;
+        record.bundle = artifact;
+    });
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
@@ -263,31 +347,20 @@ impl RunManager {
         Ok(run_id)
     }
 
-    pub fn allocate_resumed(
-        &self,
-        run_id: &str,
-        graph_id: &str,
-        graph_version: &str,
-        input: Value,
-        state: Value,
-        budgets: Option<RunBudgets>,
-        checkpoint_id: &str,
-        checkpoint_digest: &str,
-        approval: Option<Value>,
-    ) -> Result<String, String> {
+    pub fn allocate_resumed(&self, resumed: ResumedRun) -> Result<String, String> {
         let millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
         let record = RunRecord {
-            run_id: run_id.to_owned(),
+            run_id: resumed.run_id,
             trace: format!("trace-{millis:x}-resume"),
-            graph_id: graph_id.into(),
-            graph_version: graph_version.into(),
+            graph_id: resumed.graph_id,
+            graph_version: resumed.graph_version,
             status: "accepted".into(),
             success: None,
-            input,
-            state,
+            input: resumed.input,
+            state: resumed.state,
             final_state: Value::Null,
             steps: vec![],
             error: None,
@@ -298,12 +371,12 @@ impl RunManager {
             bundle: Value::Null,
             persistence_status: "volatile_active".into(),
             persistence_error: None,
-            budgets,
+            budgets: resumed.budgets,
             budget_counters: BudgetCounters::default(),
             budget_exhausted: None,
-            checkpoint_id: Some(checkpoint_id.to_owned()),
-            checkpoint_digest: Some(checkpoint_digest.to_owned()),
-            approval,
+            checkpoint_id: Some(resumed.checkpoint_id),
+            checkpoint_digest: Some(resumed.checkpoint_digest),
+            approval: resumed.approval,
             resumed: true,
             cancelled: Arc::new(AtomicBool::new(false)),
             cancellation: Arc::new(Notify::new()),
@@ -401,27 +474,32 @@ impl RunManager {
         default_model: String,
         store: Option<PersistentStore>,
     ) -> Result<Value, String> {
-        self.execute_with_store_options(
+        self.execute_with_options(
             run_id,
             spec,
             base_url,
             default_model,
-            store,
-            None,
-            BudgetCounters::default(),
+            ExecuteOptions {
+                store,
+                initial_state: None,
+                initial_counters: BudgetCounters::default(),
+            },
         )
     }
 
-    pub fn execute_with_store_options(
+    fn execute_with_options(
         &self,
         run_id: &str,
         spec: GraphSpec,
         base_url: String,
         default_model: String,
-        store: Option<PersistentStore>,
-        initial_state: Option<Value>,
-        initial_counters: BudgetCounters,
+        options: ExecuteOptions,
     ) -> Result<Value, String> {
+        let ExecuteOptions {
+            store,
+            initial_state,
+            initial_counters,
+        } = options;
         self.update(run_id, |r| r.status = "running".into())?;
         let (
             input,
@@ -448,7 +526,6 @@ impl RunManager {
                 r.resumed,
             )
         };
-        let started_at = Instant::now();
         let provider = safe_provider_label(&base_url);
         let configured_model = default_model.clone();
         let events = Arc::new(Mutex::new(Vec::<GraphEvent>::new()));
@@ -457,8 +534,10 @@ impl RunManager {
         // nodes, and read back at the terminal boundary so counters and
         // receipts reflect the same observed provider attempts.
         let llm_calls = Arc::new(AtomicU64::new(0));
+        let node_calls = Arc::new(AtomicU64::new(0));
         let llm_invocations = Arc::new(Mutex::new(Vec::<Value>::new()));
         let max_llm_calls = budgets.as_ref().and_then(|budget| budget.max_llm_calls);
+        let max_nodes = budgets.as_ref().and_then(|budget| budget.max_nodes);
         // Subgraph executor: late-bound so nested subgraph calls resolve to this
         // same runner. Sub-runs share the parent's budget counters and cancellation
         // flags, use fresh event sinks, and are executed in-process (no separate
@@ -481,6 +560,7 @@ impl RunManager {
                 let cancelled = cancelled.clone();
                 let cancellation = cancellation.clone();
                 let llm_calls = llm_calls.clone();
+                let node_calls = node_calls.clone();
                 let llm_invocations = llm_invocations.clone();
                 let subgraph_depth = subgraph_depth.clone();
                 move |graph_name: String, input: Value, _depth: u32| {
@@ -493,6 +573,7 @@ impl RunManager {
                     let cancelled = cancelled.clone();
                     let cancellation = cancellation.clone();
                     let llm_calls = llm_calls.clone();
+                    let node_calls = node_calls.clone();
                     let llm_invocations = llm_invocations.clone();
                     let subgraph_depth = subgraph_depth.clone();
                     Box::pin(async move {
@@ -522,6 +603,8 @@ impl RunManager {
                                 events: sub_events.clone(),
                                 llm_calls: llm_calls.clone(),
                                 max_llm_calls,
+                                node_calls: node_calls.clone(),
+                                max_nodes,
                                 llm_invocations: llm_invocations.clone(),
                                 api_key: api_key.clone(),
                                 executor: executor.clone(),
@@ -546,8 +629,8 @@ impl RunManager {
                             .with_recursion_limit(sub_spec.max_iterations.unwrap_or(64).min(256))
                             .with_max_parallelism(sub_spec.max_parallelism.unwrap_or(8));
                         let sub_graph = Arc::new(sub_graph);
-                        let (handle, _engine_cancel) = sub_graph
-                            .execute_cancellable(&sub_spec.entry, sub_state, sub_config);
+                        let (handle, _engine_cancel) =
+                            sub_graph.execute_cancellable(&sub_spec.entry, sub_state, sub_config);
                         handle
                             .await
                             .map_err(|e| format!("subgraph execution task failed: {e}"))?
@@ -577,6 +660,8 @@ impl RunManager {
                 events: events.clone(),
                 llm_calls: llm_calls.clone(),
                 max_llm_calls,
+                node_calls,
+                max_nodes,
                 llm_invocations: llm_invocations.clone(),
                 api_key: self.api_key.clone(),
                 executor: self
@@ -623,6 +708,10 @@ impl RunManager {
             )
             .with_max_parallelism(spec.max_parallelism.unwrap_or(8));
         let graph = Arc::new(graph);
+        // Wall-clock budgets cover the cancellable graph execution phase. The
+        // compiler and runtime construction above are synchronous setup and
+        // are intentionally outside the watchdog's accounting boundary.
+        let started_at = Instant::now();
         let (handle, engine_cancel) =
             rt.block_on(async { graph.execute_cancellable(&spec.entry, state, config) });
         let timed_out = Arc::new(AtomicBool::new(false));
@@ -679,20 +768,28 @@ impl RunManager {
         if let Some(thread) = timeout_thread {
             let _ = thread.join();
         }
-        // derive a receipt from the summary
-        let core_receipt = serde_json::json!({
-            "api": "execute_with_summary",
-            "note": "receipt not yet fully typed; upgrade to execute_with_config + receipt"
-        });
         let exported = rt.block_on(snapshot.export());
         let state_value = serde_json::to_value(exported).map_err(|e| e.to_string())?;
         ensure_size(&state_value, MAX_STATE_BYTES, "total state")?;
-        let final_state = spec
-            .output_key
-            .as_deref()
-            .and_then(|key| state_value.get(key).cloned())
-            .or_else(|| state_value.get("__input__").cloned())
-            .unwrap_or(Value::Null);
+        let (terminal_output_key, terminal_output_provenance) = spec
+            .effective_output_key()
+            .map_err(|error| format!("invalid terminal output contract: {error}"))?;
+        let final_state = if result.is_ok() {
+            state_value
+                .get(&terminal_output_key)
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "terminal output key '{}' was not produced by the completed graph",
+                        terminal_output_key
+                    )
+                })?
+        } else {
+            // Preserve the typed execution/budget failure. A failed run must not
+            // be reclassified as a projection failure merely because no terminal
+            // output was produced.
+            Value::Null
+        };
         ensure_size(&final_state, MAX_OUTPUT_BYTES, "execution output")?;
         let graph_events = events
             .lock()
@@ -830,26 +927,23 @@ impl RunManager {
             .iter()
             .filter_map(|m| m.get("model_alias").cloned())
             .collect();
-        let terminal_output_key = spec
-            .output_key
-            .clone()
-            .unwrap_or_else(|| "__input__".to_owned());
         let terminal_output = serde_json::json!({
             "state_key": terminal_output_key,
-            "provenance": if spec.output_key.is_some() { "declared_output_key" } else { "legacy_input_fallback" },
+            "provenance": terminal_output_provenance,
             "value_digest": digest(&final_state),
         });
         let receipt = serde_json::json!({"schema":"agent-graph-mcp-receipt-v2","run_id":run_id,"trace":trace,"graph_version":graph_version,
             "input_digest":digest(&input),"output_digest":digest(&state_value),"step_count":steps.len(),"models":models,
             "provider":provider,"default_model":configured_model,"model_labels":model_labels,
-            "core":core_receipt,"terminal_output":terminal_output,"llm_invocations":observed_invocations,
+            "core":{"api":"execute_cancellable","engine":"ri-agent-graph","observed_step_count":steps.len(),"observed_invocation_count":observed_invocations.len()},"terminal_output":terminal_output,"llm_invocations":observed_invocations,
             "dependency_envelopes":dependency_envelopes,"dependency_envelopes_complete":dependency_envelopes_complete,"replay_capability":if resumed { "deterministic_local_resume" } else { "integrity_only" },
             "resume_supported":resumed,
             "checkpoint":checkpoint_id.as_ref().zip(checkpoint_digest.as_ref()).map(|(id, digest)| serde_json::json!({"checkpoint_id":id,"checkpoint_digest":digest})),
             "approval":approval,
             "evidence_authority":if dependency_envelopes_complete { "local_capture_receipt_only; source_authority_not_verified" } else { "structural_unverified" },"persistence_status":"pending",
             "budgets":budgets.as_ref().map(RunBudgets::requested_value).unwrap_or(Value::Null),
-            "budget_counters":budget_counters,"budget_exhausted":budget_exhausted});
+            "budget_counters":budget_counters,"budget_exhausted":budget_exhausted,
+            "error_code":error.as_deref().map(execution_error_code)});
         let artifact = bundle(run_id, &graph_version, &input, &state_value, &receipt);
         self.update(run_id, |r| {
             let cancellation_observed = r.cancelled.load(Ordering::SeqCst);
@@ -904,11 +998,7 @@ impl RunManager {
         let manager = self.clone();
         std::thread::spawn(move || {
             if let Err(error) = manager.execute_with_store(&run_id, spec, base_url, model, store) {
-                let _ = manager.update(&run_id, |r| {
-                    r.status = "failed".into();
-                    r.success = Some(false);
-                    r.error = Some(error.clone());
-                });
+                terminalize_early_failure(&manager, &run_id, error);
             }
             if let Some(record) = manager.get(&run_id) {
                 on_completion(record);
@@ -929,20 +1019,18 @@ impl RunManager {
     {
         let manager = self.clone();
         std::thread::spawn(move || {
-            if let Err(error) = manager.execute_with_store_options(
+            if let Err(error) = manager.execute_with_options(
                 &run_id,
                 spec,
                 base_url,
                 model,
-                store,
-                None,
-                BudgetCounters::default(),
+                ExecuteOptions {
+                    store,
+                    initial_state: None,
+                    initial_counters: BudgetCounters::default(),
+                },
             ) {
-                let _ = manager.update(&run_id, |r| {
-                    r.status = "failed".into();
-                    r.success = Some(false);
-                    r.error = Some(error.clone());
-                });
+                terminalize_early_failure(&manager, &run_id, error);
             }
             if let Some(record) = manager.get(&run_id) {
                 on_completion(record);
@@ -1245,5 +1333,51 @@ mod tests {
         let public = manager.get(&id).expect("run").public();
         assert_eq!(public["storage_class"], "volatile");
         assert_eq!(public["persistence_error"], "database is unavailable");
+    }
+
+    #[test]
+    fn terminal_receipts_preserve_stable_error_classes() {
+        assert_eq!(execution_error_code("BUDGET_EXHAUSTED"), "BUDGET_EXHAUSTED");
+        assert_eq!(
+            execution_error_code("MAX_NODES_EXCEEDED"),
+            "BUDGET_EXHAUSTED"
+        );
+        assert_eq!(
+            execution_error_code("Payload error: no usable assistant result"),
+            "PROVIDER_FAILURE"
+        );
+        assert_eq!(
+            execution_error_code(
+                "Payload error: codex app-server completed without assistant text"
+            ),
+            "PROVIDER_FAILURE"
+        );
+        assert_eq!(
+            execution_error_code("WITNESS_EVIDENCE_MISSING"),
+            "EVIDENCE_FAILURE"
+        );
+        assert_eq!(
+            execution_error_code("broker timed out"),
+            "TOOL_EXECUTION_FAILURE"
+        );
+        assert_eq!(execution_error_code("compile failed"), "EXECUTION_FAILURE");
+    }
+
+    #[test]
+    fn early_failure_gets_a_typed_terminal_receipt_and_bundle() {
+        let manager = RunManager::default();
+        let id = manager
+            .allocate("graph", "version", serde_json::json!({"input": 1}))
+            .expect("allocate run");
+        terminalize_early_failure(
+            &manager,
+            &id,
+            "Payload error: no usable assistant result".into(),
+        );
+        let record = manager.get(&id).expect("terminal record");
+        assert_eq!(record.status, "failed");
+        assert_eq!(record.success, Some(false));
+        assert_eq!(record.receipt["error_code"], "PROVIDER_FAILURE");
+        assert_eq!(record.bundle["payload"]["run_id"], id);
     }
 }

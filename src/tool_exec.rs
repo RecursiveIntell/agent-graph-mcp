@@ -1,8 +1,6 @@
 //! Adapter from graph tool definitions to `llm-pipeline`'s tool-loop runtime.
 use async_trait::async_trait;
-use llm_tool_runtime::{
-    Tool, ToolCall, ToolDescriptor, ToolError, ToolErrorClass, ToolRegistry, ToolResult,
-};
+use llm_tool_runtime::{Tool, ToolCall, ToolDescriptor, ToolError, ToolRegistry, ToolResult};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -59,7 +57,7 @@ impl Tool for GraphTool {
 
     async fn invoke(
         &self,
-        ctx: &llm_tool_runtime::ToolCtx,
+        _ctx: &llm_tool_runtime::ToolCtx,
         call: &ToolCall,
     ) -> Result<ToolResult, ToolError> {
         // Graph tools forward execution to the MCP tool runtime.

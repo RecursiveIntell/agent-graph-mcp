@@ -55,3 +55,4 @@ path = "src/bin/agent-graph-mcpd.rs"
 
 [patch.crates-io]
 llm-pipeline = { path = "../Libraries/llm-pipeline" }
+ri-agent-graph = { path = "vendor/ri-agent-graph" }

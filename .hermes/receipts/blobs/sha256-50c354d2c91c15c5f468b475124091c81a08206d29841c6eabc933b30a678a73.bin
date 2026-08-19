@@ -1,0 +1,66 @@
+
+running 54 tests
+test accepted_run_is_addressable_and_unsupported_boundaries_are_stable ... ok
+test approval_request_rejects_missing_ineligible_and_tampered_checkpoints_without_rows ... ok
+test approval_tools_require_durable_sqlite_state ... ok
+test budget_projection_is_visible_after_sqlite_restart ... ok
+test checkpointed_run_cannot_be_cancelled_or_marked_cancelled ... ok
+test completed_persistent_run_is_readable_after_mcp_restart ... ok
+test configured_graph_capacity_controls_admission_and_status ... FAILED
+test daemon_accepts_api_key_flag_and_reports_it_configured ... ok
+test daemon_socket_proxy_lifecycle ... FAILED
+test declared_output_key_is_the_terminal_result ... ok
+test deterministic_local_checkpoint_restart_resume_is_exactly_once ... ok
+test durable_checkpoint_approval_survives_restart_and_resumes_exact_bound_checkpoint ... ok
+test durable_integrity_operations_require_an_external_key ... ok
+test durable_llm_receipt_preserves_typed_invocation_and_terminal_provenance_after_restart ... ok
+test evidence_required_graphs_fail_closed_without_witness_store ... ok
+test evidence_required_llm_contract_is_validated_without_external_verification ... ok
+test graph_delete_fails_closed_on_memory_storage_mismatch ... ok
+test graph_delete_rejects_durable_execution_reference ... ok
+test graph_delete_removes_unreferenced_graph_before_restart ... ok
+test historical_graph_version_executes_exact_stored_spec_after_restart ... ok
+test idempotency_key_conflicts_when_create_request_material_changes ... ok
+test idempotency_key_conflicts_when_execute_request_material_changes ... ok
+test interrupted_persistent_run_is_readable_after_mcp_restart ... ok
+test invalid_budget_shapes_are_rejected_with_one_typed_error ... ok
+test legacy_contract_and_exact_tool_names ... ok
+test legacy_model_aliases_and_per_node_core_evidence_are_preserved ... ok
+test live_run_receipt_uses_canonical_wrapper_shape ... ok
+test max_llm_calls_reserves_before_a_second_provider_attempt ... ok
+test max_nodes_stops_before_a_later_node_effect ... ok
+test model_mcp_cannot_archive_and_the_active_graph_remains_executable ... ok
+test model_mcp_cannot_nominate_an_executed_graph_for_deletion ... ok
+test model_mcp_rejects_lifecycle_mutations_without_deleting_the_graph ... ok
+test ordered_router_first_match_and_bounded_loop ... ok
+test readme_action_claims_match_the_callable_graph_execute_contract ... FAILED
+test receipt_labels_integrity_only_when_dependency_envelopes_are_missing ... ok
+test recomputed_unkeyed_checkpoint_digest_is_rejected ... ok
+test registry_templates_security_and_bundle_verification ... ok
+test rejected_and_expired_approvals_never_resume_and_late_decisions_are_typed ... ok
+test resume_integrity_tampering_never_executes ... ok
+test resume_rejects_non_deterministic_or_non_linear_specs ... ok
+test resumed_budget_counters_continue_and_exhaust ... ok
+test run_start_idempotency_and_budgets_are_typed_and_idempotent ... ok
+test source_witness_capture_is_idempotent_and_survives_restart ... ok
+test source_witness_capture_requires_store_and_rejects_invalid_contract_values ... ok
+test status_exposes_only_available_durability_capabilities ... ok
+test successful_llm_run_counts_preinvocation_attempt ... ok
+test successful_wall_clock_budget_does_not_wait_for_timeout_worker ... ok
+test tampered_source_witness_fails_closed_without_content_leak ... ok
+test tampered_terminal_receipt_fails_closed_after_mcp_restart ... ok
+test terminal_events_are_readable_after_mcp_restart ... ok
+test terminal_receipt_is_readable_after_mcp_restart ... ok
+test validates_and_runs_parallel_transform_join_with_versions ... ok
+test wall_clock_budget_is_observed_on_a_deterministically_large_local_run ... ok
+test witness_receipt_projection_preserves_reference_only_across_restart ... ok
+
+failures:
+
+failures:
+    configured_graph_capacity_controls_admission_and_status
+    daemon_socket_proxy_lifecycle
+    readme_action_claims_match_the_callable_graph_execute_contract
+
+test result: FAILED. 51 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.34s
+

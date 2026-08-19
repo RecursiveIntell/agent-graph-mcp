@@ -39,19 +39,23 @@ fn main() {
         if transport::write_frame(&mut socket, line.as_bytes()).is_err() {
             break;
         }
-        // Always read a response. For notifications (no "id"), the daemon
-        // sends nothing, so the read will time out. We detect that and continue.
-        // For requests (with "id"), a timeout means the daemon is slow/unreachable.
+        // JSON-RPC notifications have no response. Waiting for one deadlocks
+        // the proxy on transports that do not surface a socket read timeout.
         let is_notification = line.contains("\"method\"") && !line.contains("\"id\"");
+        if is_notification {
+            continue;
+        }
+        // Requests may legitimately run for minutes (for example
+        // graph_execute or graph_run_wait), so never inherit the proxy's
+        // startup/notification timeout as a request deadline.
+        if socket.set_read_timeout(None).is_err() {
+            break;
+        }
         match transport::read_frame(&mut socket) {
             Ok(response) => {
                 let _ = out.write_all(&response);
                 let _ = out.write_all(b"\n");
                 let _ = out.flush();
-            }
-            Err(_) if is_notification => {
-                // Expected: daemon doesn't respond to notifications.
-                // Read timed out — continue to next line.
             }
             Err(_) => {
                 // Unexpected read failure for a request — abort.

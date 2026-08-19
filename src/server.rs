@@ -17,7 +17,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 use crate::evidence::{digest, validate_witness_capture, WitnessCapture, WitnessError};
-use crate::run_manager::{initial_state_for_input, RunBudgets, RunManager};
+use crate::run_manager::{initial_state_for_input, ResumedRun, RunBudgets, RunManager};
 use crate::spec::{
     ensure_size, parse_and_validate, validate_max_graphs, GraphSpec, DEFAULT_MAX_GRAPHS,
     MAX_INPUT_BYTES,
@@ -370,15 +370,15 @@ impl AgentGraphServer {
         );
         let bundle = serde_json::to_string(&durable_bundle)
             .map_err(|e| format!("serialize terminal bundle error: {e}"))?;
-        store.persist_terminal_projection(
-            &record.run_id,
-            &record.status,
-            &final_state,
-            record.steps.len(),
-            &events,
-            &receipt,
-            &bundle,
-        )?;
+        store.persist_terminal_projection(crate::store::TerminalProjection {
+            run_id: &record.run_id,
+            status: &record.status,
+            final_state_json: &final_state,
+            total_nodes: record.steps.len(),
+            events: &events,
+            receipt_json: &receipt,
+            bundle_json: &bundle,
+        })?;
         Ok(())
     }
 
@@ -407,18 +407,32 @@ impl AgentGraphServer {
         let Some(mut record) = store.load_execution(run_id).map_err(internal_error)? else {
             return Ok(None);
         };
-        if let Some(receipt) = store
+        if let Some(projection) = store
             .load_terminal_receipt(run_id)
             .map_err(internal_error)?
-            .and_then(|value| value.get("receipt").cloned())
         {
             if let Some(object) = record.as_object_mut() {
-                for key in ["budgets", "budget_counters", "budget_exhausted"] {
-                    if let Some(value) = receipt.get(key) {
-                        object.insert(key.into(), value.clone());
+                if let Some(receipt) = projection.get("receipt") {
+                    for key in ["budgets", "budget_counters", "budget_exhausted"] {
+                        if let Some(value) = receipt.get(key) {
+                            object.insert(key.into(), value.clone());
+                        }
+                    }
+                    object.insert("receipt".into(), receipt.clone());
+                }
+                if let Some(bundle) = projection.get("bundle") {
+                    object.insert("bundle".into(), bundle.clone());
+                    if let Some(payload) = bundle.get("payload") {
+                        if let Some(input) = payload.get("input") {
+                            object.insert("input".into(), input.clone());
+                        }
+                        if let Some(output) = payload.get("output") {
+                            object.insert("state".into(), output.clone());
+                        }
                     }
                 }
-                object.insert("receipt".into(), receipt);
+                object.insert("persistence_status".into(), "durable_terminal".into());
+                object.insert("persistence_error".into(), Value::Null);
             }
         }
         Ok(Some(record))
@@ -436,6 +450,11 @@ impl AgentGraphServer {
             .get(graph_id)
             .cloned()
             .ok_or_else(|| invalid_params(format!("graph '{graph_id}' not found")))?;
+        parse_and_validate(&current.normalized).map_err(|error| {
+            invalid_params(format!(
+                "stored current graph definition is no longer executable: {error}"
+            ))
+        })?;
         let Some(requested_version) = requested_version else {
             return Ok(current);
         };
@@ -536,190 +555,6 @@ impl AgentGraphServer {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::run_manager::RunManager;
-    use crate::store::PersistentStore;
-
-    fn configure_test_integrity_key() {
-        let path = std::env::temp_dir().join("agent-graph-mcp-unit-integrity.key");
-        std::fs::write(&path, [0x5au8; 32]).expect("test integrity key");
-        std::env::set_var("AGENT_GRAPH_INTEGRITY_KEY_PATH", path);
-    }
-
-    #[test]
-    fn terminal_projection_failure_rolls_back_sqlite_and_marks_run_volatile() {
-        configure_test_integrity_key();
-        let temp = tempfile::tempdir().expect("temp graph database");
-        let store = PersistentStore::open(temp.path()).expect("store");
-        let spec: GraphSpec = serde_json::from_value(serde_json::json!({
-            "name":"fault-injection",
-            "entry":"x",
-            "nodes":[{"id":"x","type":"passthrough"}],
-            "edges":[{"from":"x","to":"END"}]
-        }))
-        .expect("graph spec");
-        let spec_json = serde_json::to_string(&spec).expect("spec JSON");
-        store
-            .save_graph("fault-injection", &spec_json, "version", false)
-            .expect("graph");
-
-        let runs = RunManager::default();
-        let run_id = runs
-            .allocate("fault-injection", "version", serde_json::json!({"x":1}))
-            .expect("run");
-        store
-            .save_execution(
-                &run_id,
-                "fault-injection",
-                "version",
-                "running",
-                "{\"x\":1}",
-            )
-            .expect("execution");
-        runs.execute(
-            &run_id,
-            spec,
-            "http://localhost".into(),
-            "test-model".into(),
-        )
-        .expect("execution completes");
-
-        store.fail_terminal_projection_after_events();
-        AgentGraphServer::persist_terminal_and_mark(
-            runs.clone(),
-            Some(store.clone()),
-            runs.get(&run_id).expect("terminal record"),
-        );
-
-        let public = runs.get(&run_id).expect("volatile record").public();
-        assert_eq!(public["persistence_status"], "volatile_persistence_failed");
-        assert_eq!(public["storage_class"], "volatile");
-
-        let reopened = PersistentStore::open(temp.path()).expect("fresh store");
-        assert_eq!(
-            reopened.load_execution(&run_id).unwrap().unwrap()["status"],
-            "running"
-        );
-        assert!(reopened.load_events(&run_id, 0, 100).unwrap().is_none());
-        assert!(reopened.load_terminal_receipt(&run_id).unwrap().is_none());
-    }
-
-    #[test]
-    fn capacity_is_reserved_before_direct_or_approved_checkpoint_consumption() {
-        configure_test_integrity_key();
-        let temp = tempfile::tempdir().expect("checkpoint database");
-        let server = AgentGraphServer::new(
-            "http://localhost".into(),
-            "test-model".into(),
-            Some(temp.path().to_owned()),
-            None,
-        )
-        .expect("server");
-        server
-            .graph_create(Parameters(GraphCreateParams {
-                spec: Some(serde_json::json!({
-                    "name":"capacity-resume", "entry":"first",
-                    "nodes":[
-                        {"id":"first","type":"passthrough"},
-                        {"id":"second","type":"state_transform","config":{"operations":[{"op":"set","path":"done","value":true}]}}
-                    ],
-                    "edges":[{"from":"first","to":"second"},{"from":"second","to":"END"}]
-                })),
-                action: None,
-                graph_id: None,
-                idempotency_key: None,
-                template: None,
-                overwrite: None,
-            }))
-            .expect("create graph");
-        let checkpoint = |server: &AgentGraphServer| {
-            server
-                .graph_run_start(Parameters(RunStartParams {
-                    graph_id: "capacity-resume".into(),
-                    input: None,
-                    graph_version: None,
-                    thread_id: None,
-                    idempotency_key: None,
-                    budgets: None,
-                    checkpoint: Some(true),
-                }))
-                .expect("checkpoint start")
-                .0
-                .data
-                .unwrap()["checkpoint_id"]
-                .as_str()
-                .unwrap()
-                .to_owned()
-        };
-        let direct_checkpoint = checkpoint(&server);
-        {
-            let runs = server.runs.lock().expect("runs");
-            for index in 0..8 {
-                let run_id = runs
-                    .allocate("capacity", "v1", serde_json::json!({"index":index}))
-                    .expect("slot record");
-                runs.admit_async(&run_id).expect("slot admission");
-            }
-        }
-        let direct = server
-            .graph_run_resume(Parameters(RunResumeParams {
-                checkpoint_id: Some(direct_checkpoint.clone()),
-                run_id: None,
-            }))
-            .expect("resume response");
-        assert_eq!(direct.0.error_code.as_deref(), Some("RUN_CAPACITY"));
-        let store = server.store.as_ref().expect("store");
-        assert!(store
-            .load_resume_checkpoint(Some(&direct_checkpoint), None)
-            .expect("checkpoint")
-            .expect("record")
-            .consumed_at
-            .is_none());
-
-        let approval_checkpoint = checkpoint(&server);
-        let approval = server
-            .graph_approval_request(Parameters(ApprovalRequestParams {
-                checkpoint_id: approval_checkpoint.clone(),
-                audience: "operator".into(),
-                prompt: "approve after capacity is available".into(),
-                allowed_decisions: vec!["approve".into()],
-                expiration: (Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
-            }))
-            .expect("approval request");
-        let approval_id = approval.0.data.unwrap()["approval_id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let decided = server
-            .graph_approval_decide(Parameters(ApprovalDecideParams {
-                approval_id: approval_id.clone(),
-                decision: "approve".into(),
-                claimed_actor_label: "operator".into(),
-            }))
-            .expect("approval response");
-        assert_eq!(
-            decided.0.error_code.as_deref(),
-            Some("AUTHENTICATED_OPERATOR_REQUIRED")
-        );
-        assert_eq!(
-            store
-                .get_checkpoint_approval(&approval_id)
-                .expect("approval")
-                .expect("approval row")
-                .status,
-            "pending"
-        );
-        assert!(store
-            .load_resume_checkpoint(Some(&approval_checkpoint), None)
-            .expect("checkpoint")
-            .expect("record")
-            .consumed_at
-            .is_none());
-    }
-}
-
 #[tool_router]
 impl AgentGraphServer {
     // ── graph_create ──────────────────────────────────────────────────
@@ -790,7 +625,7 @@ impl AgentGraphServer {
             let tpl_name = tpl_val
                 .get("name")
                 .and_then(Value::as_str)
-                .or_else(|| graph_id.as_deref())
+                .or(graph_id.as_deref())
                 .unwrap_or(tpl_id);
             templates::instantiate(tpl_id, tpl_name)
                 .map_err(|e| internal_error(format!("template error: {e}")))?
@@ -822,9 +657,14 @@ impl AgentGraphServer {
             .iter()
             .find(|node| crate::spec::GraphSpec::executable_node_type(&node.node_type).is_err())
         {
+            let error_code = if matches!(node.node_type, crate::spec::NodeType::Parallel) {
+                "UNSUPPORTED_PARALLEL"
+            } else {
+                "UNSUPPORTED_NODE_TYPE"
+            };
             return Ok(error_output(
                 format!("node '{}' declares an unsupported executable type", node.id),
-                "UNSUPPORTED_NODE_TYPE",
+                error_code,
             ));
         }
         let normalized =
@@ -948,8 +788,8 @@ impl AgentGraphServer {
         }): Parameters<GraphExecuteParams>,
     ) -> Result<Json<StructuredOutput>, ErrorData> {
         let input = input.unwrap_or(Value::Null);
-        ensure_size(&input, MAX_INPUT_BYTES, "execution input").map_err(|e| invalid_params(e))?;
-        let sync = mode.as_deref().is_none_or(|m| m == "sync");
+        ensure_size(&input, MAX_INPUT_BYTES, "execution input").map_err(invalid_params)?;
+        let sync = mode.as_deref().map_or(true, |m| m == "sync");
         if sync {
             tracing::warn!(
                 "graph_execute sync mode is deprecated — use graph_run_start + graph_run_get"
@@ -1000,7 +840,7 @@ impl AgentGraphServer {
 
         let run_id = runs
             .allocate(&graph_id, &graph.version, input.clone())
-            .map_err(|e| internal_error(e))?;
+            .map_err(internal_error)?;
 
         if let Err(e) = runs.admit_async(&run_id) {
             runs.remove(&run_id);
@@ -1330,21 +1170,30 @@ impl AgentGraphServer {
             }
 
             "run" => {
-                let runs = self
-                    .runs
-                    .lock()
-                    .map_err(|e| internal_error(e.to_string()))?;
                 if run_id.is_none() {
-                    // List all runs
+                    let runs = self
+                        .runs
+                        .lock()
+                        .map_err(|e| internal_error(e.to_string()))?;
                     return Ok(structured_output(serde_json::json!({
                         "runs": runs.list()
                     })));
                 }
                 let id = run_id.as_deref().unwrap();
-                let r = runs
-                    .get(id)
-                    .ok_or_else(|| invalid_params(format!("run '{id}' not found")))?;
-                Ok(structured_output(r.public()))
+                let live = {
+                    let runs = self
+                        .runs
+                        .lock()
+                        .map_err(|e| internal_error(e.to_string()))?;
+                    runs.get(id).map(|record| record.public())
+                };
+                if let Some(record) = live {
+                    return Ok(structured_output(record));
+                }
+                if let Some(record) = self.stored_run(id)? {
+                    return Ok(structured_output(record));
+                }
+                Err(invalid_params(format!("run '{id}' not found")))
             }
 
             "events" => {
@@ -1359,7 +1208,7 @@ impl AgentGraphServer {
                 let limit_val = limit.unwrap_or(100) as usize;
                 let result = runs
                     .events(self.store.as_ref(), id, cursor_val, limit_val)
-                    .map_err(|e| invalid_params(e))?;
+                    .map_err(invalid_params)?;
                 Ok(output_with_meta(result, None, None, Some(id)))
             }
 
@@ -1367,28 +1216,58 @@ impl AgentGraphServer {
                 let id = run_id
                     .as_deref()
                     .ok_or_else(|| invalid_params("missing run_id for receipt"))?;
-                let runs = self
-                    .runs
-                    .lock()
-                    .map_err(|e| internal_error(e.to_string()))?;
-                let r = runs
-                    .get(id)
-                    .ok_or_else(|| invalid_params(format!("run '{id}' not found")))?;
-                Ok(output_with_meta(r.receipt.clone(), None, None, Some(id)))
+                let live = {
+                    let runs = self
+                        .runs
+                        .lock()
+                        .map_err(|e| internal_error(e.to_string()))?;
+                    runs.get(id).map(|record| record.receipt.clone())
+                };
+                if let Some(receipt) = live {
+                    return Ok(output_with_meta(receipt, None, None, Some(id)));
+                }
+                if let Some(projection) = self
+                    .store
+                    .as_ref()
+                    .map(|store| store.load_terminal_receipt(id))
+                    .transpose()
+                    .map_err(internal_error)?
+                    .flatten()
+                {
+                    if let Some(receipt) = projection.get("receipt").cloned() {
+                        return Ok(output_with_meta(receipt, None, None, Some(id)));
+                    }
+                }
+                Err(invalid_params(format!("run '{id}' not found")))
             }
 
             "bundle" => {
                 let id = run_id
                     .as_deref()
                     .ok_or_else(|| invalid_params("missing run_id for bundle"))?;
-                let runs = self
-                    .runs
-                    .lock()
-                    .map_err(|e| internal_error(e.to_string()))?;
-                let r = runs
-                    .get(id)
-                    .ok_or_else(|| invalid_params(format!("run '{id}' not found")))?;
-                Ok(output_with_meta(r.bundle.clone(), None, None, Some(id)))
+                let live = {
+                    let runs = self
+                        .runs
+                        .lock()
+                        .map_err(|e| internal_error(e.to_string()))?;
+                    runs.get(id).map(|record| record.bundle.clone())
+                };
+                if let Some(bundle) = live {
+                    return Ok(output_with_meta(bundle, None, None, Some(id)));
+                }
+                if let Some(projection) = self
+                    .store
+                    .as_ref()
+                    .map(|store| store.load_terminal_receipt(id))
+                    .transpose()
+                    .map_err(internal_error)?
+                    .flatten()
+                {
+                    if let Some(bundle) = projection.get("bundle").cloned() {
+                        return Ok(output_with_meta(bundle, None, None, Some(id)));
+                    }
+                }
+                Err(invalid_params(format!("run '{id}' not found")))
             }
 
             _ => Ok(error_output(
@@ -1693,17 +1572,17 @@ impl AgentGraphServer {
         if runs.get(&checkpoint.run_id).is_some() {
             let _ = runs.remove(&checkpoint.run_id);
         }
-        let run_id = match runs.allocate_resumed(
-            &checkpoint.run_id,
-            &checkpoint.graph_id,
-            &checkpoint.graph_version,
-            contract.input,
-            checkpoint.state.clone(),
+        let run_id = match runs.allocate_resumed(ResumedRun {
+            run_id: checkpoint.run_id.clone(),
+            graph_id: checkpoint.graph_id.clone(),
+            graph_version: checkpoint.graph_version.clone(),
+            input: contract.input,
+            state: checkpoint.state.clone(),
             budgets,
-            &checkpoint.checkpoint_id,
-            &checkpoint.checkpoint_digest,
-            approval.clone(),
-        ) {
+            checkpoint_id: checkpoint.checkpoint_id.clone(),
+            checkpoint_digest: checkpoint.checkpoint_digest.clone(),
+            approval: approval.clone(),
+        }) {
             Ok(run_id) => run_id,
             Err(error) => {
                 runs.release_async_slot();
@@ -1800,23 +1679,24 @@ impl AgentGraphServer {
             return Ok(error_output(message, code));
         }
         let prompt_digest = digest(&Value::String(prompt));
-        let approval = match store.create_checkpoint_approval(
-            &checkpoint.checkpoint_id,
-            &checkpoint.graph_id,
-            &checkpoint.graph_version,
-            &checkpoint.next_node_cursor,
-            &checkpoint.state,
-            &checkpoint.budgets,
-            &checkpoint.budget_counters,
-            &checkpoint.dependency_summary,
-            &audience,
-            &prompt_digest,
-            &allowed_decisions,
-            &expiration,
-        ) {
-            Ok(approval) => approval,
-            Err(error) => return Ok(approval_error_output(error)),
-        };
+        let approval =
+            match store.create_checkpoint_approval(crate::store::CheckpointApprovalRequest {
+                checkpoint_id: &checkpoint.checkpoint_id,
+                graph_id: &checkpoint.graph_id,
+                graph_version: &checkpoint.graph_version,
+                next_node_cursor: &checkpoint.next_node_cursor,
+                expected_state: &checkpoint.state,
+                expected_budgets: &checkpoint.budgets,
+                expected_budget_counters: &checkpoint.budget_counters,
+                dependency_summary: &checkpoint.dependency_summary,
+                audience: &audience,
+                prompt_digest: &prompt_digest,
+                allowed_decisions: &allowed_decisions,
+                expires_at: &expiration,
+            }) {
+                Ok(approval) => approval,
+                Err(error) => return Ok(approval_error_output(error)),
+            };
         Ok(output_with_meta(
             approval_value(&approval),
             Some(&approval.graph_id),
@@ -1892,10 +1772,10 @@ impl AgentGraphServer {
             claimed_actor_label: _,
         }): Parameters<ApprovalDecideParams>,
     ) -> Result<Json<StructuredOutput>, ErrorData> {
-        return Ok(error_output(
+        Ok(error_output(
             "approval decisions require authenticated operator transport",
             "AUTHENTICATED_OPERATOR_REQUIRED",
-        ));
+        ))
     }
 
     // ── Async run lifecycle ───────────────────────────────────────────
@@ -1921,7 +1801,7 @@ impl AgentGraphServer {
         };
         let input = input.unwrap_or(Value::Null);
         let checkpoint_requested = checkpoint.unwrap_or(false);
-        ensure_size(&input, MAX_INPUT_BYTES, "execution input").map_err(|e| invalid_params(e))?;
+        ensure_size(&input, MAX_INPUT_BYTES, "execution input").map_err(invalid_params)?;
 
         let RegisteredGraph {
             spec,
@@ -1993,7 +1873,7 @@ impl AgentGraphServer {
                     input.clone(),
                     requested_budgets.clone(),
                 )
-                .map_err(|e| internal_error(e))?;
+                .map_err(internal_error)?;
             if let Err(error) = store.save_execution_with_budgets(
                 &run_id,
                 &graph_id,
@@ -2005,25 +1885,26 @@ impl AgentGraphServer {
                 runs.remove(&run_id);
                 return Ok(error_output(error, "CHECKPOINT_PERSISTENCE_FAILURE"));
             }
-            let checkpoint_record = match store.create_resume_checkpoint(
-                &run_id,
-                &graph_id,
-                &version,
-                &eligibility.next_node_cursor,
-                &state,
-                &budgets_value,
-                &counters,
-                &eligibility.dependency_summary,
-                0,
-                0,
-            ) {
-                Ok(record) => record,
-                Err(error) => {
-                    let _ = store.update_execution_status(&run_id, "failed", None, None, None);
-                    runs.remove(&run_id);
-                    return Ok(checkpoint_error_output(error));
-                }
-            };
+            let checkpoint_record =
+                match store.create_resume_checkpoint(crate::store::ResumeCheckpointRequest {
+                    run_id: &run_id,
+                    graph_id: &graph_id,
+                    graph_version: &version,
+                    next_node_cursor: &eligibility.next_node_cursor,
+                    state: &state,
+                    budgets: &budgets_value,
+                    budget_counters: &counters,
+                    dependency_summary: &eligibility.dependency_summary,
+                    terminal_cursor: 0,
+                    event_cursor: 0,
+                }) {
+                    Ok(record) => record,
+                    Err(error) => {
+                        let _ = store.update_execution_status(&run_id, "failed", None, None, None);
+                        runs.remove(&run_id);
+                        return Ok(checkpoint_error_output(error));
+                    }
+                };
             runs.mark_checkpointed(
                 &run_id,
                 &checkpoint_record.checkpoint_id,
@@ -2054,7 +1935,7 @@ impl AgentGraphServer {
 
         let run_id = runs
             .allocate_with_budgets(&graph_id, &version, input.clone(), requested_budgets)
-            .map_err(|e| internal_error(e))?;
+            .map_err(internal_error)?;
         if let Err(e) = runs.admit_async(&run_id) {
             runs.remove(&run_id);
             return Ok(error_output(e, "RUN_CAPACITY"));
@@ -2123,7 +2004,7 @@ impl AgentGraphServer {
             Ok(Some(record))
                 if run_id
                     .as_deref()
-                    .is_none_or(|run_id| record.run_id == run_id) =>
+                    .map_or(true, |run_id| record.run_id == run_id) =>
             {
                 Ok(output_with_meta(
                     checkpoint_value(&record),
@@ -2457,7 +2338,7 @@ impl AgentGraphServer {
                 cursor.unwrap_or(0),
                 limit.unwrap_or(100) as usize,
             )
-            .map_err(|e| invalid_params(e))?;
+            .map_err(invalid_params)?;
         Ok(output_with_meta(result, None, None, Some(&run_id)))
     }
 
@@ -2466,6 +2347,41 @@ impl AgentGraphServer {
         &self,
         Parameters(RunReceiptParams { run_id }): Parameters<RunReceiptParams>,
     ) -> Result<Json<StructuredOutput>, ErrorData> {
+        let store = self.store.as_ref();
+        if let Some(store) = store {
+            match store.load_terminal_receipt(&run_id) {
+                Ok(Some(receipt)) => {
+                    return Ok(output_with_meta(receipt, None, None, Some(&run_id)));
+                }
+                Ok(None) => {}
+                Err(error) if error == "RECEIPT_INTEGRITY_FAILURE" => {
+                    return Ok(error_output(
+                        "terminal receipt integrity validation failed",
+                        "RECEIPT_INTEGRITY_FAILURE",
+                    ));
+                }
+                Err(error) if error == "INTEGRITY_KEY_REQUIRED" => {
+                    return Ok(error_output(
+                        "an external integrity key is required for terminal receipt reads",
+                        "INTEGRITY_KEY_REQUIRED",
+                    ));
+                }
+                Err(error)
+                    if matches!(
+                        error.as_str(),
+                        "BUNDLE_INTEGRITY_UNAVAILABLE"
+                            | "BUNDLE_INTEGRITY_FAILURE"
+                            | "BUNDLE_RECEIPT_MISMATCH"
+                    ) =>
+                {
+                    return Ok(error_output(
+                        "terminal bundle integrity validation failed",
+                        error,
+                    ));
+                }
+                Err(error) => return Err(internal_error(error)),
+            }
+        }
         if let Some(r) = self
             .runs
             .lock()
@@ -2491,27 +2407,6 @@ impl AgentGraphServer {
                 None,
                 Some(&run_id),
             ));
-        }
-        if let Some(store) = &self.store {
-            match store.load_terminal_receipt(&run_id) {
-                Ok(Some(receipt)) => {
-                    return Ok(output_with_meta(receipt, None, None, Some(&run_id)));
-                }
-                Ok(None) => {}
-                Err(error) if error == "RECEIPT_INTEGRITY_FAILURE" => {
-                    return Ok(error_output(
-                        "terminal receipt integrity validation failed",
-                        "RECEIPT_INTEGRITY_FAILURE",
-                    ));
-                }
-                Err(error) if error == "INTEGRITY_KEY_REQUIRED" => {
-                    return Ok(error_output(
-                        "an external integrity key is required for terminal receipt reads",
-                        "INTEGRITY_KEY_REQUIRED",
-                    ));
-                }
-                Err(error) => return Err(internal_error(error)),
-            }
         }
         Ok(error_output(
             format!("run '{run_id}' not found"),
@@ -2651,3 +2546,187 @@ impl AgentGraphServer {
     instructions = "Graph orchestration for bounded multi-step LLM workflows with parallel fan-out, conditional routing, state transforms, joins, cooperative cancellation, and optional enforced max_wall_clock_ms/max_nodes/max_llm_calls run budgets (max_llm_calls reserves each provider attempt before invocation; failed or timed-out attempts still count). Parallel unordered state writes require an explicit reducer. Cancellation can drop the local provider future on request, best effort; an underlying provider request may continue. Optional SQLite stores terminal projections plus explicit pre-execution checkpoints. Durable checkpoints, approvals, terminal receipts, and source witnesses require an external key file named by AGENT_GRAPH_INTEGRITY_KEY_PATH; without it their operations fail closed with INTEGRITY_KEY_REQUIRED. Deterministic local resume is limited to linear passthrough/state_transform chains and is never generic replay; uncheckpointed or ineligible runs remain interrupted_non_resumable after restart. SQLite-backed approvals can decide only an immutable deterministic-local checkpoint and resume that checkpoint; HumanApproval nodes and arbitrary external actions remain unsupported. Source witnesses are caller-supplied local captures: locators are never fetched, HMAC-authenticated witness integrity and bounded evidence spans are checked against SQLite, and source authority is not independently verified. Receipts provide integrity_only except a successfully resumed deterministic-local path, which reports deterministic_local_resume. Define graphs with graph_create, execute with graph_execute or graph_run_start, checkpoint with checkpoint:true, inspect with graph_run_get/wait/cancel/state/events/receipt/checkpoint, request or decide checkpoint approvals with graph_approval_request/decide, and resume with graph_run_resume."
 )]
 impl ServerHandler for AgentGraphServer {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::run_manager::RunManager;
+    use crate::store::PersistentStore;
+
+    fn configure_test_integrity_key() {
+        let path = std::env::temp_dir().join("agent-graph-mcp-unit-integrity.key");
+        std::fs::write(&path, [0x5au8; 32]).expect("test integrity key");
+        std::env::set_var("AGENT_GRAPH_INTEGRITY_KEY_PATH", path);
+    }
+
+    #[test]
+    fn terminal_projection_failure_rolls_back_sqlite_and_marks_run_volatile() {
+        configure_test_integrity_key();
+        let temp = tempfile::tempdir().expect("temp graph database");
+        let store = PersistentStore::open(temp.path()).expect("store");
+        let spec: GraphSpec = serde_json::from_value(serde_json::json!({
+            "name":"fault-injection",
+            "entry":"x",
+            "nodes":[{"id":"x","type":"passthrough"}],
+            "edges":[{"from":"x","to":"END"}]
+        }))
+        .expect("graph spec");
+        let spec_json = serde_json::to_string(&spec).expect("spec JSON");
+        store
+            .save_graph("fault-injection", &spec_json, "version", false)
+            .expect("graph");
+
+        let runs = RunManager::default();
+        let run_id = runs
+            .allocate("fault-injection", "version", serde_json::json!({"x":1}))
+            .expect("run");
+        store
+            .save_execution(
+                &run_id,
+                "fault-injection",
+                "version",
+                "running",
+                "{\"x\":1}",
+            )
+            .expect("execution");
+        runs.execute(
+            &run_id,
+            spec,
+            "http://localhost".into(),
+            "test-model".into(),
+        )
+        .expect("execution completes");
+
+        store.fail_terminal_projection_after_events();
+        AgentGraphServer::persist_terminal_and_mark(
+            runs.clone(),
+            Some(store.clone()),
+            runs.get(&run_id).expect("terminal record"),
+        );
+
+        let public = runs.get(&run_id).expect("volatile record").public();
+        assert_eq!(public["persistence_status"], "volatile_persistence_failed");
+        assert_eq!(public["storage_class"], "volatile");
+
+        let reopened = PersistentStore::open(temp.path()).expect("fresh store");
+        assert_eq!(
+            reopened.load_execution(&run_id).unwrap().unwrap()["status"],
+            "running"
+        );
+        assert!(reopened.load_events(&run_id, 0, 100).unwrap().is_none());
+        assert!(reopened.load_terminal_receipt(&run_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn capacity_is_reserved_before_direct_or_approved_checkpoint_consumption() {
+        configure_test_integrity_key();
+        let temp = tempfile::tempdir().expect("checkpoint database");
+        let server = AgentGraphServer::new(
+            "http://localhost".into(),
+            "test-model".into(),
+            Some(temp.path().to_owned()),
+            None,
+        )
+        .expect("server");
+        server
+            .graph_create(Parameters(GraphCreateParams {
+                spec: Some(serde_json::json!({
+                    "name":"capacity-resume", "entry":"first",
+                    "nodes":[
+                        {"id":"first","type":"passthrough"},
+                        {"id":"second","type":"state_transform","config":{"operations":[{"op":"set","path":"done","value":true}]}}
+                    ],
+                    "edges":[{"from":"first","to":"second"},{"from":"second","to":"END"}]
+                })),
+                action: None,
+                graph_id: None,
+                idempotency_key: None,
+                template: None,
+                overwrite: None,
+            }))
+            .expect("create graph");
+        let checkpoint = |server: &AgentGraphServer| {
+            server
+                .graph_run_start(Parameters(RunStartParams {
+                    graph_id: "capacity-resume".into(),
+                    input: None,
+                    graph_version: None,
+                    thread_id: None,
+                    idempotency_key: None,
+                    budgets: None,
+                    checkpoint: Some(true),
+                }))
+                .expect("checkpoint start")
+                .0
+                .data
+                .unwrap()["checkpoint_id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        let direct_checkpoint = checkpoint(&server);
+        {
+            let runs = server.runs.lock().expect("runs");
+            for index in 0..8 {
+                let run_id = runs
+                    .allocate("capacity", "v1", serde_json::json!({"index":index}))
+                    .expect("slot record");
+                runs.admit_async(&run_id).expect("slot admission");
+            }
+        }
+        let direct = server
+            .graph_run_resume(Parameters(RunResumeParams {
+                checkpoint_id: Some(direct_checkpoint.clone()),
+                run_id: None,
+            }))
+            .expect("resume response");
+        assert_eq!(direct.0.error_code.as_deref(), Some("RUN_CAPACITY"));
+        let store = server.store.as_ref().expect("store");
+        assert!(store
+            .load_resume_checkpoint(Some(&direct_checkpoint), None)
+            .expect("checkpoint")
+            .expect("record")
+            .consumed_at
+            .is_none());
+
+        let approval_checkpoint = checkpoint(&server);
+        let approval = server
+            .graph_approval_request(Parameters(ApprovalRequestParams {
+                checkpoint_id: approval_checkpoint.clone(),
+                audience: "operator".into(),
+                prompt: "approve after capacity is available".into(),
+                allowed_decisions: vec!["approve".into()],
+                expiration: (Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+            }))
+            .expect("approval request");
+        let approval_id = approval.0.data.unwrap()["approval_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let decided = server
+            .graph_approval_decide(Parameters(ApprovalDecideParams {
+                approval_id: approval_id.clone(),
+                decision: "approve".into(),
+                claimed_actor_label: "operator".into(),
+            }))
+            .expect("approval response");
+        assert_eq!(
+            decided.0.error_code.as_deref(),
+            Some("AUTHENTICATED_OPERATOR_REQUIRED")
+        );
+        assert_eq!(
+            store
+                .get_checkpoint_approval(&approval_id)
+                .expect("approval")
+                .expect("approval row")
+                .status,
+            "pending"
+        );
+        assert!(store
+            .load_resume_checkpoint(Some(&approval_checkpoint), None)
+            .expect("checkpoint")
+            .expect("record")
+            .consumed_at
+            .is_none());
+    }
+}

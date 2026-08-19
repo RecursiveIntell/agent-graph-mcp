@@ -1,0 +1,48 @@
+{
+  "artifact": {
+    "bytes": 9249,
+    "kind": "markdown",
+    "path": "/home/sikmindz/Coding/agent-graph-mcp-release/.hermes/runs/unfinished-work-direction-20260808/JUDGMENT.md",
+    "sha256": "sha256:84a9f25769506daee4911731c93b14183f3ee4755697ed8b80686a52507a0f62"
+  },
+  "checks": [
+    {
+      "evidence": {
+        "bytes": 9249,
+        "kind": "markdown",
+        "path": "/home/sikmindz/Coding/agent-graph-mcp-release/.hermes/runs/unfinished-work-direction-20260808/JUDGMENT.md",
+        "sha256": "sha256:84a9f25769506daee4911731c93b14183f3ee4755697ed8b80686a52507a0f62"
+      },
+      "name": "exists-and-hash",
+      "status": "PASS"
+    },
+    {
+      "evidence": {
+        "characters": 9235
+      },
+      "name": "text-decode",
+      "status": "PASS"
+    },
+    {
+      "evidence": {
+        "missing": []
+      },
+      "name": "local-links-and-assets",
+      "status": "PASS"
+    },
+    {
+      "evidence": {
+        "hits": []
+      },
+      "name": "placeholder-and-tool-token-scan",
+      "status": "PASS"
+    }
+  ],
+  "created_at": "2026-08-08T20:34:13.931925+00:00",
+  "defects": [],
+  "manual_checks": [],
+  "overall_status": "PASS",
+  "repair_authority_required": false,
+  "schema": "ArtifactValidationReceiptV1",
+  "version": 1
+}

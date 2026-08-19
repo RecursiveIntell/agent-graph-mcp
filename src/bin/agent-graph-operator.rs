@@ -13,9 +13,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let non_interactive = raw_args.iter().any(|a| a == "--non-interactive")
         || std::env::var("AGENT_GRAPH_OPERATOR_TOKEN").is_ok();
     let mut args = raw_args.into_iter().filter(|a| a != "--non-interactive");
-    let socket = args
-        .next()
-        .unwrap_or_else(|| "/run/user/1000/agent-graph/operator.sock".into());
+    let socket = args.next().unwrap_or_else(|| {
+        std::env::var("AGENT_GRAPH_OPERATOR_SOCKET").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            format!("{home}/.local/share/agent-graph/run/operator.sock")
+        })
+    });
     let action_text = args.next().unwrap_or_else(|| "delete_graph".into());
     let action: OperatorAction = serde_json::from_str(&format!("\"{action_text}\""))?;
     let resource_id = args.next().ok_or("missing graph ID")?;

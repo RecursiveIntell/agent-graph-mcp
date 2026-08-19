@@ -372,14 +372,14 @@ pub fn validate_research_evidence(value: &Value) -> Result<(), String> {
         if source
             .get("source_type")
             .and_then(Value::as_str)
-            .is_none_or(|source_type| source_type.trim().is_empty())
+            .map_or(true, |source_type| source_type.trim().is_empty())
         {
             return Err(format!(
                 "research evidence source {index} requires a non-empty source_type"
             ));
         }
         if let Some(witness_id) = source.get("witness_id") {
-            if witness_id.as_str().is_none_or(str::is_empty) {
+            if witness_id.as_str().map_or(true, str::is_empty) {
                 return Err(format!(
                     "research evidence source {index} witness_id must be a non-empty string"
                 ));
@@ -390,7 +390,7 @@ pub fn validate_research_evidence(value: &Value) -> Result<(), String> {
         if claim
             .get("text")
             .and_then(Value::as_str)
-            .is_none_or(|text| text.trim().is_empty())
+            .map_or(true, |text| text.trim().is_empty())
         {
             return Err(format!(
                 "research evidence claim {index} requires non-empty text"

@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 350" fill="none">
+  <defs>
+    <linearGradient id="bg2" x1="0" y1="0" x2="800" y2="350">
+      <stop offset="0%" stop-color="#0d1117"/>
+      <stop offset="100%" stop-color="#161b22"/>
+    </linearGradient>
+  </defs>
+  <rect width="800" height="350" fill="url(#bg2)"/>
+
+  <!-- Layers -->
+  <rect x="40" y="30" width="720" height="70" rx="10" fill="#1f6feb33" stroke="#1f6feb" stroke-width="1"/>
+  <text x="60" y="55" fill="#58a6ff" font-family="monospace" font-size="14" font-weight="bold">Application Layer</text>
+  <text x="60" y="75" fill="#8b949e" font-family="monospace" font-size="12">Your graph definitions, custom node types, agent workflows</text>
+
+  <rect x="40" y="120" width="720" height="70" rx="10" fill="#23863633" stroke="#238636" stroke-width="1"/>
+  <text x="60" y="145" fill="#3fb950" font-family="monospace" font-size="14" font-weight="bold">Engine Layer</text>
+  <text x="60" y="165" fill="#8b949e" font-family="monospace" font-size="12">AgentGraph, GraphExecutor, Node dispatch, Edge routing, State management</text>
+
+  <rect x="40" y="210" width="720" height="70" rx="10" fill="#a371f733" stroke="#a371f7" stroke-width="1"/>
+  <text x="60" y="235" fill="#a371f7" font-family="monospace" font-size="14" font-weight="bold">Persistence Layer</text>
+  <text x="60" y="255" fill="#8b949e" font-family="monospace" font-size="12">CheckpointStore (SQLite), execution receipts, event streaming, interrupt/resume</text>
+
+  <!-- Arrows between layers -->
+  <line x1="400" y1="100" x2="400" y2="118" stroke="#8b949e" stroke-width="1" stroke-dasharray="4"/>
+  <line x1="400" y1="190" x2="400" y2="208" stroke="#8b949e" stroke-width="1" stroke-dasharray="4"/>
+
+  <text x="400" y="310" text-anchor="middle" fill="#484f58" font-family="monospace" font-size="11">stack-ids integration: TraceCtx, AttemptId, TrialId at every layer</text>
+</svg>

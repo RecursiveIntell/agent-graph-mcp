@@ -1,0 +1,48 @@
+{
+  "artifact": {
+    "bytes": 31253,
+    "kind": "markdown",
+    "path": "/home/sikmindz/Coding/agent-graph-mcp-release/.hermes/plans/governed-agent-reliability-proof-20260808.md",
+    "sha256": "sha256:75e09ebc8924d6a5c41f36084e2fdf1d4913fca7f3229674da954d5ac5dbc03f"
+  },
+  "checks": [
+    {
+      "evidence": {
+        "bytes": 31253,
+        "kind": "markdown",
+        "path": "/home/sikmindz/Coding/agent-graph-mcp-release/.hermes/plans/governed-agent-reliability-proof-20260808.md",
+        "sha256": "sha256:75e09ebc8924d6a5c41f36084e2fdf1d4913fca7f3229674da954d5ac5dbc03f"
+      },
+      "name": "exists-and-hash",
+      "status": "PASS"
+    },
+    {
+      "evidence": {
+        "characters": 30917
+      },
+      "name": "text-decode",
+      "status": "PASS"
+    },
+    {
+      "evidence": {
+        "missing": []
+      },
+      "name": "local-links-and-assets",
+      "status": "PASS"
+    },
+    {
+      "evidence": {
+        "hits": []
+      },
+      "name": "placeholder-and-tool-token-scan",
+      "status": "PASS"
+    }
+  ],
+  "created_at": "2026-08-08T23:53:19.235011+00:00",
+  "defects": [],
+  "manual_checks": [],
+  "overall_status": "PASS",
+  "repair_authority_required": false,
+  "schema": "ArtifactValidationReceiptV1",
+  "version": 1
+}

@@ -1,5 +1,5 @@
 use agent_graph_mcp::promotion::{
-    verify_canonical_receipt, OperatorReceipt, PromotionError, PromotionStore,
+    verify_canonical_receipt, OperatorReceipt, PromotionError, PromotionStore, ReceiptIdentity,
     TemplateCandidateState, TemplateOutcome,
 };
 
@@ -58,18 +58,24 @@ fn bad_outcome_quarantines_candidate() {
 
 #[test]
 fn mismatched_and_nonterminal_receipts_are_rejected() {
-    let mismatch = verify_canonical_receipt(
-        "run", "receipt", "graph", "v1", "template", "spec", "other", "receipt", "graph", "v1",
-        "template", "spec", true,
-    );
+    let expected = ReceiptIdentity {
+        run_id: "run",
+        receipt_digest: "receipt",
+        graph_id: "graph",
+        graph_version: "v1",
+        template_id: "template",
+        spec_digest: "spec",
+    };
+    let mismatched = ReceiptIdentity {
+        run_id: "other",
+        ..expected
+    };
+    let mismatch = verify_canonical_receipt(&expected, &mismatched, true);
     assert_eq!(
         mismatch,
         Err(PromotionError::ReceiptMismatch("run_id".into()))
     );
-    let nonterminal = verify_canonical_receipt(
-        "run", "receipt", "graph", "v1", "template", "spec", "run", "receipt", "graph", "v1",
-        "template", "spec", false,
-    );
+    let nonterminal = verify_canonical_receipt(&expected, &expected, false);
     assert_eq!(nonterminal, Err(PromotionError::NonTerminal));
 }
 

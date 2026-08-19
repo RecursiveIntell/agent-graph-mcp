@@ -1,0 +1,2 @@
+gate_id,claim_or_invariant,command_or_witness,required,status,evidence_ref,notes
+G-000,source identity and owner map reviewed,manual preflight,true,NOT_RUN,,

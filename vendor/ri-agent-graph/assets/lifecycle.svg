@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 520" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="900" y2="520">
+      <stop offset="0%" stop-color="#0d1117"/>
+      <stop offset="100%" stop-color="#161b22"/>
+    </linearGradient>
+    <filter id="glow"><feGaussianBlur stdDeviation="3"/><feMerge><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#58a6ff"/></marker>
+    <marker id="arrg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#3fb950"/></marker>
+    <marker id="arrr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="#da3633"/></marker>
+  </defs>
+  <rect width="900" height="520" fill="url(#bg)"/>
+
+  <text x="450" y="25" text-anchor="middle" fill="#58a6ff" font-family="monospace" font-size="15" font-weight="bold">Execution Lifecycle: Build → Execute → Stream → Receipt</text>
+
+  <!-- Build Phase -->
+  <rect x="30" y="55" width="200" height="100" rx="10" fill="#1f6feb33" stroke="#1f6feb" stroke-width="2"/>
+  <text x="130" y="80" text-anchor="middle" fill="#58a6ff" font-family="monospace" font-size="13" font-weight="bold">1. Build</text>
+  <text x="130" y="100" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="10">AgentGraph::builder()</text>
+  <text x="130" y="116" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="10">.add_node( ) .add_edge( )</text>
+  <text x="130" y="132" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="10">.with_reducers( ) .build()</text>
+  <text x="130" y="148" text-anchor="middle" fill="#484f58" font-family="monospace" font-size="9">Validates topology, reducers</text>
+
+  <line x1="230" y1="105" x2="275" y2="105" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)"/>
+
+  <!-- Execute Phase -->
+  <rect x="280" y="55" width="300" height="100" rx="10" fill="#23863633" stroke="#238636" stroke-width="2"/>
+  <text x="430" y="80" text-anchor="middle" fill="#3fb950" font-family="monospace" font-size="13" font-weight="bold">2. Execute</text>
+  <text x="430" y="100" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="10">GraphExecutor::new(graph)</text>
+  <text x="430" y="116" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="10">.with_checkpoint_store( )</text>
+  <text x="430" y="132" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="10">.execute(entry, state)</text>
+  <text x="430" y="148" text-anchor="middle" fill="#484f58" font-family="monospace" font-size="9">Superstep loop: dispatch → collect → advance</text>
+
+  <line x1="580" y1="105" x2="625" y2="105" stroke="#3fb950" stroke-width="2" marker-end="url(#arrg)"/>
+
+  <!-- Stream Phase -->
+  <rect x="630" y="55" width="240" height="100" rx="10" fill="#d2992233" stroke="#d29922" stroke-width="2"/>
+  <text x="750" y="80" text-anchor="middle" fill="#d29922" font-family="monospace" font-size="13" font-weight="bold">3. Stream</text>
+  <text x="750" y="100" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="10">EventSink → StreamExt</text>
+  <text x="750" y="116" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="10">NodeStarted / NodeCompleted</text>
+  <text x="750" y="132" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="10">TokenStream / StateSnapshot</text>
+  <text x="750" y="148" text-anchor="middle" fill="#484f58" font-family="monospace" font-size="9">Real-time event emission</text>
+
+  <!-- Receipt Row -->
+  <line x1="240" y1="175" x2="430" y2="220" stroke="#a371f7" stroke-width="1" stroke-dasharray="4"/>
+  <line x1="580" y1="175" x2="430" y2="220" stroke="#a371f7" stroke-width="1" stroke-dasharray="4"/>
+  <line x1="750" y1="175" x2="750" y2="220" stroke="#a371f7" stroke-width="1" stroke-dasharray="4"/>
+
+  <rect x="250" y="225" width="360" height="55" rx="10" fill="#a371f733" stroke="#a371f7" stroke-width="2" filter="url(#glow)"/>
+  <text x="430" y="250" text-anchor="middle" fill="#a371f7" font-family="monospace" font-size="13" font-weight="bold">GraphExecutionReceiptV1</text>
+  <text x="430" y="270" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="10">run_id · graph_name · steps[] · final_state_digest · HMAC-SHA256</text>
+
+  <!-- Branching detail -->
+  <text x="450" y="310" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="13" font-weight="bold">Superstep Loop Detail</text>
+
+  <rect x="30" y="330" width="195" height="70" rx="8" fill="#1f6feb33" stroke="#1f6feb" stroke-width="1"/>
+  <text x="127" y="355" text-anchor="middle" fill="#58a6ff" font-family="monospace" font-size="11">Dispatch</text>
+  <text x="127" y="373" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="9">Route edges → target nodes</text>
+  <text x="127" y="389" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="9">Resolve router decisions</text>
+
+  <rect x="250" y="330" width="195" height="70" rx="8" fill="#23863633" stroke="#238636" stroke-width="1"/>
+  <text x="347" y="355" text-anchor="middle" fill="#3fb950" font-family="monospace" font-size="11">Execute Nodes</text>
+  <text x="347" y="373" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="9">JoinSet for parallel fan-out</text>
+  <text x="347" y="389" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="9">Apply reducers on merge</text>
+
+  <rect x="470" y="330" width="195" height="70" rx="8" fill="#d2992233" stroke="#d29922" stroke-width="1"/>
+  <text x="567" y="355" text-anchor="middle" fill="#d29922" font-family="monospace" font-size="11">Checkpoint</text>
+  <text x="567" y="373" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="9">Save attempt outcomes</text>
+  <text x="567" y="389" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="9">Atomic SQLite transactions</text>
+
+  <rect x="690" y="330" width="180" height="70" rx="8" fill="#da363333" stroke="#da3633" stroke-width="1"/>
+  <text x="780" y="355" text-anchor="middle" fill="#da3633" font-family="monospace" font-size="11">Advance / Halt</text>
+  <text x="780" y="373" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="9">END sentinel → terminate</text>
+  <text x="780" y="389" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="9">max_iterations guard</text>
+
+  <!-- Arrows for superstep -->
+  <line x1="225" y1="365" x2="245" y2="365" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)"/>
+  <line x1="445" y1="365" x2="465" y2="365" stroke="#3fb950" stroke-width="2" marker-end="url(#arrg)"/>
+
+  <!-- Retry -->
+  <rect x="470" y="420" width="195" height="50" rx="8" fill="#a371f733" stroke="#a371f7" stroke-width="1"/>
+  <text x="567" y="442" text-anchor="middle" fill="#a371f7" font-family="monospace" font-size="11">Retry Policy</text>
+  <text x="567" y="460" text-anchor="middle" fill="#8b949e" font-family="monospace" font-size="9">max_retries · backoff · predicate</text>
+
+  <text x="450" y="500" text-anchor="middle" fill="#484f58" font-family="monospace" font-size="10">All steps carry TraceCtx · AttemptId · TrialId from stack-ids</text>
+</svg>

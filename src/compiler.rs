@@ -3,8 +3,10 @@ use std::sync::{
     Arc, Mutex,
 };
 
+use ri_agent_graph::command::NodeOutput;
 use ri_agent_graph::event_sink::{EventSink, GraphEvent};
 use ri_agent_graph::join::JoinNode;
+use ri_agent_graph::node::Node;
 use ri_agent_graph::reducer::{AddReducer, AppendReducer, LastWriteWins, MergeReducer};
 use ri_agent_graph::retry::RetryPolicy;
 use ri_agent_graph::AgentGraph;
@@ -15,56 +17,8 @@ use crate::nodes::{
     legacy_router, HumanApprovalNode, LlmNode, PassthroughNode, RouterConfig, RouterNode,
     RunContext, SubgraphExecutor, SubgraphNode, ToolNode, TransformConfig, TransformNode,
 };
-use crate::spec::{GraphSpec, NodeType, ReducerKind};
+use crate::spec::{effective_node_timeout_ms, GraphSpec, NodeType, ReducerKind};
 use serde_json::Value;
-
-fn default_tools() -> Vec<serde_json::Value> {
-    vec![
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "search_memory",
-                "description": "Search semantic memory for facts, claims, and past work.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "Search keywords or namespace: prefix"}
-                    },
-                    "required": ["query"]
-                }
-            }
-        }),
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "read_file",
-                "description": "Read a file. Returns content with line numbers.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string", "description": "File path to read"}
-                    },
-                    "required": ["path"]
-                }
-            }
-        }),
-        serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": "search_codebase",
-                "description": "Search codebase for files, types, or patterns.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "pattern": {"type": "string", "description": "Search pattern"},
-                        "path": {"type": "string", "description": "Directory to search"}
-                    },
-                    "required": ["pattern"]
-                }
-            }
-        }),
-    ]
-}
 
 // ---------------------------------------------------------------------------
 // Strategy join helpers (five-stage pipeline: validate -> normalize ->
@@ -340,6 +294,8 @@ pub struct CompileContext {
     pub events: Arc<Mutex<Vec<GraphEvent>>>,
     pub llm_calls: Arc<AtomicU64>,
     pub max_llm_calls: Option<u64>,
+    pub node_calls: Arc<AtomicU64>,
+    pub max_nodes: Option<u64>,
     pub llm_invocations: Arc<Mutex<Vec<Value>>>,
     /// Provider API key for http(s) llm-pipeline calls (Bearer header).
     pub api_key: Option<String>,
@@ -364,12 +320,31 @@ impl EventSink for Collector {
     }
 }
 
+struct BudgetedNode {
+    inner: Box<dyn Node>,
+    ctx: RunContext,
+}
+
+#[async_trait::async_trait]
+impl Node for BudgetedNode {
+    async fn execute(
+        &self,
+        state: &ri_agent_graph::state::AgentState,
+        config: &ri_agent_graph::config::GraphConfig,
+    ) -> ri_agent_graph::Result<NodeOutput> {
+        self.ctx.reserve_node()?;
+        self.inner.execute(state, config).await
+    }
+}
+
 pub fn compile(spec: &GraphSpec, cx: CompileContext) -> Result<AgentGraph, String> {
     let run = RunContext {
         cancelled: cx.cancelled,
         cancellation: cx.cancellation,
         llm_calls: cx.llm_calls,
         max_llm_calls: cx.max_llm_calls,
+        node_calls: cx.node_calls,
+        max_nodes: cx.max_nodes,
         llm_invocations: cx.llm_invocations,
         executor: cx.executor.clone(),
         subgraph: cx.subgraph.clone(),
@@ -408,7 +383,7 @@ pub fn compile(spec: &GraphSpec, cx: CompileContext) -> Result<AgentGraph, Strin
                     .config
                     .get("tools")
                     .and_then(|v| v.as_array())
-                    .map(|arr| arr.clone())
+                    .cloned()
                     .unwrap_or_default();
                 Box::new(LlmNode {
                     id: node.id.clone(),
@@ -429,11 +404,12 @@ pub fn compile(spec: &GraphSpec, cx: CompileContext) -> Result<AgentGraph, Strin
                     json_mode: node.json_mode,
                     evidence_required: node.evidence_required,
                     max_tokens: node.max_tokens,
-                    timeout_ms: node
-                        .config
-                        .get("timeout_ms")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(120_000),
+                    timeout_ms: effective_node_timeout_ms(
+                        node.config
+                            .get("timeout_ms")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(120_000),
+                    ),
                     input_key,
                     output_key,
                     context_file,
@@ -480,8 +456,7 @@ pub fn compile(spec: &GraphSpec, cx: CompileContext) -> Result<AgentGraph, Strin
                 {
                     "collect_array" => Box::new(JoinNode::collect_array(inputs, output)),
                     "collect_object" => Box::new(JoinNode::new(inputs, output, |values| {
-                        let obj: serde_json::Map<String, serde_json::Value> =
-                            values.into_iter().map(|(k, v)| (k, v)).collect();
+                        let obj: serde_json::Map<String, Value> = values.into_iter().collect();
                         Ok(serde_json::Value::Object(obj))
                     })),
                     "merge_objects" => Box::new(JoinNode::merge_objects(inputs, output)),
@@ -603,18 +578,10 @@ pub fn compile(spec: &GraphSpec, cx: CompileContext) -> Result<AgentGraph, Strin
                 }
             }
             NodeType::Parallel => {
-                // Parallel node: compile branches as passthrough nodes that fan out.
-                // The engine handles parallel execution when multiple nodes are targets
-                // from the same source in a superstep. We create a passthrough here
-                // and rely on edge routing to fan out to individual branch entries.
-                let _branches = node
-                    .config
-                    .get("branches")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| arr.len())
-                    .unwrap_or(0);
-                // Write branch metadata to state for introspection
-                Box::new(PassthroughNode { ctx: run.clone() })
+                return Err(format!(
+                    "UNSUPPORTED_PARALLEL: node '{}' requires explicit fan-out edges and a Join node",
+                    node.id
+                ));
             }
             NodeType::Subgraph => {
                 let graph_name = node
@@ -751,11 +718,12 @@ pub fn compile(spec: &GraphSpec, cx: CompileContext) -> Result<AgentGraph, Strin
                     .and_then(|v| v.as_str())
                     .unwrap_or("/tmp/agent-graph-tool-receipts")
                     .to_owned();
-                let timeout_ms = node
-                    .config
-                    .get("timeout_ms")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(120_000);
+                let timeout_ms = effective_node_timeout_ms(
+                    node.config
+                        .get("timeout_ms")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(120_000),
+                );
                 Box::new(ToolNode {
                     id: node.id.clone(),
                     python,
@@ -767,6 +735,10 @@ pub fn compile(spec: &GraphSpec, cx: CompileContext) -> Result<AgentGraph, Strin
                 })
             }
         };
+        let boxed: Box<dyn ri_agent_graph::node::Node> = Box::new(BudgetedNode {
+            inner: boxed,
+            ctx: run.clone(),
+        });
         if let Some(retry) = node.config.get("retry") {
             let attempts = retry
                 .get("max_attempts")
@@ -824,7 +796,7 @@ pub fn compile(spec: &GraphSpec, cx: CompileContext) -> Result<AgentGraph, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ri_agent_graph::command::{Navigation, NodeOutput};
+    use ri_agent_graph::command::Navigation;
     use ri_agent_graph::config::GraphConfig;
     use ri_agent_graph::node::Node;
     use ri_agent_graph::state::AgentState;
@@ -955,6 +927,8 @@ mod tests {
             cancellation: Arc::new(tokio::sync::Notify::new()),
             llm_calls: Arc::new(AtomicU64::new(0)),
             max_llm_calls: None,
+            node_calls: Arc::new(AtomicU64::new(0)),
+            max_nodes: None,
             llm_invocations: Arc::new(Mutex::new(Vec::new())),
             executor: crate::model_executor::ExecutorHandle::none(),
             subgraph: None,

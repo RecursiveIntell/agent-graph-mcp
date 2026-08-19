@@ -138,28 +138,36 @@ impl PromotionStore {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct ReceiptIdentity<'a> {
+    pub run_id: &'a str,
+    pub receipt_digest: &'a str,
+    pub graph_id: &'a str,
+    pub graph_version: &'a str,
+    pub template_id: &'a str,
+    pub spec_digest: &'a str,
+}
+
 pub fn verify_canonical_receipt(
-    run_id: &str,
-    receipt_digest: &str,
-    graph_id: &str,
-    graph_version: &str,
-    template_id: &str,
-    spec_digest: &str,
-    actual_run_id: &str,
-    actual_receipt_digest: &str,
-    actual_graph_id: &str,
-    actual_graph_version: &str,
-    actual_template_id: &str,
-    actual_spec_digest: &str,
+    expected: &ReceiptIdentity<'_>,
+    actual: &ReceiptIdentity<'_>,
     terminal: bool,
 ) -> Result<(), PromotionError> {
     for (name, a, b) in [
-        ("run_id", run_id, actual_run_id),
-        ("receipt_digest", receipt_digest, actual_receipt_digest),
-        ("graph_id", graph_id, actual_graph_id),
-        ("graph_version", graph_version, actual_graph_version),
-        ("template_id", template_id, actual_template_id),
-        ("spec_digest", spec_digest, actual_spec_digest),
+        ("run_id", expected.run_id, actual.run_id),
+        (
+            "receipt_digest",
+            expected.receipt_digest,
+            actual.receipt_digest,
+        ),
+        ("graph_id", expected.graph_id, actual.graph_id),
+        (
+            "graph_version",
+            expected.graph_version,
+            actual.graph_version,
+        ),
+        ("template_id", expected.template_id, actual.template_id),
+        ("spec_digest", expected.spec_digest, actual.spec_digest),
     ] {
         if a != b {
             return Err(PromotionError::ReceiptMismatch(name.into()));

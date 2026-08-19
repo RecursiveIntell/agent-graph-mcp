@@ -31,6 +31,9 @@ pub struct RunContext {
     pub llm_calls: Arc<AtomicU64>,
     /// Run-scoped cap on provider attempts; None means unlimited.
     pub max_llm_calls: Option<u64>,
+    /// Run-scoped cap on actual node executions, including parallel branches.
+    pub node_calls: Arc<AtomicU64>,
+    pub max_nodes: Option<u64>,
     /// Optional model invocation executor for local backends.
     pub executor: ExecutorHandle,
     /// Shared typed ledger of observed invocations for the terminal receipt.
@@ -47,18 +50,13 @@ pub struct RunContext {
 /// Host-provided subgraph runner: (graph_name, input_value, depth) -> terminal output value.
 /// The runner returns a future so sub-executions can be awaited inside the engine's
 /// async runtime without blocking (block_on is illegal on a runtime worker thread).
+pub type SubgraphFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = std::result::Result<Value, String>> + Send>>;
+pub type SubgraphRunner = Arc<dyn Fn(String, Value, u32) -> SubgraphFuture + Send + Sync>;
+
 #[derive(Clone)]
 pub struct SubgraphExecutor {
-    pub inner: Arc<
-        dyn Fn(
-                String,
-                Value,
-                u32,
-            ) -> std::pin::Pin<
-                Box<dyn std::future::Future<Output = std::result::Result<Value, String>> + Send>,
-            > + Send
-            + Sync,
-    >,
+    pub inner: SubgraphRunner,
 }
 
 impl std::fmt::Debug for SubgraphExecutor {
@@ -93,6 +91,23 @@ impl RunContext {
             // already advanced to used+1, so the attempt number is used+1.
             Ok(used) => Ok(used.saturating_add(1)),
             Err(_) => Err(AgentGraphError::PayloadError("BUDGET_EXHAUSTED".to_owned())),
+        }
+    }
+
+    pub fn reserve_node(&self) -> Result<u64> {
+        match self
+            .node_calls
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                if self.max_nodes.is_some_and(|limit| used >= limit) {
+                    None
+                } else {
+                    Some(used + 1)
+                }
+            }) {
+            Ok(used) => Ok(used.saturating_add(1)),
+            Err(_) => Err(AgentGraphError::PayloadError(
+                "MAX_NODES_EXCEEDED".to_owned(),
+            )),
         }
     }
 }
@@ -158,61 +173,14 @@ impl Node for LlmNode {
         // Prepend context file content if configured. This allows graph specs
         // to reference AGENTS.md or project files instead of embedding massive
         // context in every prompt. Large files (>32KB) are truncated.
-        let mut rendered = if let Some(ref cf) = self.context_file {
-            let resolved = match cf.as_str() {
-                "AGENTS.md" => {
-                    let cwd = std::env::current_dir().unwrap_or_default();
-                    cwd.join("AGENTS.md")
-                }
-                p if p.starts_with('/') => std::path::PathBuf::from(p),
-                p => {
-                    let cwd = std::env::current_dir().unwrap_or_default();
-                    cwd.join(p)
-                }
-            };
-            match std::fs::read_to_string(&resolved) {
-                Ok(file_content) => {
-                    let truncated: String = file_content.chars().take(32768).collect();
-                    format!(
-                        "[CONTEXT FILE: {}]
-
-{}
-
----
-
-{}",
-                        cf, truncated, self.prompt
-                    )
-                }
-                Err(_) => self.prompt.clone(),
-            }
-        } else {
-            self.prompt.clone()
-        };
+        let rendered = prompt_with_context(self.context_file.as_deref(), &self.prompt);
         // Expand the input placeholder. Council specs reference the input key
         // by name (e.g. {brief}, {plan}, {input}) — the daemon previously only
         // expanded {input}, so prompts using {<input_key>} sent the literal
         // placeholder to the model and analysts never received the coordinator
         // output (observed 2026-08-03: analysts returned empty content).
-        let mut rendered = self.prompt.replace("{input}", &input_json);
-        if !self.input_key.is_empty() {
-            rendered = rendered.replace(&format!("{{{}}}", self.input_key), &input_json);
-        }
-        // Expand any remaining {keyname} placeholders from agent state.
-        // Council specs use cross-node references like {attack} and {cross_reviewed}
-        // which are separate state keys, not the current node's input_key.
         let state_snapshot = state.snapshot().await;
-        for (key, value) in &state_snapshot.data {
-            if key.starts_with("__") {
-                continue; // skip internal keys
-            }
-            let placeholder = format!("{{{}}}", key);
-            if rendered.contains(&placeholder) {
-                if let Ok(json_str) = serde_json::to_string(value) {
-                    rendered = rendered.replace(&placeholder, &json_str);
-                }
-            }
-        }
+        let rendered = expand_prompt(rendered, &self.input_key, &input_json, &state_snapshot.data);
         let model = self.model.as_deref().unwrap_or(&self.default_model);
         // Reserve the provider attempt before any invocation; the limit cannot
         // be bypassed by parallel nodes and failed calls still count.
@@ -244,7 +212,8 @@ impl Node for LlmNode {
             let exec_ctx = ExecCtx::builder(&self.base_url).build();
             let use_openai =
                 self.base_url.starts_with("http://") || self.base_url.starts_with("https://");
-            let response = tokio::task::spawn_blocking(move || {
+            let timeout = std::time::Duration::from_millis(self.timeout_ms);
+            let mut task = tokio::task::spawn_blocking(move || {
                 tokio::runtime::Handle::current().block_on(async move {
                     if use_openai {
                         runner.run_openai_responses(&exec_ctx, request).await
@@ -252,12 +221,27 @@ impl Node for LlmNode {
                         runner.run_ollama(&exec_ctx, request).await
                     }
                 })
-            })
-            .await
-            .map_err(|e| AgentGraphError::PayloadError(format!("tool loop task failed: {e}")))?;
+            });
+            let response = tokio::select! {
+                result = &mut task => {
+                    result
+                        .map_err(|e| AgentGraphError::PayloadError(format!("tool loop task failed: {e}")))?
+                        .map(|r| Value::String(r.final_text))
+                        .map_err(|e| AgentGraphError::PayloadError(e.to_string()))
+                }
+                _ = tokio::time::sleep(timeout) => {
+                    task.abort();
+                    Err(AgentGraphError::PayloadError(format!(
+                        "tool loop timed out after {} ms",
+                        self.timeout_ms
+                    )))
+                }
+                _ = cancellation_requested(self.ctx.cancelled.clone(), self.ctx.cancellation.clone()) => {
+                    task.abort();
+                    Err(AgentGraphError::Cancelled)
+                }
+            };
             response
-                .map(|r| Value::String(r.final_text))
-                .map_err(|e| AgentGraphError::PayloadError(e.to_string()))
         } else if self.base_url == "codex-app-server://" {
             let model = model.to_owned();
             let prompt = rendered.clone();
@@ -341,9 +325,9 @@ impl Node for LlmNode {
                         // reasoning as the content so graph nodes receive
                         // usable output.
                         if let Some(content) = payload.value.get("content") {
-                            if content.as_str().map_or(false, |s| s.is_empty()) {
+                            if content.as_str().is_some_and(str::is_empty) {
                                 if let Some(reasoning) = payload.value.get("reasoning") {
-                                    if reasoning.as_str().map_or(false, |s| !s.is_empty()) {
+                                    if reasoning.as_str().is_some_and(|s| !s.is_empty()) {
                                         payload.value["content"] = reasoning.clone();
                                     }
                                 }
@@ -358,6 +342,10 @@ impl Node for LlmNode {
         };
         let output = match result {
             Ok(output) => {
+                if let Err(error) = validate_usable_provider_output(&output) {
+                    self.record_invocation(attempt, model, "failed", last_usage);
+                    return Err(error);
+                }
                 self.record_invocation(attempt, model, "succeeded", last_usage);
                 output
             }
@@ -375,6 +363,71 @@ impl Node for LlmNode {
         // result there made parallel branches race for the graph's final state.
         state.set_raw(&self.output_key, output).await?;
         Ok(NodeOutput::Done)
+    }
+}
+
+fn prompt_with_context(context_file: Option<&str>, prompt: &str) -> String {
+    let Some(context_file) = context_file else {
+        return prompt.to_owned();
+    };
+    let resolved = match context_file {
+        "AGENTS.md" => std::env::current_dir()
+            .unwrap_or_default()
+            .join("AGENTS.md"),
+        path if path.starts_with('/') => std::path::PathBuf::from(path),
+        path => std::env::current_dir().unwrap_or_default().join(path),
+    };
+    match std::fs::read_to_string(resolved) {
+        Ok(file_content) => {
+            let truncated: String = file_content.chars().take(32768).collect();
+            format!("[CONTEXT FILE: {context_file}]\n\n{truncated}\n\n---\n\n{prompt}")
+        }
+        Err(_) => prompt.to_owned(),
+    }
+}
+
+fn expand_prompt(
+    mut rendered: String,
+    input_key: &str,
+    input_json: &str,
+    state: &std::collections::HashMap<String, Value>,
+) -> String {
+    rendered = rendered.replace("{input}", input_json);
+    if !input_key.is_empty() {
+        rendered = rendered.replace(&format!("{{{input_key}}}"), input_json);
+    }
+    for (key, value) in state {
+        if key.starts_with("__") {
+            continue;
+        }
+        let placeholder = format!("{{{key}}}");
+        if rendered.contains(&placeholder) {
+            if let Ok(json_str) = serde_json::to_string(value) {
+                rendered = rendered.replace(&placeholder, &json_str);
+            }
+        }
+    }
+    rendered
+}
+
+fn validate_usable_provider_output(value: &Value) -> Result<()> {
+    let usable = match value {
+        Value::Null => false,
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Array(values) => !values.is_empty(),
+        Value::Object(object) => match object.get("content") {
+            Some(Value::String(text)) => !text.trim().is_empty(),
+            Some(_) => false,
+            None => !object.is_empty(),
+        },
+        Value::Bool(_) | Value::Number(_) => true,
+    };
+    if usable {
+        Ok(())
+    } else {
+        Err(AgentGraphError::PayloadError(
+            "provider returned no usable assistant result".into(),
+        ))
     }
 }
 
@@ -401,7 +454,11 @@ impl LlmNode {
 
 #[cfg(test)]
 mod tests {
-    use super::cancellation_requested;
+    use super::{
+        cancellation_requested, expand_prompt, parse_receipt_ledger, prompt_with_context,
+        validate_usable_provider_output,
+    };
+    use serde_json::json;
     use std::sync::{atomic::AtomicBool, Arc};
     use tokio::sync::Notify;
 
@@ -416,6 +473,56 @@ mod tests {
             .await
             .expect("cancellation waiter completed")
             .is_err());
+    }
+
+    #[test]
+    fn context_file_survives_prompt_expansion() {
+        let path = std::env::temp_dir().join(format!(
+            "agent-graph-context-{}-{}.md",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&path, "SOURCE_SENTINEL").expect("context file");
+        let rendered =
+            prompt_with_context(Some(path.to_str().expect("utf8 path")), "input={input}");
+        let expanded = expand_prompt(
+            rendered,
+            "input",
+            "\"PAYLOAD_SENTINEL\"",
+            &std::collections::HashMap::new(),
+        );
+        std::fs::remove_file(path).expect("remove context file");
+        assert!(expanded.contains("SOURCE_SENTINEL"));
+        assert!(expanded.contains("PAYLOAD_SENTINEL"));
+    }
+
+    #[test]
+    fn empty_provider_results_are_typed_failures() {
+        for value in [
+            json!(null),
+            json!(""),
+            json!({}),
+            json!([]),
+            json!({"content": ""}),
+        ] {
+            let error = validate_usable_provider_output(&value).expect_err("empty result rejected");
+            assert!(error.to_string().contains("no usable assistant result"));
+        }
+        assert!(validate_usable_provider_output(&json!("usable")).is_ok());
+        assert!(validate_usable_provider_output(&json!({"finding": "usable"})).is_ok());
+    }
+
+    #[test]
+    fn malformed_receipt_ledger_is_rejected_without_partial_evidence() {
+        let error = parse_receipt_ledger("{\"receipt\":1}\nnot-json\n")
+            .expect_err("malformed ledger must fail closed");
+        assert!(error
+            .to_string()
+            .contains("WITNESS_LEDGER_PARSE_FAILURE line 2"));
+        assert_eq!(
+            parse_receipt_ledger("\n{\"receipt\":1}\n").expect("valid ledger"),
+            json!([{"receipt":1}])
+        );
     }
 }
 
@@ -707,6 +814,23 @@ pub struct ToolNode {
     pub ctx: RunContext,
 }
 
+fn parse_receipt_ledger(contents: &str) -> Result<Value> {
+    let mut receipts = Vec::new();
+    for (line_number, line) in contents.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let receipt: Value = serde_json::from_str(line).map_err(|error| {
+            AgentGraphError::PayloadError(format!(
+                "WITNESS_LEDGER_PARSE_FAILURE line {}: {error}",
+                line_number + 1
+            ))
+        })?;
+        receipts.push(receipt);
+    }
+    Ok(Value::Array(receipts))
+}
+
 #[async_trait]
 impl Node for ToolNode {
     async fn execute(&self, state: &AgentState, _: &GraphConfig) -> Result<NodeOutput> {
@@ -875,11 +999,7 @@ impl Node for ToolNode {
         // Read receipt ledger for verification.
         let ledger_path = format!("{}/ledger.jsonl", self.receipt_dir);
         let receipt_evidence = if let Ok(contents) = std::fs::read_to_string(&ledger_path) {
-            let receipts: Vec<Value> = contents
-                .lines()
-                .filter_map(|line| serde_json::from_str(line).ok())
-                .collect();
-            receipts.into()
+            parse_receipt_ledger(&contents)?
         } else {
             Value::Null
         };

@@ -24,6 +24,9 @@ pub fn connect(path: &std::path::Path) -> Result<UnixStream, ProxyError> {
 
 pub fn connect_timeout(path: &std::path::Path, timeout_ms: u64) -> Result<UnixStream, ProxyError> {
     let stream = UnixStream::connect(path).map_err(|_| ProxyError::DaemonUnavailable)?;
+    // This bounded read is only for MCP notifications, which deliberately do
+    // not receive daemon responses. The proxy clears it per request before a
+    // potentially long graph execution or wait response.
     stream.set_read_timeout(Some(std::time::Duration::from_millis(timeout_ms)))?;
     Ok(stream)
 }

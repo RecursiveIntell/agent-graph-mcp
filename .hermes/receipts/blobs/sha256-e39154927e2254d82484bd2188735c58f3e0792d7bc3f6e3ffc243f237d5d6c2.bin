@@ -1,0 +1,6 @@
+rollback_stage=/home/sikmindz/.hermes/staging/agent-graph-codex-rust-admission-20260808T121005Z
+live_pid=234256
+4f24483d7d0278e49f66907a43624a654ef05b02d15a033eb3198d5da7610f83  target/release/agent-graph-mcp
+961a7631b08c58654ecca2cd98ddb9e28b1e2069cc8d10e98454c47801e0532b  target/release/agent-graph-mcpd
+4f24483d7d0278e49f66907a43624a654ef05b02d15a033eb3198d5da7610f83  /home/sikmindz/.local/bin/agent-graph-mcp
+961a7631b08c58654ecca2cd98ddb9e28b1e2069cc8d10e98454c47801e0532b  /home/sikmindz/.local/bin/agent-graph-mcpd
