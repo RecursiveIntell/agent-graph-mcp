@@ -98,6 +98,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 });
             }
+            // D3: automatic retention GC — non-destructive transitions only
+            // (archived / expired_pending_review), receipt-bearing, 6h cadence.
+            {
+                let gc_store = store.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(6 * 3600)).await;
+                        let now = chrono::Utc::now().to_rfc3339();
+                        let _ = gc_store.gc_run_policy(&now);
+                    }
+                });
+            }
             // ── Authenticated operator service (peer-credentialed Unix socket) ──
             let operator_socket = socket
                 .parent()

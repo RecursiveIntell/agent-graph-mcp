@@ -2228,6 +2228,27 @@ impl AgentGraphServer {
         }
     }
 
+    #[tool(
+        description = "List interrupted_non_resumable runs for resume-or-purge triage (B9): run_id, graph, error, checkpoint flag. Purging runs is operator-only (agent-graph-operator run-purge)."
+    )]
+    fn graph_run_triage(
+        &self,
+        Parameters(TriageParams { limit }): Parameters<TriageParams>,
+    ) -> Result<Json<StructuredOutput>, ErrorData> {
+        let store = self
+            .store
+            .as_ref()
+            .ok_or_else(|| internal_error("triage requires SQLite store"))?;
+        match store.list_interrupted_runs(limit) {
+            Ok(runs) => Ok(structured_output(serde_json::json!({
+                "runs": runs,
+                "count": runs.len(),
+                "purge_authority": "operator_only",
+            }))),
+            Err(e) => Err(internal_error(e)),
+        }
+    }
+
     #[tool(description = "Cancel a running execution.")]
     fn graph_run_cancel(
         &self,

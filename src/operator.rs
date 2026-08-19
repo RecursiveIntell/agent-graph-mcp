@@ -52,6 +52,7 @@ impl OperatorService {
         if frame.resource_kind != "graph"
             && !(frame.action == OperatorAction::DecideApproval
                 && frame.resource_kind == "approval")
+            && !(frame.action == OperatorAction::PurgeRun && frame.resource_kind == "run")
         {
             return error("OPERATOR_RESOURCE_UNSUPPORTED");
         }
@@ -87,6 +88,7 @@ impl OperatorService {
                 | OperatorAction::DeleteGraph
                 | OperatorAction::ClearExecutionLineage
                 | OperatorAction::PurgeGraph
+                | OperatorAction::PurgeRun
                 | OperatorAction::PromoteTemplate
                 | OperatorAction::Migrate
                 | OperatorAction::Install
@@ -171,6 +173,33 @@ impl OperatorService {
                     .and_then(Value::as_str)
                     .map(str::to_owned),
             };
+            if frame.action == OperatorAction::PurgeRun {
+                // B9: run-scoped purge — route to the run purge path.
+                return match self.store.purge_run(&request) {
+                    Ok(OperatorRetentionResult::Applied { receipt_id })
+                    | Ok(OperatorRetentionResult::Replayed { receipt_id }) => OperatorResponse {
+                        protocol: PROTOCOL.into(),
+                        ok: true,
+                        error_code: None,
+                        receipt_id: Some(receipt_id),
+                    },
+                    Err(err) => error(match err {
+                        OperatorRetentionError::StaleState => "AUTHORIZATION_STATE_STALE",
+                        OperatorRetentionError::NonceReplayed => "AUTHORIZATION_NONCE_REPLAYED",
+                        OperatorRetentionError::Tombstoned => "GRAPH_TOMBSTONED",
+                        OperatorRetentionError::LegalHold => "LEGAL_HOLD_ACTIVE",
+                        OperatorRetentionError::Referenced => "GRAPH_REFERENCED",
+                        OperatorRetentionError::ReferencedBySubgraph => {
+                            "GRAPH_REFERENCED_BY_SUBGRAPH"
+                        }
+                        OperatorRetentionError::InvalidState => "RETENTION_STATE_INVALID",
+                        OperatorRetentionError::InvalidTransition => "RETENTION_TRANSITION_INVALID",
+                        OperatorRetentionError::NotFound => "RUN_NOT_FOUND",
+                        OperatorRetentionError::InvalidAction => "OPERATOR_ACTION_UNSUPPORTED",
+                        OperatorRetentionError::Persistence => "OPERATOR_PERSISTENCE_FAILED",
+                    }),
+                };
+            }
             match self.store.apply_operator_retention(&request) {
                 Ok(OperatorRetentionResult::Applied { receipt_id })
                 | Ok(OperatorRetentionResult::Replayed { receipt_id }) => OperatorResponse {

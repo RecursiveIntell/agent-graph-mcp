@@ -2,7 +2,7 @@
 use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 
-pub const CURRENT_VERSION: i64 = 5;
+pub const CURRENT_VERSION: i64 = 6;
 pub const LEGACY_OWNER_UNKNOWN: &str = "legacy_owner_unknown";
 
 #[allow(dead_code)]
@@ -103,7 +103,17 @@ pub fn apply(conn: &mut Connection, binary_digest: &str) -> rusqlite::Result<()>
                 execution_count INTEGER,\
                 content_digest TEXT,\
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))\
-            );",
+            );\
+            CREATE TABLE IF NOT EXISTS gc_policy (\
+                id INTEGER PRIMARY KEY CHECK (id = 1),\
+                enabled INTEGER NOT NULL DEFAULT 1,\
+                idle_archive_days INTEGER NOT NULL DEFAULT 30,\
+                review_expire_days INTEGER NOT NULL DEFAULT 60,\
+                min_executions INTEGER NOT NULL DEFAULT 5,\
+                storage_flag_mb INTEGER NOT NULL DEFAULT 10,\
+                last_run TEXT\
+            );\
+            INSERT OR IGNORE INTO gc_policy (id) VALUES (1);",
         )?;
 
         let digest = migration_digest(binary_digest);

@@ -7,6 +7,7 @@ pub mod compiler;
 pub mod daemon;
 pub mod evidence;
 pub mod fs_security;
+pub mod gc;
 pub mod lifecycle;
 pub mod migrations;
 pub mod model_executor;

@@ -264,6 +264,12 @@ pub struct RunGetParams {
     pub run_id: String,
 }
 
+/// B9: resume-or-purge triage listing (interrupted_non_resumable runs).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TriageParams {
+    pub limit: Option<u32>,
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RunStateParams {
     pub run_id: String,

@@ -531,6 +531,18 @@ pub struct GraphRetentionReport {
     pub deletion_eligible: bool,
     pub state_digest: String,
     pub tombstoned: bool,
+    /// E4: active legal holds on the graph (empty when none / table absent).
+    pub legal_holds: Vec<LegalHoldInfo>,
+}
+
+/// One legal hold on a graph (E4 surfacing).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegalHoldInfo {
+    pub hold_id: String,
+    pub reason: Option<String>,
+    pub issued_at: String,
+    pub expires_at: Option<String>,
+    pub issued_by: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1258,6 +1270,7 @@ impl PersistentStore {
                 && review_satisfied
                 && executions == 0
                 && inbound_subgraph_refs.is_empty();
+            let legal_holds = Self::legal_holds_for(&conn, &graph_id)?;
             reports.push(GraphRetentionReport {
                 graph_id,
                 state,
@@ -1273,6 +1286,7 @@ impl PersistentStore {
                 inbound_subgraph_refs,
                 state_digest,
                 tombstoned,
+                legal_holds,
             });
         }
         Ok(reports)
@@ -1404,7 +1418,13 @@ impl PersistentStore {
 
         let action = serde_json::to_string(&request.action)
             .map_err(|_| OperatorRetentionError::InvalidAction)?;
-        let actor = format!("uid:{}", request.operator_uid);
+        // uid 0 is reserved for the daemon GC task (D3); everything else is a
+        // peer-authenticated operator uid.
+        let actor = if request.operator_uid == 0 {
+            "gc".to_string()
+        } else {
+            format!("uid:{}", request.operator_uid)
+        };
         let tx = conn
             .transaction()
             .map_err(|_| OperatorRetentionError::Persistence)?;
@@ -1695,6 +1715,363 @@ impl PersistentStore {
             |r| r.get(0),
         )
         .map_err(|e| e.to_string())
+    }
+
+    /// Active legal holds for one graph (E4). Tolerant of a missing table.
+    fn legal_holds_for(conn: &Connection, graph: &str) -> Result<Vec<LegalHoldInfo>, String> {
+        let table_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='legal_holds'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| format!("legal holds table check error: {e}"))?;
+        if table_exists == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = conn
+            .prepare(
+                "SELECT hold_id, reason, issued_at, expires_at, issued_by
+                 FROM legal_holds WHERE graph_name = ?1 ORDER BY issued_at",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![graph], |row| {
+                Ok(LegalHoldInfo {
+                    hold_id: row.get(0)?,
+                    reason: row.get(1)?,
+                    issued_at: row.get(2)?,
+                    expires_at: row.get(3)?,
+                    issued_by: row.get(4)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| e.to_string())?);
+        }
+        Ok(out)
+    }
+
+    /// D3: GC transition — synthesize an operator request for a NON-DESTRUCTIVE
+    /// retention state change and apply it through the standard receipt-bearing
+    /// path (actor "gc"). Only `archived` / `expired_pending_review` are
+    /// reachable here; anything destructive stays operator-gated.
+    pub fn gc_transition(
+        &self,
+        graph: &str,
+        to_state: &str,
+        reason: &str,
+        now: &str,
+    ) -> Result<OperatorRetentionResult, OperatorRetentionError> {
+        if !matches!(to_state, "archived" | "expired_pending_review") {
+            return Err(OperatorRetentionError::InvalidState);
+        }
+        let review = self
+            .graph_retention_review(Some(graph), None, 1)
+            .map_err(|_| OperatorRetentionError::Persistence)?
+            .into_iter()
+            .next()
+            .ok_or(OperatorRetentionError::NotFound)?;
+        let nonce = format!("gc-{graph}-{to_state}-{}", now.replace([' ', ':', '-'], ""));
+        let request = OperatorRetentionRequest {
+            request_digest: format!("sha256:{nonce}"),
+            action: OperatorAction::SetGraphRetention,
+            graph_id: graph.to_string(),
+            expected_state_digest: review.state_digest,
+            nonce,
+            operator_uid: 0,
+            daemon_instance_id: "gc-task".into(),
+            issued_at: now.to_string(),
+            expires_at: now.to_string(),
+            state: Some(to_state.to_string()),
+            reason: Some(reason.to_string()),
+            review_after: None,
+        };
+        self.apply_operator_retention(&request)
+    }
+
+    /// D3: read the persisted GC policy (defaults when the row is absent).
+    pub fn gc_policy(&self) -> Result<crate::gc::GcPolicy, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='gc_policy'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if exists == 0 {
+            return Ok(crate::gc::GcPolicy::default());
+        }
+        conn.query_row(
+            "SELECT enabled, idle_archive_days, review_expire_days, min_executions,
+                    storage_flag_mb, last_run FROM gc_policy WHERE id = 1",
+            [],
+            |r| {
+                Ok(crate::gc::GcPolicy {
+                    enabled: r.get::<_, i64>(0)? != 0,
+                    idle_archive_days: r.get(1)?,
+                    review_expire_days: r.get(2)?,
+                    min_executions: r.get(3)?,
+                    storage_flag_mb: r.get(4)?,
+                    last_run: r.get(5)?,
+                })
+            },
+        )
+        .map_err(|e| format!("gc policy read error: {e}"))
+    }
+
+    /// D3: collect GC candidate rows (live graphs only, storage estimated from
+    /// events + checkpoints + terminal receipts).
+    pub fn gc_candidates(&self) -> Result<Vec<crate::gc::GcCandidateRow>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT g.name,
+                        COALESCE(r.state, 'active'),
+                        MAX(COALESCE(e.finished_at, e.started_at)),
+                        COUNT(DISTINCT e.run_id),
+                        CASE WHEN r.state = 'pinned' THEN 1 ELSE 0 END,
+                        CASE WHEN EXISTS(
+                            SELECT 1 FROM legal_holds h
+                            WHERE h.graph_name = g.name
+                              AND (h.expires_at IS NULL OR h.expires_at > datetime('now'))
+                        ) THEN 1 ELSE 0 END,
+                        COALESCE((SELECT SUM(length(ev.event_json)) FROM events ev
+                                  WHERE ev.run_id IN (SELECT x.run_id FROM executions x WHERE x.graph_name = g.name)), 0)
+                      + COALESCE((SELECT SUM(length(cp.output_json)) FROM checkpoints cp
+                                  WHERE cp.run_id IN (SELECT x.run_id FROM executions x WHERE x.graph_name = g.name)), 0)
+                      + COALESCE((SELECT SUM(length(tr.receipt_json)) FROM terminal_receipts tr
+                                  WHERE tr.run_id IN (SELECT x.run_id FROM executions x WHERE x.graph_name = g.name)), 0)
+                 FROM graphs g
+                 LEFT JOIN graph_retention r ON r.graph_name = g.name
+                 LEFT JOIN executions e ON e.graph_name = g.name
+                 WHERE g.name NOT IN (SELECT graph_name FROM graph_tombstones)
+                 GROUP BY g.name",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(crate::gc::GcCandidateRow {
+                    graph: row.get(0)?,
+                    state: row.get(1)?,
+                    last_execution_at: row.get(2)?,
+                    execution_count: row.get(3)?,
+                    pinned: row.get::<_, i64>(4)? != 0,
+                    legal_held: row.get::<_, i64>(5)? != 0,
+                    storage_bytes: row.get(6)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| e.to_string())?);
+        }
+        Ok(out)
+    }
+
+    /// D3: run one GC pass. Applies non-destructive transitions through the
+    /// receipt-bearing path, updates `gc_policy.last_run`, returns a summary.
+    pub fn gc_run_policy(&self, now: &str) -> Result<serde_json::Value, String> {
+        let policy = self.gc_policy()?;
+        if !policy.enabled {
+            return Ok(
+                serde_json::json!({"enabled": false, "archived": 0, "expired": 0, "flagged": 0}),
+            );
+        }
+        let candidates = self.gc_candidates()?;
+        let actions = crate::gc::gc_decisions(&candidates, &policy, now);
+        let mut archived = 0i64;
+        let mut expired = 0i64;
+        let mut flagged = 0i64;
+        // Two waves per pass: wave 1 archives idle active graphs, wave 2 (on
+        // refreshed candidates) expires archived graphs past the review window
+        // — so a long-idle graph completes both hops in a single pass.
+        for wave in 0..2 {
+            let wave_rows = if wave == 0 {
+                candidates.clone()
+            } else {
+                self.gc_candidates()?
+            };
+            for action in crate::gc::gc_decisions(&wave_rows, &policy, now) {
+                match action {
+                    crate::gc::GcAction::Archive { graph } => {
+                        if self
+                            .gc_transition(&graph, "archived", "gc: idle past archive policy", now)
+                            .is_ok()
+                        {
+                            archived += 1;
+                        }
+                    }
+                    crate::gc::GcAction::Expire { graph } => {
+                        if self
+                            .gc_transition(
+                                &graph,
+                                "expired_pending_review",
+                                "gc: review window passed",
+                                now,
+                            )
+                            .is_ok()
+                        {
+                            expired += 1;
+                        }
+                    }
+                    crate::gc::GcAction::FlagStorage { graph: _ } => {
+                        flagged += 1;
+                    }
+                }
+            }
+        }
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute("UPDATE gc_policy SET last_run = ?1 WHERE id = 1", [now])
+            .map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({
+            "enabled": true,
+            "archived": archived,
+            "expired": expired,
+            "flagged": flagged,
+            "last_run": now,
+        }))
+    }
+
+    /// B9: operator action — purge one run's lineage child-first within one
+    /// transaction and write an operator receipt (resource_kind 'run').
+    /// Only terminal runs are purgeable; running/checkpointed runs are refused.
+    pub fn purge_run(
+        &self,
+        request: &OperatorRetentionRequest,
+    ) -> Result<OperatorRetentionResult, OperatorRetentionError> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| OperatorRetentionError::Persistence)?;
+        let prior: Option<(String, String)> = conn
+            .query_row(
+                "SELECT request_digest, receipt_id FROM operator_receipts WHERE nonce = ?1",
+                params![request.nonce],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|_| OperatorRetentionError::Persistence)?;
+        if let Some((digest, receipt_id)) = prior {
+            if digest == request.request_digest {
+                return Ok(OperatorRetentionResult::Replayed { receipt_id });
+            }
+            return Err(OperatorRetentionError::NonceReplayed);
+        }
+        let status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM executions WHERE run_id = ?1",
+                params![request.graph_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| OperatorRetentionError::Persistence)?;
+        let Some(status) = status else {
+            return Err(OperatorRetentionError::NotFound);
+        };
+        if !matches!(
+            status.as_str(),
+            "completed"
+                | "failed"
+                | "cancelled"
+                | "interrupted_non_resumable"
+                | "legacy_unverified"
+        ) {
+            return Err(OperatorRetentionError::InvalidState);
+        }
+        let tx = conn
+            .transaction()
+            .map_err(|_| OperatorRetentionError::Persistence)?;
+        for table in [
+            "approval_requests",
+            "checkpoints",
+            "events",
+            "template_outcome_links",
+            "terminal_receipts",
+            "run_publication_state",
+        ] {
+            let sql = format!("DELETE FROM {table} WHERE run_id = ?1");
+            tx.execute(&sql, params![request.graph_id])
+                .map_err(|_| OperatorRetentionError::Persistence)?;
+        }
+        // idempotency_keys have no run_id column; orphans are swept by G9.
+        tx.execute(
+            "DELETE FROM executions WHERE run_id = ?1",
+            params![request.graph_id],
+        )
+        .map_err(|_| OperatorRetentionError::Persistence)?;
+        let action = serde_json::to_string(&request.action)
+            .map_err(|_| OperatorRetentionError::InvalidAction)?;
+        let receipt_id = format!(
+            "operator-{}",
+            request.request_digest.trim_start_matches("sha256:")
+        );
+        tx.execute(
+            "INSERT INTO operator_receipts
+             (receipt_id, request_digest, action, resource_kind, resource_id, state_digest,
+              operator_uid, daemon_instance_id, nonce, issued_at, expires_at)
+             VALUES (?1, ?2, ?3, 'run', ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                receipt_id,
+                request.request_digest,
+                action,
+                request.graph_id,
+                request.expected_state_digest,
+                request.operator_uid,
+                request.daemon_instance_id,
+                request.nonce,
+                request.issued_at,
+                request.expires_at
+            ],
+        )
+        .map_err(|_| OperatorRetentionError::Persistence)?;
+        tx.commit()
+            .map_err(|_| OperatorRetentionError::Persistence)?;
+        Ok(OperatorRetentionResult::Applied { receipt_id })
+    }
+
+    /// B9: list `interrupted_non_resumable` runs for resume-or-purge triage.
+    pub fn list_interrupted_runs(
+        &self,
+        limit: Option<u32>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let limit = (limit.unwrap_or(100) as usize).min(500);
+        let mut stmt = conn
+            .prepare(
+                "SELECT run_id, graph_name, started_at, COALESCE(finished_at, ''),
+                        final_state_json,
+                        EXISTS(SELECT 1 FROM checkpoints c WHERE c.run_id = executions.run_id)
+                 FROM executions
+                 WHERE status = 'interrupted_non_resumable'
+                 ORDER BY started_at DESC LIMIT ?1",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| {
+                let final_state: Option<String> = row.get(4)?;
+                let error = final_state
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                    .and_then(|v| v.get("error").cloned())
+                    .and_then(|v| v.as_str().map(str::to_owned));
+                Ok(serde_json::json!({
+                    "run_id": row.get::<_, String>(0)?,
+                    "graph_name": row.get::<_, String>(1)?,
+                    "started_at": row.get::<_, String>(2)?,
+                    "finished_at": row.get::<_, String>(3)?,
+                    "error": error,
+                    "has_checkpoint": row.get::<_, i64>(5)? != 0,
+                }))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| e.to_string())?);
+        }
+        Ok(out)
     }
 
     /// True when an unexpired legal hold exists for the graph.
@@ -3741,5 +4118,180 @@ mod tests {
             .expect("tombstone");
         assert_eq!(store.count_live_graphs().expect("count"), 1);
         drop(temp);
+    }
+
+    #[test]
+    fn gc_transition_archives_and_receipts_actor_gc() {
+        let (_temp, store) = open_store_with_daemon_schema();
+        store.save_graph("gc-me", "{}", "v1", false).expect("graph");
+        let now = "2026-08-19T00:00:00Z";
+        store
+            .gc_transition("gc-me", "archived", "gc test", now)
+            .expect("gc archive");
+        let state: String = store
+            .conn
+            .lock()
+            .expect("conn")
+            .query_row(
+                "SELECT state FROM graph_retention WHERE graph_name = 'gc-me'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("state");
+        assert_eq!(state, "archived");
+        // Receipt recorded with the GC actor.
+        let actor: String = store
+            .conn
+            .lock()
+            .expect("conn")
+            .query_row(
+                "SELECT actor FROM graph_retention WHERE graph_name = 'gc-me'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("actor");
+        assert_eq!(actor, "gc");
+        // Destructive transitions are refused by gc_transition.
+        assert!(store
+            .gc_transition("gc-me", "purged", "must fail", now)
+            .is_err());
+    }
+
+    #[test]
+    fn gc_run_policy_applies_thresholds() {
+        let (_temp, store) = open_store_with_daemon_schema();
+        store
+            .save_graph("old-idle", "{}", "v1", false)
+            .expect("graph");
+        store
+            .conn
+            .lock()
+            .expect("conn")
+            .execute(
+                "INSERT INTO executions (run_id, graph_name, graph_hash, status, input_json, started_at, finished_at)
+                 VALUES ('run-old', 'old-idle', 'v1', 'completed', '{}', '2026-05-01 00:00:00', '2026-05-01 00:01:00')",
+                [],
+            )
+            .expect("old execution");
+        store
+            .gc_run_policy("2026-08-19T00:00:00Z")
+            .expect("gc pass");
+        let state: String = store
+            .conn
+            .lock()
+            .expect("conn")
+            .query_row(
+                "SELECT state FROM graph_retention WHERE graph_name = 'old-idle'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("state");
+        // 110 days idle > 60d review window -> archived then expired_pending_review.
+        assert_eq!(state, "expired_pending_review");
+        let last_run: Option<String> = store
+            .conn
+            .lock()
+            .expect("conn")
+            .query_row("SELECT last_run FROM gc_policy WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .expect("last_run");
+        assert!(last_run.is_some());
+    }
+
+    #[test]
+    fn purge_run_deletes_lineage_with_receipt() {
+        let (_temp, store) = open_store_with_daemon_schema();
+        store
+            .save_graph("purge-run-g", "{}", "v1", false)
+            .expect("graph");
+        store
+            .conn
+            .lock()
+            .expect("conn")
+            .execute(
+                "INSERT INTO executions (run_id, graph_name, graph_hash, status, input_json, started_at)
+                 VALUES ('run-dead', 'purge-run-g', 'v1', 'interrupted_non_resumable', '{}', '2026-08-01 00:00:00')",
+                [],
+            )
+            .expect("run");
+        store
+            .conn
+            .lock()
+            .expect("conn")
+            .execute(
+                "INSERT INTO events (run_id, seq, event_type, event_json) VALUES ('run-dead', 1, 'NodeStart', '{}')",
+                [],
+            )
+            .expect("event");
+        let request = OperatorRetentionRequest {
+            request_digest: "sha256:purge-run-req".into(),
+            action: OperatorAction::PurgeRun,
+            graph_id: "run-dead".into(),
+            expected_state_digest: "sha256:state".into(),
+            nonce: "purge-run-nonce-1".into(),
+            operator_uid: 4242,
+            daemon_instance_id: "unit-test".into(),
+            issued_at: "2026-08-19T00:00:00Z".into(),
+            expires_at: "2026-08-19T00:01:00Z".into(),
+            state: None,
+            reason: Some("test purge".into()),
+            review_after: None,
+        };
+        store.purge_run(&request).expect("purge run");
+        let executions: i64 = store
+            .conn
+            .lock()
+            .expect("conn")
+            .query_row(
+                "SELECT COUNT(*) FROM executions WHERE run_id = 'run-dead'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("exec count");
+        assert_eq!(executions, 0);
+        let events: i64 = store
+            .conn
+            .lock()
+            .expect("conn")
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE run_id = 'run-dead'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("event count");
+        assert_eq!(events, 0);
+        // Replay-safe: same request returns the same receipt without re-deleting.
+        let replay = store.purge_run(&request).expect("replay");
+        assert!(matches!(replay, OperatorRetentionResult::Replayed { .. }));
+        // Running runs are refused.
+        store
+            .conn
+            .lock()
+            .expect("conn")
+            .execute(
+                "INSERT INTO executions (run_id, graph_name, graph_hash, status, input_json, started_at)
+                 VALUES ('run-live', 'purge-run-g', 'v1', 'running', '{}', '2026-08-19 00:00:00')",
+                [],
+            )
+            .expect("live run");
+        let live = OperatorRetentionRequest {
+            request_digest: "sha256:live-req".into(),
+            action: OperatorAction::PurgeRun,
+            graph_id: "run-live".into(),
+            expected_state_digest: "sha256:state".into(),
+            nonce: "purge-run-nonce-2".into(),
+            operator_uid: 4242,
+            daemon_instance_id: "unit-test".into(),
+            issued_at: "2026-08-19T00:00:00Z".into(),
+            expires_at: "2026-08-19T00:01:00Z".into(),
+            state: None,
+            reason: None,
+            review_after: None,
+        };
+        assert!(matches!(
+            store.purge_run(&live),
+            Err(OperatorRetentionError::InvalidState)
+        ));
     }
 }

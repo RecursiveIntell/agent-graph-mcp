@@ -13,6 +13,8 @@ pub enum OperatorAction {
     ApproveGraphDeletion,
     ClearExecutionLineage,
     PurgeGraph,
+    /// B9: purge one run's lineage (resource_kind "run").
+    PurgeRun,
     PromoteTemplate,
     Migrate,
     Install,
