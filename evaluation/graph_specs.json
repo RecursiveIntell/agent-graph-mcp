@@ -1,0 +1,35 @@
+{
+  "schema": "recursiveintell.proof-graph-specs.v1",
+  "baseline": {
+    "spec_version": "2",
+    "name": "proof-baseline",
+    "entry": "answer",
+    "output_key": "answer",
+    "nodes": [
+      {"id": "answer", "type": "llm", "prompt": "Answer the held-out task rigorously. Separate observed facts, inferences, unknowns, risks, and the exact next verification. Task input: {input}", "config": {"input_key": "__input__", "output_key": "answer", "timeout_ms": 120000}}
+    ],
+    "edges": [{"from": "answer", "to": "END"}]
+  },
+  "candidate": {
+    "spec_version": "2",
+    "name": "proof-governed-candidate",
+    "entry": "fanout",
+    "output_key": "final",
+    "max_parallelism": 3,
+    "nodes": [
+      {"id": "fanout", "type": "parallel", "config": {"branches": [{"id": "risk", "entry": "risk"}, {"id": "evidence", "entry": "evidence"}, {"id": "adversary", "entry": "adversary"}], "join": "dissent", "max_parallelism": 3}},
+      {"id": "risk", "type": "llm", "prompt": "Act as the risk auditor. Identify concrete hazards, blockers, and rollback requirements for this task. Return a structured concise report with scope, claims, evidence, and uncertainty. Task: {input}", "config": {"input_key": "__input__", "output_key": "risk", "timeout_ms": 120000}},
+      {"id": "evidence", "type": "llm", "prompt": "Act as the evidence auditor. Distinguish observed, verified, inferred, proposed, and unknown material. State missing proof and an executable verification sequence. Task: {input}", "config": {"input_key": "__input__", "output_key": "evidence", "timeout_ms": 120000}},
+      {"id": "adversary", "type": "llm", "prompt": "Act as a hostile reviewer. Try to falsify the apparent answer, find contradictions, and preserve a minority position when warranted. Task: {input}", "config": {"input_key": "__input__", "output_key": "adversary", "timeout_ms": 120000}},
+      {"id": "contradictions", "type": "join", "config": {"inputs": ["risk", "evidence", "adversary"], "output": "contradictions", "mode": "contradiction_matrix", "scope_path": "scope", "claim_path": "claim", "time_path": "time"}},
+      {"id": "dissent", "type": "join", "config": {"inputs": ["risk", "evidence", "adversary"], "output": "dissent", "mode": "minority_report", "dissent_path": "dissent"}},
+      {"id": "synthesis", "type": "llm", "prompt": "Synthesize a decision-grade answer. Preserve contradictions and minority dissent instead of averaging it away. Include verdict, evidence ledger, risks, exact acceptance gates, rollback, and unresolved unknowns. Analyst reports: {dissent}. Contradiction matrix: {contradictions}", "config": {"input_key": "dissent", "output_key": "final", "timeout_ms": 120000}}
+    ],
+    "edges": [
+      {"from": "fanout", "to": "risk"}, {"from": "fanout", "to": "evidence"}, {"from": "fanout", "to": "adversary"},
+      {"from": "risk", "to": "contradictions"}, {"from": "evidence", "to": "contradictions"}, {"from": "adversary", "to": "contradictions"},
+      {"from": "risk", "to": "dissent"}, {"from": "evidence", "to": "dissent"}, {"from": "adversary", "to": "dissent"},
+      {"from": "contradictions", "to": "synthesis"}, {"from": "dissent", "to": "synthesis"}, {"from": "synthesis", "to": "END"}
+    ]
+  }
+}

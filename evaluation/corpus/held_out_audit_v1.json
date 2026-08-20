@@ -1,0 +1,71 @@
+{
+  "schema": "recursiveintell.held-out-corpus.v1",
+  "purpose": "Gate-16 held-out audit tasks: dual-join council (candidate) vs single-agent collect (baseline). Fixed tasks; no topology-specific leakage.",
+  "tasks": [
+    {
+      "id": "t1",
+      "task": "Verify the rollback safety of this migration plan: Phase 1 installs tooling on the live host; Phase 2 rsyncs /var while the old system keeps writing; Phase 3 deletes /var/old after rsync exit 0; Phase 4 reboots into the new kernel.",
+      "task_profile": {"goal_type": "verify", "effect_class": "read_only", "risk": "high", "verifiability": "executable", "evidence_distribution": "central"},
+      "acceptance_criteria": [
+        "Identifies the no-quiesce copy hazard in Phase 2",
+        "Flags deletion of /var/old without backup as P0",
+        "Requires a verification step before deletion"
+      ],
+      "denial_criteria": ["Approves deletion without verification", "Missing the live-write inconsistency"]
+    },
+    {
+      "id": "t2",
+      "task": "Check whether this release claim is supported: 'the nightly memory projection rebuild has never run successfully in production, so retrieval may serve stale vectors.' Evidence available: ledger schema shipped in v0.5; rebuild job scheduled but no successful run recorded.",
+      "task_profile": {"goal_type": "verify", "effect_class": "read_only", "risk": "medium", "verifiability": "rubric", "evidence_distribution": "partitioned"},
+      "acceptance_criteria": [
+        "Separates verified facts from inferred risk",
+        "States the staleness consequence explicitly",
+        "Flags what evidence is missing"
+      ],
+      "denial_criteria": ["Treating inference as verified fact", "Ignoring the missing-success-run evidence"]
+    },
+    {
+      "id": "t3",
+      "task": "Find contradictions in this design: 'the ledger is the only source of truth' AND 'retrieval serves from a nightly-rebuilt projection that may lag 24 hours and real-time consistency is out of scope.'",
+      "task_profile": {"goal_type": "discover", "effect_class": "read_only", "risk": "high", "verifiability": "rubric", "evidence_distribution": "contested"},
+      "acceptance_criteria": [
+        "Names the consistency contradiction explicitly",
+        "Assigns a resolution direction (projection is not authority)"
+      ],
+      "denial_criteria": ["Declaring both claims compatible without scope analysis"]
+    },
+    {
+      "id": "t4",
+      "task": "Triage this crash: app crashes on settings page on Fedora 44, 100% reproducible, no error dialog, Wayland session.",
+      "task_profile": {"goal_type": "discover", "effect_class": "read_only", "risk": "medium", "verifiability": "rubric", "evidence_distribution": "central"},
+      "acceptance_criteria": [
+        "Produces a discriminating test (theme/backend/segfault)",
+        "Gives a concrete diagnostic command",
+        "Ranks hypotheses by likelihood"
+      ],
+      "denial_criteria": ["One speculative fix without diagnosis", "No reproduction command"]
+    },
+    {
+      "id": "t5",
+      "task": "Audit release-gate compliance for: clean tree, 84 tests passing, 5 pre-existing clippy warnings, README claims 'production-ready' with no certification receipt.",
+      "task_profile": {"goal_type": "verify", "effect_class": "read_only", "risk": "medium", "verifiability": "executable", "evidence_distribution": "known"},
+      "acceptance_criteria": [
+        "Blocks release on the unsupported production-ready claim",
+        "Separates pre-existing warnings from blockers",
+        "States the re-run sequence"
+      ],
+      "denial_criteria": ["Releasing while the claim is unsupported", "Counting warnings as release blockers"]
+    },
+    {
+      "id": "t6",
+      "task": "Assess ROI of swapping a crate into Hermes internals: integration_difficulty high, speed gain ~15%, but the crate is unmaintained for 8 months.",
+      "task_profile": {"goal_type": "decide", "effect_class": "read_only", "risk": "medium", "verifiability": "rubric", "evidence_distribution": "partitioned"},
+      "acceptance_criteria": [
+        "Weighs maintenance risk against the speed gain",
+        "Recommends a falsifying experiment before commitment",
+        "States the decision owner"
+      ],
+      "denial_criteria": ["Score-blending without risk framing", "Recommending a swap without a pilot"]
+    }
+  ]
+}

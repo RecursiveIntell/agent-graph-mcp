@@ -1,0 +1,34 @@
+{
+  "schema": "recursiveintell.no-graphs-closeout.v1",
+  "status": "offline-implementation-verified",
+  "evidence_class": "synthetic_fixture_only",
+  "graph_calls": 0,
+  "provider_calls": 0,
+  "implementation": {
+    "contracts": "verified",
+    "deterministic_adjudication": "verified",
+    "paired_comparison": "verified",
+    "raw_envelope_preservation": "verified",
+    "offline_replay": "verified"
+  },
+  "gates": {
+    "python_tests": {"status": "pass", "command": "uv run --no-project --with pytest pytest -q evaluation/tests", "result": "15 passed"},
+    "offline_matrix": {"status": "pass", "envelopes": 36, "paired_tasks": 6, "verdict": "PROMOTE", "qualification": "synthetic-only"},
+    "replay": {"status": "pass", "valid": true},
+    "live_graph_execution": {"status": "blocked-by-user-constraint", "result": "not run"},
+    "provider_quality_measurement": {"status": "blocked-by-user-constraint", "result": "not run"},
+    "rust_release_gate": {"status": "not-release-certified", "reason": "offline scope does not authorize unrelated live/source release closure"}
+  },
+  "rollback": {
+    "worktree": "/home/sikmindz/Coding/agent-graph-mcp-proof-v1",
+    "branch": "proof/governed-agent-reliability-v1",
+    "action": "Remove this uncommitted worktree/branch only after preserving or discarding its evidence by explicit decision; canonical checkout remains separate."
+  },
+  "remaining_delta": [
+    "Real baseline and governed runs",
+    "Durable graph/run/node/attempt receipts",
+    "Independent external adjudication",
+    "Offline replay of real receipts",
+    "Second reproduction and evidence-safe outreach"
+  ]
+}
