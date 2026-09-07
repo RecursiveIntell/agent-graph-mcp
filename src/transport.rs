@@ -65,16 +65,26 @@ pub async fn write_frame_async<W: AsyncWrite + Unpin>(
 /// deployment hazard (silent protocol failure / relay restart loop).
 pub const PROTOCOL_VERSION: u64 = 1;
 
+/// Return the build identity shared by the proxy and daemon binaries.
+pub fn build_identity() -> serde_json::Value {
+    serde_json::json!({
+        "crate_version": env!("CARGO_PKG_VERSION"),
+        "source_revision": env!("AGENT_GRAPH_BUILD_GIT_SHA"),
+        "git_dirty": env!("AGENT_GRAPH_BUILD_GIT_DIRTY"),
+        "source_content_sha256": env!("AGENT_GRAPH_BUILD_SOURCE_SHA256"),
+        "source_scope": "build.rs,Cargo.toml,Cargo.lock(if present),src/**",
+        "identity_policy": "observable_build_identity; protocol_version_controls_compatibility; deployment_manifest_controls_artifact_admission",
+        "cargo_lock_sha256": env!("AGENT_GRAPH_BUILD_LOCK_SHA256"),
+    })
+}
+
 /// Build the proxy's hello frame (sent as the first frame of a connection).
 pub fn hello_frame() -> Vec<u8> {
-    serde_json::json!({
-        "hello": {
-            "protocol_version": PROTOCOL_VERSION,
-            "crate_version": env!("CARGO_PKG_VERSION"),
-        }
-    })
-    .to_string()
-    .into_bytes()
+    let mut build = build_identity();
+    if let Some(object) = build.as_object_mut() {
+        object.insert("protocol_version".into(), PROTOCOL_VERSION.into());
+    }
+    serde_json::json!({"hello": build}).to_string().into_bytes()
 }
 
 /// Proxy side: interpret the daemon's hello reply. Ok(()) means versions agree;
@@ -82,7 +92,14 @@ pub fn hello_frame() -> Vec<u8> {
 pub fn parse_hello_response(bytes: &[u8]) -> Result<(), String> {
     let v: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|e| format!("not a hello response: {e}"))?;
-    if v.get("hello").is_some() {
+    if let Some(hello) = v.get("hello") {
+        if hello
+            .get("protocol_version")
+            .and_then(|value| value.as_u64())
+            != Some(PROTOCOL_VERSION)
+        {
+            return Err("daemon protocol version does not match proxy".into());
+        }
         Ok(())
     } else if let Some(err) = v.get("hello_error") {
         Err(format!("daemon rejected handshake: {err}"))
@@ -95,8 +112,8 @@ pub fn parse_hello_response(bytes: &[u8]) -> Result<(), String> {
 /// - `None`: not a hello (legacy client) — the caller must forward the frame
 ///   into the MCP bridge unchanged.
 /// - `Some(Ok(reply))`: valid hello — caller sends `reply` and proceeds.
-/// - `Some(Err(reason))`: version mismatch — caller sends a hello_error frame
-///   and drops the connection (fail fast instead of silent protocol failure).
+/// - `Some(Err(reason))`: protocol mismatch — caller sends a hello_error
+///   frame and drops the connection (fail fast instead of silent protocol failure).
 pub fn interpret_hello(frame: &[u8]) -> Option<Result<Vec<u8>, String>> {
     let v: serde_json::Value = serde_json::from_slice(frame).ok()?;
     let hello = v.get("hello")?;
@@ -104,23 +121,28 @@ pub fn interpret_hello(frame: &[u8]) -> Option<Result<Vec<u8>, String>> {
         .get("protocol_version")
         .and_then(|x| x.as_u64())
         .unwrap_or(0);
-    if proto != PROTOCOL_VERSION {
+    let mismatch_reason = if proto != PROTOCOL_VERSION {
+        Some("PROTOCOL_VERSION_MISMATCH")
+    } else {
+        None
+    };
+    if let Some(reason) = mismatch_reason {
         let err = serde_json::json!({
             "hello_error": {
                 "protocol_version": PROTOCOL_VERSION,
-                "crate_version": env!("CARGO_PKG_VERSION"),
-                "reason": "PROTOCOL_VERSION_MISMATCH",
+                "build": build_identity(),
+                "reason": reason,
             }
         });
         return Some(Err(err.to_string()));
     }
-    let reply = serde_json::json!({
-        "hello": {
-            "protocol_version": PROTOCOL_VERSION,
-            "crate_version": env!("CARGO_PKG_VERSION"),
-        }
-    });
-    Some(Ok(reply.to_string().into_bytes()))
+    let mut reply = build_identity();
+    if let Some(object) = reply.as_object_mut() {
+        object.insert("protocol_version".into(), PROTOCOL_VERSION.into());
+    }
+    Some(Ok(serde_json::json!({"hello": reply})
+        .to_string()
+        .into_bytes()))
 }
 
 #[cfg(test)]
@@ -161,6 +183,49 @@ mod tests {
             }
             other => panic!("expected Some(Err), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_identity_is_observable_without_changing_protocol_compatibility() {
+        let bad = serde_json::json!({
+            "hello": {
+                "protocol_version": PROTOCOL_VERSION,
+                "crate_version": env!("CARGO_PKG_VERSION"),
+                "source_revision": "different-source",
+                "cargo_lock_sha256": env!("AGENT_GRAPH_BUILD_LOCK_SHA256"),
+            }
+        })
+        .to_string()
+        .into_bytes();
+        match interpret_hello(&bad) {
+            Some(Ok(reply)) => {
+                let response: serde_json::Value = serde_json::from_slice(&reply).unwrap();
+                assert_ne!(response["hello"]["source_revision"], "different-source");
+                assert!(parse_hello_response(&reply).is_ok());
+                assert!(parse_hello_response(&bad).is_ok());
+            }
+            other => panic!("expected compatible protocol with observable identity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_content_digest_is_present() {
+        let build = build_identity();
+        let digest = build["source_content_sha256"].as_str().unwrap_or("");
+        assert!(digest.starts_with("sha256:"));
+        assert_eq!(digest.len(), 71);
+    }
+
+    #[test]
+    fn proxy_rejects_wrong_protocol_even_when_build_matches() {
+        let mut response: serde_json::Value = serde_json::from_slice(&hello_frame()).unwrap();
+        response["hello"]["protocol_version"] = 999.into();
+        assert!(parse_hello_response(response.to_string().as_bytes()).is_err());
+        response["hello"]
+            .as_object_mut()
+            .unwrap()
+            .remove("protocol_version");
+        assert!(parse_hello_response(response.to_string().as_bytes()).is_err());
     }
 
     #[test]

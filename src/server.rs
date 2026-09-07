@@ -1118,6 +1118,7 @@ impl AgentGraphServer {
                 "total_execution_count": run_ids.len(),
                 "base_url": self.safe_provider_label(),
                 "default_model": self.default_model,
+                "build": crate::transport::build_identity(),
                 "provider": self.provider_health.as_json(),
                 "storage_class": if self.store.is_none() {
                     "process_local"
@@ -2634,7 +2635,7 @@ impl AgentGraphServer {
 #[tool_handler(
     router = self.tool_router,
     name = "agent-graph-mcp",
-    version = "0.2.0",
+    version = "0.3.0",
     instructions = "Graph orchestration for bounded multi-step LLM workflows with parallel fan-out, conditional routing, state transforms, joins, cooperative cancellation, and optional enforced max_wall_clock_ms/max_nodes/max_llm_calls run budgets (max_llm_calls reserves each provider attempt before invocation; failed or timed-out attempts still count). Parallel unordered state writes require an explicit reducer. Cancellation can drop the local provider future on request, best effort; an underlying provider request may continue. Optional SQLite stores terminal projections plus explicit pre-execution checkpoints. Durable checkpoints, approvals, terminal receipts, and source witnesses require an external key file named by AGENT_GRAPH_INTEGRITY_KEY_PATH; without it their operations fail closed with INTEGRITY_KEY_REQUIRED. Deterministic local resume is limited to linear passthrough/state_transform chains and is never generic replay; uncheckpointed or ineligible runs remain interrupted_non_resumable after restart. SQLite-backed approvals can decide only an immutable deterministic-local checkpoint and resume that checkpoint; HumanApproval nodes and arbitrary external actions remain unsupported. Source witnesses are caller-supplied local captures: locators are never fetched, HMAC-authenticated witness integrity and bounded evidence spans are checked against SQLite, and source authority is not independently verified. Receipts provide integrity_only except a successfully resumed deterministic-local path, which reports deterministic_local_resume. Define graphs with graph_create, execute with graph_execute or graph_run_start, checkpoint with checkpoint:true, inspect with graph_run_get/wait/cancel/state/events/receipt/checkpoint, request or decide checkpoint approvals with graph_approval_request/decide, and resume with graph_run_resume."
 )]
 impl ServerHandler for AgentGraphServer {}

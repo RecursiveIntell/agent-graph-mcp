@@ -13,8 +13,8 @@ keywords = ["mcp", "agent", "graph", "workflow", "orchestration"]
 categories = ["development-tools", "asynchronous"]
 
 [dependencies]
-ri-agent-graph = "0.2"
-llm-pipeline = { version = "0.2", features = ["openai"] }
+ri-agent-graph = "=0.2.4"
+llm-pipeline = { version = "=0.2.1", features = ["openai"] }
 llm-tool-runtime = "0.1"
 async-trait = "0.1"
 rmcp = { version = "1", features = ["server", "transport-io"] }
@@ -31,7 +31,7 @@ fs2 = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-provekv = { path = "../../proveKV/proveKV", optional = true }
+provekv = { git = "https://github.com/RecursiveIntell/proveKV.git", rev = "8dd2bd4ce6ee9c2247f47823151b185a5c5511b9", optional = true }
 blake3 = { version = "1", optional = true }
 rand = { version = "0.8", optional = true }
 regex = "1.11"
@@ -45,6 +45,9 @@ provekv = ["dep:provekv", "dep:blake3", "dep:rand"]
 [dev-dependencies]
 tempfile = "3"
 
+[build-dependencies]
+sha2 = "0.10"
+
 [[bin]]
 name = "agent-graph-mcp"
 path = "src/main.rs"
@@ -53,8 +56,15 @@ path = "src/main.rs"
 name = "agent-graph-mcpd"
 path = "src/bin/agent-graph-mcpd.rs"
 
-[patch.crates-io]
-ri-agent-graph = { path = "vendor/ri-agent-graph" }
-llm-pipeline = { path = "../Libraries/llm-pipeline" }
+# Startup hashes the actual executable before opening the listener. Optimize the
+# SHA implementation in debug builds too; otherwise large debug images exhaust
+# bounded concurrent-startup tests doing unoptimized compression rounds.
+[profile.dev.package.sha2]
+opt-level = 3
 
+# Dependency-owned patches are not inherited. Admit both reviewed simba versions
+# explicitly at the exact same source revision as provekv.
+[patch.crates-io]
+simba08 = { package = "simba", version = "=0.8.1", git = "https://github.com/RecursiveIntell/proveKV.git", rev = "8dd2bd4ce6ee9c2247f47823151b185a5c5511b9" }
+simba09 = { package = "simba", version = "=0.9.1", git = "https://github.com/RecursiveIntell/proveKV.git", rev = "8dd2bd4ce6ee9c2247f47823151b185a5c5511b9" }
 

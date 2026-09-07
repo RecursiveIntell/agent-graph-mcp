@@ -2,9 +2,10 @@
 use crate::migrations;
 use fs2::FileExt;
 use rusqlite::{Connection, OptionalExtension};
+use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
-    io,
+    io::{self, Read},
     os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -88,11 +89,35 @@ pub struct DaemonIdentity {
     pub instance_id: String,
     pub generation: i64,
     pub pid: u32,
+    pub executable_digest: String,
     pub started_at: String,
+}
+
+/// Hash the exact executable image selected for daemon startup.
+pub fn current_executable_digest() -> Result<String, DaemonError> {
+    let mut file = File::open(std::env::current_exe()?)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
 }
 
 #[allow(dead_code)]
 pub fn identity(conn: &Connection) -> rusqlite::Result<DaemonIdentity> {
+    identity_with_digest(conn, "unverified:test-only")
+}
+
+/// Persist the daemon instance with its observed executable-image digest.
+pub fn identity_with_digest(
+    conn: &Connection,
+    executable_digest: &str,
+) -> rusqlite::Result<DaemonIdentity> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let now = SystemTime::now()
@@ -112,13 +137,20 @@ pub fn identity(conn: &Connection) -> rusqlite::Result<DaemonIdentity> {
     )?;
     let started_at = now.to_string();
     conn.execute(
-        "INSERT INTO daemon_instances(instance_id,generation,pid,started_at,heartbeat_at) VALUES (?1,?2,?3,?4,?4)",
-        rusqlite::params![instance_id, generation, std::process::id(), started_at],
+        "INSERT INTO daemon_instances(instance_id,generation,pid,executable_digest,started_at,heartbeat_at) VALUES (?1,?2,?3,?4,?5,?5)",
+        rusqlite::params![
+            instance_id,
+            generation,
+            std::process::id(),
+            executable_digest,
+            started_at
+        ],
     )?;
     Ok(DaemonIdentity {
         instance_id,
         generation,
         pid: std::process::id(),
+        executable_digest: executable_digest.to_string(),
         started_at,
     })
 }

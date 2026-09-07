@@ -17,7 +17,7 @@ use agent_graph_mcp::operator_ipc::{OperatorFrame, OperatorResponse, PROTOCOL};
 use chrono::{Duration, Utc};
 use std::{
     env,
-    io::{self, BufRead, Read, Write},
+    io::{self, Read, Write},
     os::unix::net::UnixStream,
     path::PathBuf,
 };

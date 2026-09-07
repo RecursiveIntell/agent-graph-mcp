@@ -12,6 +12,7 @@ use std::sync::Mutex;
 #[derive(Debug, Clone)]
 pub struct ProviderHealth {
     healthy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    indeterminate: std::sync::Arc<std::sync::atomic::AtomicBool>,
     consecutive_failures: std::sync::Arc<AtomicU64>,
     last_check_ms: std::sync::Arc<AtomicU64>,
     last_error: std::sync::Arc<Mutex<Option<String>>>,
@@ -27,6 +28,7 @@ impl ProviderHealth {
     pub fn new() -> Self {
         Self {
             healthy: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            indeterminate: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             consecutive_failures: std::sync::Arc::new(AtomicU64::new(0)),
             last_check_ms: std::sync::Arc::new(AtomicU64::new(0)),
             last_error: std::sync::Arc::new(Mutex::new(None)),
@@ -35,6 +37,7 @@ impl ProviderHealth {
 
     pub fn record_success(&self) {
         self.healthy.store(true, Ordering::SeqCst);
+        self.indeterminate.store(false, Ordering::SeqCst);
         self.consecutive_failures.store(0, Ordering::SeqCst);
         self.last_check_ms.store(now_ms(), Ordering::SeqCst);
         if let Ok(mut err) = self.last_error.lock() {
@@ -44,6 +47,7 @@ impl ProviderHealth {
 
     pub fn record_failure(&self, error: impl Into<String>) {
         self.healthy.store(false, Ordering::SeqCst);
+        self.indeterminate.store(false, Ordering::SeqCst);
         self.consecutive_failures.fetch_add(1, Ordering::SeqCst);
         self.last_check_ms.store(now_ms(), Ordering::SeqCst);
         if let Ok(mut err) = self.last_error.lock() {
@@ -51,16 +55,30 @@ impl ProviderHealth {
         }
     }
 
+    /// Mark the provider path as not probeable by this health mechanism.
+    /// This is distinct from a failed provider transport.
+    pub fn record_unknown(&self, reason: impl Into<String>) {
+        self.healthy.store(false, Ordering::SeqCst);
+        self.indeterminate.store(true, Ordering::SeqCst);
+        self.last_check_ms.store(now_ms(), Ordering::SeqCst);
+        if let Ok(mut err) = self.last_error.lock() {
+            *err = Some(reason.into());
+        }
+    }
+
     /// JSON surface for `graph_status`. `total_failures` is optional context
     /// from callers that observe run-level provider failures.
     pub fn as_json(&self) -> serde_json::Value {
         let last_error = self.last_error.lock().ok().and_then(|e| e.clone());
+        let indeterminate = self.indeterminate.load(Ordering::SeqCst);
+        let healthy = self.healthy.load(Ordering::SeqCst);
         serde_json::json!({
-            "healthy": self.healthy.load(Ordering::SeqCst),
+            "healthy": if indeterminate { serde_json::Value::Null } else { serde_json::json!(healthy) },
+            "health_state": if indeterminate { "unknown" } else if healthy { "healthy" } else { "failed" },
             "consecutive_failures": self.consecutive_failures.load(Ordering::SeqCst),
             "last_check_ms": self.last_check_ms.load(Ordering::SeqCst),
             "last_error": last_error,
-            "probe": "tcp_connect_plus_http_get",
+            "probe": if indeterminate { "not_applicable_for_transport" } else { "tcp_connect_plus_http_get" },
             "failover": "not_configured_v1",
         })
     }
@@ -156,5 +174,17 @@ mod tests {
         assert!(j2["healthy"].as_bool().unwrap());
         assert_eq!(j2["consecutive_failures"].as_u64().unwrap(), 0);
         assert!(j2["last_error"].is_null());
+    }
+
+    #[test]
+    fn unsupported_probe_is_unknown_not_failed() {
+        let h = ProviderHealth::new();
+        h.record_unknown("not applicable for codex transport");
+        let j = h.as_json();
+        assert!(j["healthy"].is_null());
+        assert_eq!(j["health_state"].as_str(), Some("unknown"));
+        assert_eq!(j["probe"].as_str(), Some("not_applicable_for_transport"));
+        h.record_success();
+        assert!(h.as_json()["healthy"].as_bool().unwrap());
     }
 }

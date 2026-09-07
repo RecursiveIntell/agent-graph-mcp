@@ -46,6 +46,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => return Err("unknown daemon argument".into()),
         }
     }
+    max_graphs =
+        agent_graph_mcp::spec::validate_max_graphs(max_graphs).map_err(std::io::Error::other)?;
     std::fs::create_dir_all(&data)?;
     // B1: key out of argv — explicit flag wins (deprecated), else env var.
     let api_key = daemon::resolve_api_key(api_key, std::env::var("AGENT_GRAPH_API_KEY").ok());
@@ -57,10 +59,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         key_path.as_deref(),
     )
     .map_err(std::io::Error::other)?;
-    let (_lock, conn) = daemon::open_owned(&data, "daemon")?;
+    let executable_digest = daemon::current_executable_digest()?;
+    let (_lock, conn) = daemon::open_owned(&data, &executable_digest)?;
     daemon::enforce_startup_mode(&conn, key_path.is_some())
         .map_err(|e| format!("daemon startup rejected: {e}"))?;
-    let id = daemon::identity(&conn)?;
+    let id = daemon::identity_with_digest(&conn, &executable_digest)?;
     let _ = daemon::recover_owned_state(&conn, &id.instance_id, id.generation)?;
     drop(conn);
     let rt = tokio::runtime::Runtime::new()?;
@@ -90,6 +93,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let status = serde_json::json!({
                         "daemon_pid": std::process::id(),
                         "version": env!("CARGO_PKG_VERSION"),
+                        "build": agent_graph_mcp::transport::build_identity(),
+                        "executable_digest": executable_digest,
                         "started_at": chrono::Utc::now().to_rfc3339(),
                         "mcp_socket": mcp_socket.to_string_lossy(),
                         "operator_socket": op_socket.to_string_lossy(),
@@ -115,31 +120,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let probe_store = store.clone();
                 let probe_mcp = socket.clone();
                 let probe_op = operator_socket.clone();
+                let probe_executable_digest = executable_digest.clone();
                 tokio::spawn(async move {
                     loop {
-                        let ok = tokio::task::spawn_blocking({
-                            let url = probe_url.clone();
-                            move || {
-                                agent_graph_mcp::provider_health::probe_base_url(&url, 5000).is_ok()
-                            }
-                        })
-                        .await
-                        .unwrap_or(false);
-                        if ok {
-                            health.record_success();
+                        if probe_url.starts_with("codex-app-server://") {
+                            health.record_unknown(
+                                "provider health probe is not applicable to codex-app-server transport",
+                            );
                         } else {
-                            health.record_failure("provider probe failed (tcp/http)");
+                            let result = tokio::task::spawn_blocking({
+                                let url = probe_url.clone();
+                                move || agent_graph_mcp::provider_health::probe_base_url(&url, 5000)
+                            })
+                            .await
+                            .unwrap_or_else(|_| Err("provider probe task failed".into()));
+                            match result {
+                                Ok(()) => health.record_success(),
+                                Err(error) => health.record_failure(error),
+                            }
                         }
                         // Refresh the well-known status file with the probe.
                         let status_store = probe_store.clone();
                         let status_mcp = probe_mcp.clone();
                         let status_op = probe_op.clone();
+                        let status_executable_digest = probe_executable_digest.clone();
                         let _ = tokio::task::spawn_blocking(move || {
                             if let Some(path) = status_mcp.parent() {
                                 let count = status_store.count_live_graphs().unwrap_or(0);
                                 let status = serde_json::json!({
                                     "daemon_pid": std::process::id(),
                                     "version": env!("CARGO_PKG_VERSION"),
+                                    "build": agent_graph_mcp::transport::build_identity(),
+                                    "executable_digest": status_executable_digest,
                                     "mcp_socket": status_mcp.to_string_lossy(),
                                     "operator_socket": status_op.to_string_lossy(),
                                     "graph_count": count,

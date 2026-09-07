@@ -88,6 +88,22 @@ fn daemon_identity_is_unique_and_monotonic() {
 }
 
 #[test]
+fn daemon_identity_persists_executable_digest() {
+    let dir = tempdir().expect("temp dir");
+    let (_lock, conn) = daemon::open_owned(dir.path(), "sha256:fixture").expect("daemon");
+    let id = daemon::identity_with_digest(&conn, "sha256:fixture").expect("identity");
+    let stored: String = conn
+        .query_row(
+            "SELECT executable_digest FROM daemon_instances WHERE instance_id=?1",
+            rusqlite::params![id.instance_id],
+            |row| row.get(0),
+        )
+        .expect("stored digest");
+    assert_eq!(id.executable_digest, "sha256:fixture");
+    assert_eq!(stored, "sha256:fixture");
+}
+
+#[test]
 fn daemon_startup_mode_is_durable_across_restarts() {
     let dir = tempdir().expect("temp dir");
     let (_lock, conn) = daemon::open_owned(dir.path(), "daemon-a").expect("first daemon");
