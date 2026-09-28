@@ -4,7 +4,7 @@
 //! The rmcp macro auto-generates JSON Schema from the parameter structs in tools.rs.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{SecondsFormat, Utc};
@@ -17,6 +17,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 use crate::evidence::{digest, validate_witness_capture, WitnessCapture, WitnessError};
+use crate::run_artifact::{page_verified_artifact, ArtifactPageError};
 use crate::run_manager::{initial_state_for_input, ResumedRun, RunBudgets, RunManager};
 use crate::spec::{
     ensure_size, parse_and_validate, validate_max_graphs, GraphSpec, DEFAULT_MAX_GRAPHS,
@@ -138,6 +139,34 @@ fn checkpoint_error_output(error: CheckpointError) -> Json<StructuredOutput> {
     error_output(error.message(), error.code())
 }
 
+fn compact_run_projection(record: &Value) -> Value {
+    let mut result = serde_json::Map::new();
+    for key in [
+        "run_id",
+        "graph_id",
+        "graph_version",
+        "status",
+        "success",
+        "storage_class",
+        "persistence_status",
+        "budget_counters",
+        "budget_exhausted",
+        "replay_capability",
+    ] {
+        if let Some(value) = record.get(key) {
+            result.insert(key.into(), value.clone());
+        }
+    }
+    if let Some(error_code) = record
+        .get("error_code")
+        .or_else(|| record.pointer("/receipt/error_code"))
+    {
+        result.insert("error_code".into(), error_code.clone());
+    }
+    result.insert("projection".into(), Value::String("compact".into()));
+    Value::Object(result)
+}
+
 fn approval_error_output(error: ApprovalError) -> Json<StructuredOutput> {
     error_output(error.message(), error.code())
 }
@@ -194,6 +223,9 @@ struct RegisteredGraph {
     warnings: Vec<String>,
 }
 
+/// One runtime owner, shared by client connections within the daemon.
+/// Cloning attaches a client; only construction performs startup recovery.
+#[derive(Clone)]
 pub struct AgentGraphServer {
     tool_router: ToolRouter<Self>,
     base_url: String,
@@ -202,8 +234,8 @@ pub struct AgentGraphServer {
     /// header only for the http(s) path; the codex-app-server:// path carries no
     /// auth. Never serialized into status, receipts, or logs.
     api_key: Option<String>,
-    graphs: Mutex<HashMap<String, RegisteredGraph>>,
-    runs: Mutex<RunManager>,
+    graphs: Arc<Mutex<HashMap<String, RegisteredGraph>>>,
+    runs: Arc<Mutex<RunManager>>,
     store: Option<PersistentStore>,
     max_graphs: usize,
     /// B2: shared provider-path health, updated by the daemon probe task and
@@ -293,8 +325,8 @@ impl AgentGraphServer {
             base_url,
             default_model,
             api_key,
-            graphs: Mutex::new(HashMap::new()),
-            runs: Mutex::new(runs),
+            graphs: Arc::new(Mutex::new(HashMap::new())),
+            runs: Arc::new(Mutex::new(runs)),
             store,
             max_graphs,
             tool_router: Self::tool_router(),
@@ -2340,23 +2372,132 @@ impl AgentGraphServer {
         ))
     }
 
-    #[tool(description = "Get current run status, budget usage, and pending approvals.")]
+    #[tool(
+        description = "Get current run status, budget usage, and pending approvals. Set compact=true to return bounded control metadata only."
+    )]
     fn graph_run_get(
         &self,
-        Parameters(RunGetParams { run_id }): Parameters<RunGetParams>,
+        Parameters(RunGetParams { run_id, compact }): Parameters<RunGetParams>,
     ) -> Result<Json<StructuredOutput>, ErrorData> {
         let runs = self
             .runs
             .lock()
             .map_err(|e| internal_error(e.to_string()))?;
         if let Some(r) = runs.get(&run_id) {
-            return Ok(output_with_meta(r.public(), None, None, Some(&run_id)));
+            let record = r.public();
+            let result = if compact {
+                compact_run_projection(&record)
+            } else {
+                record
+            };
+            return Ok(output_with_meta(result, None, None, Some(&run_id)));
         }
         drop(runs);
         if let Some(record) = self.stored_run(&run_id)? {
-            return Ok(output_with_meta(record, None, None, Some(&run_id)));
+            let result = if compact {
+                compact_run_projection(&record)
+            } else {
+                record
+            };
+            return Ok(output_with_meta(result, None, None, Some(&run_id)));
         }
         Err(invalid_params(format!("run '{run_id}' not found")))
+    }
+
+    #[tool(
+        description = "Read bounded pages from a durable, verified terminal receipt, bundle, or declared output."
+    )]
+    fn graph_run_artifact(
+        &self,
+        Parameters(RunArtifactParams {
+            run_id,
+            artifact,
+            offset,
+            limit,
+            expected_digest,
+            expected_artifact_id,
+        }): Parameters<RunArtifactParams>,
+    ) -> Result<Json<StructuredOutput>, ErrorData> {
+        let Some(store) = self.store.as_ref() else {
+            return Ok(error_output(
+                "durable terminal artifact storage is unavailable",
+                "PERSISTENCE_PENDING",
+            ));
+        };
+        let wrapper = match store.load_terminal_receipt(&run_id) {
+            Ok(Some(wrapper)) => wrapper,
+            Ok(None) => {
+                let stored = store
+                    .load_execution(&run_id)
+                    .map_err(|_| internal_error("run lookup failed"))?;
+                let Some(stored) = stored else {
+                    return Ok(error_output("run was not found", "RUN_NOT_FOUND"));
+                };
+                let terminal = matches!(
+                    stored.get("status").and_then(Value::as_str),
+                    Some("completed" | "failed" | "cancelled" | "checkpointed")
+                );
+                return if terminal {
+                    Ok(error_output(
+                        "terminal artifact persistence is pending",
+                        "PERSISTENCE_PENDING",
+                    ))
+                } else {
+                    Ok(error_output("run is not terminal", "RUN_NOT_TERMINAL"))
+                };
+            }
+            Err(error)
+                if matches!(
+                    error.as_str(),
+                    "RECEIPT_INTEGRITY_FAILURE"
+                        | "BUNDLE_INTEGRITY_UNAVAILABLE"
+                        | "BUNDLE_INTEGRITY_FAILURE"
+                        | "BUNDLE_RECEIPT_MISMATCH"
+                        | "INTEGRITY_KEY_REQUIRED"
+                ) =>
+            {
+                return Ok(error_output(
+                    "terminal artifact integrity validation failed",
+                    error,
+                ));
+            }
+            Err(_) => {
+                return Ok(error_output(
+                    "terminal artifact persistence is unavailable",
+                    "PERSISTENCE_PENDING",
+                ))
+            }
+        };
+        match page_verified_artifact(
+            &wrapper,
+            &run_id,
+            artifact,
+            offset,
+            limit,
+            expected_digest.as_deref(),
+            expected_artifact_id.as_deref(),
+        ) {
+            Ok(page) => Ok(output_with_meta(
+                serde_json::to_value(page)
+                    .map_err(|_| internal_error("artifact page serialization failed"))?,
+                None,
+                None,
+                Some(&run_id),
+            )),
+            Err(error) => {
+                let (message, code) = match error {
+                    ArtifactPageError::InvalidLimit => ("limit must be between 1 and 16384", "INVALID_LIMIT"),
+                    ArtifactPageError::InvalidOffset => ("offset must be at an artifact UTF-8 boundary and no greater than total bytes", "INVALID_OFFSET"),
+                    ArtifactPageError::Unavailable => ("requested canonical artifact is unavailable", "ARTIFACT_UNAVAILABLE"),
+                    ArtifactPageError::DigestMismatch => ("expected artifact digest does not match", "ARTIFACT_DIGEST_MISMATCH"),
+                    ArtifactPageError::ArtifactIdentityMismatch => ("expected artifact identity does not match", "ARTIFACT_ID_MISMATCH"),
+                    ArtifactPageError::ContinuationIdentityRequired => ("continuation pages require expected_digest and expected_artifact_id", "ARTIFACT_IDENTITY_REQUIRED"),
+                    ArtifactPageError::LimitTooSmall => ("limit cannot fit the next UTF-8 code point", "LIMIT_TOO_SMALL"),
+                    ArtifactPageError::Serialization => ("canonical artifact serialization failed", "ARTIFACT_SERIALIZATION_FAILURE"),
+                };
+                Ok(error_output(message, code))
+            }
+        }
     }
 
     #[tool(
@@ -2512,7 +2653,7 @@ impl AgentGraphServer {
     #[tool(description = "Preflight a graph against policy before execution.")]
     fn graph_policy_check(
         &self,
-        Parameters(PolicyCheckParams { graph_id, input: _ }): Parameters<PolicyCheckParams>,
+        Parameters(PolicyCheckParams { graph_id, input }): Parameters<PolicyCheckParams>,
     ) -> Result<Json<StructuredOutput>, ErrorData> {
         let graphs = self
             .graphs
@@ -2524,12 +2665,39 @@ impl AgentGraphServer {
 
         let node_count = g.spec.nodes.len();
         let edge_count = g.spec.edges.len();
-        let issues: Vec<String> = Vec::new();
+        let report = crate::policy::preflight(&g.spec, &self.base_url);
+        let mut issues: Vec<String> = report
+            .findings
+            .iter()
+            .map(|finding| finding.code.to_owned())
+            .collect();
+        if parse_and_validate(&g.normalized).is_err() {
+            issues.push("GRAPH_INVALID".into());
+        }
+        if ensure_size(
+            &input.unwrap_or(Value::Null),
+            crate::spec::MAX_INPUT_BYTES,
+            "input",
+        )
+        .is_err()
+        {
+            issues.push("INPUT_TOO_LARGE".into());
+        }
 
         Ok(structured_output(serde_json::json!({
             "graph_id": graph_id,
             "passed": issues.is_empty(),
             "issues": issues,
+            "validation_scope": "graph_structure_provider_destination_input_size_and_declared_evidence_requirements",
+            "authorization_granted": false,
+            "provider_generation_verified": false,
+            "build": crate::transport::build_identity(),
+            "limits": {
+                "graph_bytes": crate::spec::MAX_GRAPH_BYTES,
+                "input_bytes": crate::spec::MAX_INPUT_BYTES,
+                "node_timeout_ceiling_ms": crate::spec::node_timeout_ceiling_ms(),
+                "node_timeout_multiplier": crate::spec::GRAPH_RUN_TIMEOUT_MULTIPLIER
+            },
             "stats": {
                 "node_count": node_count,
                 "edge_count": edge_count,
@@ -2821,5 +2989,101 @@ mod tests {
             .expect("record")
             .consumed_at
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod admission_contract_tests {
+    use super::*;
+
+    fn fixture() -> AgentGraphServer {
+        let server =
+            AgentGraphServer::new("http://localhost".into(), "fixture".into(), None, None).unwrap();
+        let params = serde_json::from_value(serde_json::json!({"spec": {
+            "name":"preflight-fixture", "entry":"n", "nodes":[{"id":"n","type":"passthrough"}],
+            "edges":[{"from":"n","to":"END"}]
+        }}))
+        .unwrap();
+        server.graph_create(Parameters(params)).unwrap();
+        server
+    }
+
+    #[test]
+    fn policy_preflight_rejects_oversized_input_before_execution() {
+        let server = fixture();
+        let result = server
+            .graph_policy_check(Parameters(PolicyCheckParams {
+                graph_id: "preflight-fixture".into(),
+                input: Some(serde_json::json!("x".repeat(crate::spec::MAX_INPUT_BYTES))),
+            }))
+            .unwrap()
+            .0
+            .data
+            .unwrap();
+        assert_eq!(result["passed"], false);
+        assert!(result["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|x| x.as_str() == Some("INPUT_TOO_LARGE")));
+    }
+
+    #[test]
+    fn passing_preflight_is_explicitly_non_authorizing_and_exposes_effective_limits() {
+        let server = fixture();
+        let result = server
+            .graph_policy_check(Parameters(PolicyCheckParams {
+                graph_id: "preflight-fixture".into(),
+                input: Some(serde_json::json!({"x":1})),
+            }))
+            .unwrap()
+            .0
+            .data
+            .unwrap();
+        assert_eq!(result["passed"], true);
+        assert_eq!(result["authorization_granted"], false);
+        assert_eq!(result["provider_generation_verified"], false);
+        assert_eq!(
+            result["limits"]["input_bytes"],
+            crate::spec::MAX_INPUT_BYTES
+        );
+        assert_eq!(
+            result["limits"]["node_timeout_multiplier"],
+            crate::spec::GRAPH_RUN_TIMEOUT_MULTIPLIER
+        );
+    }
+}
+
+#[cfg(test)]
+mod bounded_run_read_tests {
+    use super::compact_run_projection;
+    use serde_json::json;
+
+    #[test]
+    fn compact_run_projection_is_a_payload_free_whitelist() {
+        let compact = compact_run_projection(&json!({
+            "run_id": "r", "graph_id": "g", "graph_version": "v", "status": "completed",
+            "success": true, "storage_class": "volatile", "persistence_status": "pending",
+            "budget_counters": {"nodes": 1}, "budget_exhausted": null,
+            "error": "large provider diagnostic", "state": {"secret": "payload"},
+            "final_state": {"answer": "payload"}, "steps": [{"prompt": "secret"}],
+            "receipt": {"error_code": "NONE", "input": "secret"}, "bundle": {"large": true}
+        }));
+        assert_eq!(compact["projection"], "compact");
+        assert_eq!(compact["error_code"], "NONE");
+        for excluded in [
+            "error",
+            "state",
+            "final_state",
+            "steps",
+            "receipt",
+            "bundle",
+            "input",
+        ] {
+            assert!(
+                compact.get(excluded).is_none(),
+                "unexpected field {excluded}"
+            );
+        }
     }
 }

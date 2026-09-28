@@ -605,7 +605,8 @@ fn legacy_contract_and_exact_tool_names() {
     assert!(names.contains(&"graph_retention_review"));
     assert!(names.contains(&"graph_retention_set"));
     assert!(names.contains(&"graph_run_triage"));
-    assert_eq!(names.len(), 28);
+    assert!(names.contains(&"graph_run_artifact"));
+    assert_eq!(names.len(), 29);
     let created = mcp.call("graph_create", json!({"spec":{"name":"legacy","entry":"a","nodes":[{"id":"a","type":"passthrough"}],"edges":[{"from":"a","to":"END"}]}}));
     assert_eq!(created["graph_id"], "legacy");
     let run = mcp.call(

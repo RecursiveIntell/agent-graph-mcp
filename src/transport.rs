@@ -2,6 +2,40 @@
 use std::io::{self, Read, Write};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 pub const MAX_FRAME: usize = 1024 * 1024;
+
+/// Preserve small replies exactly and replace oversized correlated JSON-RPC
+/// responses with a bounded error. This does not truncate canonical artifacts
+/// or enlarge the wire contract. Uncorrelated/invalid messages fail closed.
+pub fn bound_json_response(payload: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>, FrameError> {
+    if payload.len() <= MAX_FRAME {
+        return Ok(std::borrow::Cow::Borrowed(payload));
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(payload).map_err(|_| FrameError::TooLarge)?;
+    let id = value
+        .get("id")
+        .filter(|id| id.is_string() || id.is_number());
+    if value.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0")
+        || value.get("method").is_some()
+        || (value.get("result").is_none() && value.get("error").is_none())
+    {
+        return Err(FrameError::TooLarge);
+    }
+    let id = id.ok_or(FrameError::TooLarge)?;
+    let reply = serde_json::to_vec(&serde_json::json!({
+        "jsonrpc": "2.0", "id": id,
+        "error": {
+            "code": -32001,
+            "message": "RESPONSE_TOO_LARGE: use compact status or paged graph_run_artifact reads",
+            "data": {"code": "RESPONSE_TOO_LARGE", "max_response_bytes": MAX_FRAME}
+        }
+    }))
+    .map_err(|_| FrameError::TooLarge)?;
+    if reply.len() > MAX_FRAME {
+        return Err(FrameError::TooLarge);
+    }
+    Ok(std::borrow::Cow::Owned(reply))
+}
 #[derive(Debug)]
 pub enum FrameError {
     Io(io::Error),

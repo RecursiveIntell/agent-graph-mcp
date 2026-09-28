@@ -262,6 +262,35 @@ pub struct RunCancelParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RunGetParams {
     pub run_id: String,
+    /// Return only bounded control metadata.
+    #[serde(default)]
+    pub compact: bool,
+}
+
+/// Parameters for a bounded read of a durable verified terminal artifact.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RunArtifactParams {
+    /// Terminal run identifier.
+    pub run_id: String,
+    /// Canonical artifact to read.
+    pub artifact: crate::run_artifact::ArtifactKind,
+    /// Byte offset into the serialized artifact.
+    #[serde(default)]
+    pub offset: u64,
+    /// Maximum page size in bytes (1 through 16384).
+    #[serde(default = "default_artifact_limit")]
+    pub limit: u64,
+    /// Expected SHA-256 from the first page.
+    #[serde(default)]
+    pub expected_digest: Option<String>,
+    /// Expected identity from the first page.
+    #[serde(default)]
+    pub expected_artifact_id: Option<String>,
+}
+
+fn default_artifact_limit() -> u64 {
+    16384
 }
 
 /// B9: resume-or-purge triage listing (interrupted_non_resumable runs).

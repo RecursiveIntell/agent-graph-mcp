@@ -3,6 +3,22 @@ use rmcp::ServiceExt;
 use std::{os::unix::fs::PermissionsExt, path::PathBuf};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
+// Bounds connection establishment only, never a graph or an initialized RPC.
+const INITIALIZATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+fn retryable_accept_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::ConnectionAborted
+    ) || matches!(
+        error.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+    )
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing. Set RUST_LOG=debug for verbose daemon logs.
     tracing_subscriber::fmt()
@@ -63,11 +79,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (_lock, conn) = daemon::open_owned(&data, &executable_digest)?;
     daemon::enforce_startup_mode(&conn, key_path.is_some())
         .map_err(|e| format!("daemon startup rejected: {e}"))?;
+    // Recover once under the exclusive daemon owner lock, before accepting
+    // clients. Connections clone this owner rather than recovering live work.
+    let server = AgentGraphServer::new_with_max_graphs_and_key(
+        base_url.clone(),
+        model.clone(),
+        Some(data.clone()),
+        key_path.clone(),
+        max_graphs,
+        api_key.clone(),
+    )
+    .map_err(std::io::Error::other)?
+    .with_provider_health(provider_health.clone());
     let id = daemon::identity_with_digest(&conn, &executable_digest)?;
     let _ = daemon::recover_owned_state(&conn, &id.instance_id, id.generation)?;
     drop(conn);
     let rt = tokio::runtime::Runtime::new()?;
-    let data_dir = data.clone();
+
     let accept_result: std::result::Result<(), Box<dyn std::error::Error>> =
         rt.block_on(async move {
             if socket.exists() {
@@ -203,7 +231,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         allowed_uids,
                         instance_id,
                     );
-                    while let Ok((stream, _)) = op_listener.accept().await {
+                    loop {
+                        let stream = match op_listener.accept().await {
+                            Ok((stream, _)) => stream,
+                            Err(error) if retryable_accept_error(&error) => {
+                                tracing::warn!(code = ?error.raw_os_error(), "operator accept temporarily unavailable");
+                                tokio::time::sleep(ACCEPT_BACKOFF).await;
+                                continue;
+                            }
+                            Err(error) => {
+                                tracing::error!(code = ?error.raw_os_error(), "operator listener failed");
+                                break;
+                            }
+                        };
                         let svc = service.clone();
                         tokio::spawn(async move {
                             let _ = agent_graph_mcp::operator::serve_connection(stream, svc).await;
@@ -214,26 +254,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 let (stream, _) = match listener.accept().await {
                     Ok(pair) => pair,
+                    Err(error) if retryable_accept_error(&error) => {
+                        tracing::warn!(code = ?error.raw_os_error(), "MCP accept temporarily unavailable");
+                        tokio::time::sleep(ACCEPT_BACKOFF).await;
+                        continue;
+                    }
                     Err(err) => break Err(Box::<dyn std::error::Error>::from(err)),
                 };
-                let data_dir = data_dir.clone();
-                let key_path = key_path.clone();
-                let base_url = base_url.clone();
-                let model = model.clone();
-                let api_key = api_key.clone();
-                let provider_health = provider_health.clone();
+                let server = server.clone();
                 tokio::spawn(async move {
-                    let _ = serve_connection(
-                        stream,
-                        &data_dir,
-                        key_path.as_deref(),
-                        &base_url,
-                        &model,
-                        api_key.as_deref(),
-                        max_graphs,
-                        provider_health,
-                    )
-                    .await;
+                    let _ = serve_connection(stream, server).await;
                 });
             }
         });
@@ -241,17 +271,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn serve_connection(
     stream: tokio::net::UnixStream,
-    data_dir: &std::path::Path,
-    key_path: Option<&std::path::Path>,
-    base_url: &str,
-    model: &str,
-    api_key: Option<&str>,
-    max_graphs: usize,
-    provider_health: agent_graph_mcp::provider_health::ProviderHealth,
+    server: AgentGraphServer,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let initialization_deadline = tokio::time::Instant::now() + INITIALIZATION_TIMEOUT;
     let (mut sock_rx, mut sock_tx) = stream.into_split();
     let (bridge_side, rmcp_side) = tokio::io::duplex(1024 * 1024 + 4096);
     let (bridge_rx, mut bridge_tx) = tokio::io::split(bridge_side);
@@ -259,43 +283,54 @@ async fn serve_connection(
     // B5: protocol hello handshake on the first frame. Legacy (non-hello)
     // frames are forwarded into the MCP bridge unchanged; version mismatch
     // replies with a hello_error frame and drops the connection (fail fast).
-    {
+    let hello = async {
         let mut hdr = [0u8; 4];
-        if sock_rx.read_exact(&mut hdr).await.is_err() {
-            return Ok(());
-        }
+        sock_rx.read_exact(&mut hdr).await?;
         let len = u32::from_be_bytes(hdr) as usize;
         if len > 1024 * 1024 {
-            return Ok(());
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "frame too large",
+            ));
         }
         let mut payload = vec![0u8; len];
-        if sock_rx.read_exact(&mut payload).await.is_err() {
-            return Ok(());
-        }
+        sock_rx.read_exact(&mut payload).await?;
         match agent_graph_mcp::transport::interpret_hello(&payload) {
             Some(Ok(reply)) => {
-                let _ = sock_tx.write_all(&(reply.len() as u32).to_be_bytes()).await;
-                let _ = sock_tx.write_all(&reply).await;
-                let _ = sock_tx.flush().await;
+                sock_tx
+                    .write_all(&(reply.len() as u32).to_be_bytes())
+                    .await?;
+                sock_tx.write_all(&reply).await?;
+                sock_tx.flush().await?;
             }
             Some(Err(reason)) => {
-                let _ = sock_tx
+                sock_tx
                     .write_all(&(reason.len() as u32).to_be_bytes())
-                    .await;
-                let _ = sock_tx.write_all(reason.as_bytes()).await;
-                let _ = sock_tx.flush().await;
-                return Ok(());
+                    .await?;
+                sock_tx.write_all(reason.as_bytes()).await?;
+                sock_tx.flush().await?;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "hello rejected",
+                ));
             }
             None => {
                 // Legacy proxy: forward the first MCP frame into the bridge.
-                let _ = bridge_tx.write_all(&payload).await;
-                let _ = bridge_tx.write_all(b"\n").await;
-                let _ = bridge_tx.flush().await;
+                bridge_tx.write_all(&payload).await?;
+                bridge_tx.write_all(b"\n").await?;
+                bridge_tx.flush().await?;
             }
         }
+        Ok::<(), std::io::Error>(())
+    };
+    if !matches!(
+        tokio::time::timeout_at(initialization_deadline, hello).await,
+        Ok(Ok(()))
+    ) {
+        return Ok(());
     }
 
-    let to_rmcp = tokio::spawn(async move {
+    let mut to_rmcp = tokio::spawn(async move {
         loop {
             let mut hdr = [0u8; 4];
             if sock_rx.read_exact(&mut hdr).await.is_err() {
@@ -316,10 +351,11 @@ async fn serve_connection(
                 break;
             }
         }
-        drop(bridge_tx);
+        // A split half's drop is not EOF while its sibling is retained.
+        let _ = bridge_tx.shutdown().await;
     });
 
-    let from_rmcp = tokio::spawn(async move {
+    let mut from_rmcp = tokio::spawn(async move {
         let mut reader = tokio::io::BufReader::new(bridge_rx);
         loop {
             let mut line = String::new();
@@ -330,10 +366,14 @@ async fn serve_connection(
                     if trimmed.is_empty() {
                         continue;
                     }
-                    let len = trimmed.len() as u32;
-                    if sock_tx.write_all(&len.to_be_bytes()).await.is_err()
-                        || sock_tx.write_all(trimmed.as_bytes()).await.is_err()
-                        || sock_tx.flush().await.is_err()
+                    let frame =
+                        match agent_graph_mcp::transport::bound_json_response(trimmed.as_bytes()) {
+                            Ok(frame) => frame,
+                            Err(_) => break,
+                        };
+                    if agent_graph_mcp::transport::write_frame_async(&mut sock_tx, frame.as_ref())
+                        .await
+                        .is_err()
                     {
                         break;
                     }
@@ -344,28 +384,40 @@ async fn serve_connection(
         }
     });
 
-    let server = AgentGraphServer::new_with_max_graphs_and_key(
-        base_url.to_owned(),
-        model.to_owned(),
-        Some(data_dir.to_path_buf()),
-        key_path.map(|p| p.to_path_buf()),
-        max_graphs,
-        api_key.map(|s| s.to_owned()),
-    )
-    .map_err(std::io::Error::other)?
-    .with_provider_health(provider_health);
-
-    let service = match server.serve(rmcp_side).await {
-        Ok(service) => service,
-        Err(_) => {
-            to_rmcp.abort();
-            from_rmcp.abort();
-            return Ok(());
-        }
+    let service =
+        match tokio::time::timeout_at(initialization_deadline, server.serve(rmcp_side)).await {
+            Ok(Ok(service)) => service,
+            _ => {
+                to_rmcp.abort();
+                from_rmcp.abort();
+                let _ = to_rmcp.await;
+                let _ = from_rmcp.await;
+                return Ok(());
+            }
+        };
+    // This token cancels the connection, not an admitted Graph execution.
+    // The shared server/run manager remains owned by the daemon.
+    let cancel_connection = service.cancellation_token();
+    let mut waiting = Box::pin(service.waiting());
+    let ended = tokio::select! {
+        _ = &mut to_rmcp => 0,
+        _ = &mut from_rmcp => 1,
+        _ = &mut waiting => 2,
     };
-    let _ = service.waiting().await;
-    to_rmcp.abort();
-    from_rmcp.abort();
+    cancel_connection.cancel();
+    if ended != 0 {
+        to_rmcp.abort();
+        let _ = to_rmcp.await;
+    }
+    if ended != 1 {
+        from_rmcp.abort();
+        let _ = from_rmcp.await;
+    }
+    if ended != 2 {
+        // rmcp bounds cancellation response draining internally. Join its
+        // supervisor too, rather than leaving a detached connection behind.
+        let _ = waiting.await;
+    }
 
     Ok(())
 }
