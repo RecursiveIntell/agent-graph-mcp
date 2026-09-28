@@ -24,6 +24,7 @@ pub mod promotion;
 pub mod provekv_executor;
 pub mod provider_health;
 pub mod proxy;
+pub mod run_artifact;
 pub mod run_manager;
 pub mod server;
 pub mod spec;

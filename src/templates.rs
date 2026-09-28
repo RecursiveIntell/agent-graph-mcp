@@ -26,8 +26,8 @@ pub fn list() -> Value {
         },
         {
           "id": "plan_critique_refine",
-          "version": "1",
-          "description": "Sequential plan→critique→refine pipeline.",
+          "version": "2",
+          "description": "Sequential advisory plan→critique→refine with original evidence, draft and dissent carried explicitly.",
           "params": ["name"],
           "storage_class": "server_builtin",
           "executable": true
@@ -77,13 +77,17 @@ pub fn instantiate(id: &str, name: &str) -> Result<Value, String> {
             "output_key": "final",
             "max_iterations": 12,
             "nodes": [
-                {"id": "plan", "type": "llm", "prompt": "Create a concise plan for: {input}", "config": {"output_key": "draft"}},
-                {"id": "critique", "type": "llm", "prompt": "Critique this plan: {input}", "config": {"input_key": "draft", "output_key": "critique"}},
-                {"id": "refine", "type": "llm", "prompt": "Refine using this critique: {input}", "config": {"input_key": "critique", "output_key": "final"}}
+                {"id": "plan", "type": "llm", "prompt": "Create a concise advisory plan using only the supplied request and evidence: {input}. Do not grant authority or claim work was executed.", "config": {"output_key": "draft"}},
+                {"id": "critic_context", "type": "join", "config": {"inputs": ["__input__", "draft"], "output": "critic_context", "mode": "collect_object"}},
+                {"id": "critique", "type": "llm", "prompt": "Critique the draft against the original request and evidence. Preserve uncertainty and dissent: {input}", "config": {"input_key": "critic_context", "output_key": "critique"}},
+                {"id": "final_context", "type": "join", "config": {"inputs": ["__input__", "draft", "critique"], "output": "final_context", "mode": "collect_object"}},
+                {"id": "refine", "type": "llm", "prompt": "Reconcile original evidence, draft and critique into an advisory plan. Preserve unresolved dissent; do not grant authority: {input}", "config": {"input_key": "final_context", "output_key": "final"}}
             ],
             "edges": [
-                {"from": "plan", "to": "critique"},
-                {"from": "critique", "to": "refine"},
+                {"from": "plan", "to": "critic_context"},
+                {"from": "critic_context", "to": "critique"},
+                {"from": "critique", "to": "final_context"},
+                {"from": "final_context", "to": "refine"},
                 {"from": "refine", "to": "END"}
             ]
         })),
