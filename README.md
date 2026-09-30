@@ -1,6 +1,6 @@
 # agent-graph-mcp
 
-**Run 9 agents at once.** MCP server for graph-orchestrated LLM workflows — dispatch up to 16 LLM nodes in parallel fan-out with typed joins, checkpoint/resume, human-in-the-loop approvals, and HMAC-authenticated execution receipts. 27 typed tools.
+**Run 9 agents at once.** MCP server for graph-orchestrated LLM workflows — dispatch up to 16 LLM nodes in parallel fan-out with typed joins, checkpoint/resume, human-in-the-loop approvals, and HMAC-authenticated execution receipts. 29 typed tools.
 
 [![Crates.io](https://img.shields.io/crates/v/agent-graph-mcp)](https://crates.io/crates/agent-graph-mcp)
 [![docs.rs](https://img.shields.io/docsrs/agent-graph-mcp)](https://docs.rs/agent-graph-mcp)
@@ -10,7 +10,7 @@
 
 ![Architecture diagram showing MCP client connecting via stdin/stdout to the agent-graph-mcp proxy, which communicates over Unix socket to the agent-graph-mcpd daemon backed by SQLite](assets/architecture.svg)
 
-> **Expose the `ri-agent-graph` runtime engine over MCP.** Compile declarative JSON workflow specs, execute synchronously or asynchronously, checkpoint/resume, request human approval, capture source witnesses, and get cryptographic receipts — all through 27 typed MCP tools. Normal execution is synchronous. Durable approval is supported only as a SQLite-backed decision.
+> **Expose the `ri-agent-graph` runtime engine over MCP.** Compile declarative JSON workflow specs, execute synchronously or asynchronously, checkpoint/resume, request human approval, capture source witnesses, and get cryptographic receipts — all through 29 typed MCP tools. Normal execution is synchronous. Durable approval is supported only as a SQLite-backed decision.
 
 ## Who is this for?
 
@@ -32,7 +32,7 @@ npx -y @recursiveintell/agent-graph-mcp --direct --base-url http://127.0.0.1:114
 
 > **Note:** `--direct` is deprecated. Prefer daemon mode (below) for persistence and multi-client support. Direct mode still works but will be removed in a future release.
 
-**Expected output:** MCP initialization handshake. Run `tools/list` to verify you see 27 tools.
+**Expected output:** MCP initialization handshake. Run `tools/list` to inspect the tool list for the installed version; this source registers 29 tools.
 
 ### Cargo install
 
@@ -231,7 +231,7 @@ mcp_servers:
 
 ### Try it out
 
-Once configured, your agent can use any of the 27 tools directly. Try these natural language prompts:
+Once configured, your agent can use any of the 29 tools directly. Try these natural language prompts:
 
 > "Use the `council_deliberation` template to debate the merits of Rust vs. Go for systems programming."
 
@@ -306,13 +306,15 @@ MCP Client ──→ agent-graph-mcp (proxy) ──Unix socket──→ agent-gr
 
 Human-in-the-loop approvals are backed by durable SQLite checkpoints. When a graph reaches an approval node, execution pauses, a checkpoint is persisted, and the approval is surfaced via `graph_approval_list`. The human reviews and decides; the graph resumes from the checkpoint.
 
-## Tools (27)
+## Tools (29)
+
+This count describes the current source router, including run triage and paginated verified-artifact reads. Published npm/Cargo packages can lag source changes; check the running server's `tools/list` rather than assuming a package with the same version number includes every later commit.
 
 **Graph lifecycle (4):** `graph_create`, `graph_list`, `graph_inspect`, `graph_render`
-**Execution (5):** `graph_execute`, `graph_run_start`, `graph_run_wait`, `graph_run_cancel`, `graph_run_get`
+**Execution (6):** `graph_execute`, `graph_run_start`, `graph_run_wait`, `graph_run_cancel`, `graph_run_get`, `graph_run_triage`
 **State & checkpoint (4):** `graph_run_state`, `graph_run_events`, `graph_run_checkpoint`, `graph_run_resume`
 **HITL approval (3):** `graph_approval_list`, `graph_approval_get`, `graph_approval_request`
-**Evidence (2):** `graph_source_witness_capture`, `graph_source_witness_get`
+**Evidence (3):** `graph_source_witness_capture`, `graph_source_witness_get`, `graph_run_artifact`
 **Templates (4):** `graph_template_list`, `graph_template_instantiate`, `graph_template_candidates`, `graph_template_outcomes`
 **Receipts & status (3):** `graph_policy_check`, `graph_run_receipt`, `graph_status`
 **Retention (2):** `graph_retention_review`, `graph_retention_set`
@@ -321,7 +323,7 @@ Human-in-the-loop approvals are backed by durable SQLite checkpoints. When a gra
 
 | Crate | Role | Version |
 |-------|------|---------|
-| [agent-graph-mcp](https://crates.io/crates/agent-graph-mcp) | MCP server (this repo) | 0.2.6 |
+| [agent-graph-mcp](https://crates.io/crates/agent-graph-mcp) | MCP server (this repo) | 0.3.0 |
 | [ri-agent-graph](https://crates.io/crates/ri-agent-graph) | Core graph engine | 0.2 |
 | [llm-pipeline](https://crates.io/crates/llm-pipeline) | LLM node payloads + retry | 0.2 |
 | [stack-ids](https://crates.io/crates/stack-ids) | Trace primitives (TraceCtx, AttemptId) | 0.1 |
@@ -329,11 +331,11 @@ Human-in-the-loop approvals are backed by durable SQLite checkpoints. When a gra
 ## Verification
 
 ```bash
-# Smoke test — verify 27 tools are exposed
+# Smoke test — inspect tools exposed by the installed package
 echo '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' | \
   npx -y @recursiveintell/agent-graph-mcp --direct --base-url http://127.0.0.1:11434 --model llama3.2:3b 2>/dev/null | \
   python3 -c "import sys,json; msg=json.loads(sys.stdin.read()); print(f'{len(msg[\"result\"][\"tools\"])} tools')"
-# Expected: 27 tools
+# Compare the returned tool names with the installed package revision
 
 # Build and test suite
 cargo build --release
