@@ -285,7 +285,7 @@ Fan out to eight LLM nodes in parallel, then join results into a ninth LLM call 
 }
 ```
 
-The eight `agent_0` through `agent_7` branches are scheduled in parallel, subject to graph and provider-worker limits.  Each writes its own state key, the join collects those eight results into `{collected}`, and the report LLM call runs afterward.  The top-level `output_key` selects the final report.  This graph has nine LLM calls in total: eight parallel research calls and one serial report call.  The compiler caps parallel fan-out at 16.
+The eight `agent_0` through `agent_7` branches are scheduled in parallel, subject to graph and provider-worker limits.  Each writes its own state key, the join collects those eight results into `{collected}`, and the report LLM call runs afterward.  The top-level `output_key` selects the final report.  This graph has nine LLM calls in total: eight parallel research calls and one serial report call.
 
 ## Loop and subgraph nodes
 
