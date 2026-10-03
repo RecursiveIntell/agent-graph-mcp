@@ -171,7 +171,7 @@ npx -y @recursiveintell/agent-graph-mcp --direct --base-url https://api.deepseek
 | OpenAI | ⚠️ compatible | Untested but OpenAI-compatible. Same flag pattern |
 | Alibaba MaaS | ⚠️ body-size limit | Gateway rejects payloads > ~100KB — trim council context before dispatch |
 
-**Choosing a model for agent-graph:** Fan-out nodes share the same model. For 9-agent sweeps, use a fast model (`deepseek-v4-flash`, `llama3.2:3b`). For synthesis/report nodes that process all collected results, prefer a larger-context model (`deepseek-v4-pro`, `gpt-4o`). The daemon currently uses a single model for all nodes in a graph; per-node model selection is tracked but not yet shipped.
+**Choosing a model for agent-graph:** An LLM node uses the daemon's `--model` unless its top-level `model` field supplies an override.  The compiler forwards that field to `LlmNode`, which selects it before the default model.  This source supports per-node model selection; availability still depends on the configured provider.  Graph fan-out limits and Codex App Server worker bounds remain separate from model selection.
 
 ## Complete CLI reference
 
@@ -237,45 +237,55 @@ Once configured, your agent can use any of the 29 tools directly. Try these natu
 
 > "Create a graph with 3 parallel research nodes analyzing web framework tradeoffs, join the results, and produce a ranked recommendation."
 
-> "Spin up a plan→critique→refine pipeline for a database migration strategy, and pause for my approval before the final report."
+> "Inspect the deterministic-local checkpoint and approval boundary before creating a workflow that needs human approval."
 
-## 9 agents at once
+## Eight-way research sweep
 
-Fan out to 9 LLM nodes in parallel, then join results into one synthesis:
+Fan out to eight LLM nodes in parallel, then join results into a ninth LLM call for synthesis:
 
 ```json
 {
   "name": "9-agent-research-sweep",
   "entry": "fanout",
+  "output_key": "report",
   "nodes": [
-    {"id": "fanout", "type": "passthrough"},
-    {"id": "agent_0", "type": "llm", "prompt": "Research topic A: {input}"},
-    {"id": "agent_1", "type": "llm", "prompt": "Research topic B: {input}"},
-    {"id": "agent_2", "type": "llm", "prompt": "Research topic C: {input}"},
-    {"id": "agent_3", "type": "llm", "prompt": "Analyze dimension 1: {input}"},
-    {"id": "agent_4", "type": "llm", "prompt": "Analyze dimension 2: {input}"},
-    {"id": "agent_5", "type": "llm", "prompt": "Analyze dimension 3: {input}"},
-    {"id": "agent_6", "type": "llm", "prompt": "Critique from angle X: {input}"},
-    {"id": "agent_7", "type": "llm", "prompt": "Critique from angle Y: {input}"},
-    {"id": "join", "type": "join", "config": {"inputs": ["agent_0","agent_1","agent_2","agent_3","agent_4","agent_5","agent_6","agent_7"], "output": "collected", "mode": "collect_array"}},
-    {"id": "report", "type": "llm", "prompt": "Synthesize findings from all agents and produce final report: {collected}"}
+    {"id":"fanout","type":"passthrough"},
+    {"id":"agent_0","type":"llm","prompt":"Research topic A: {input}","config":{"output_key":"agent_0"}},
+    {"id":"agent_1","type":"llm","prompt":"Research topic B: {input}","config":{"output_key":"agent_1"}},
+    {"id":"agent_2","type":"llm","prompt":"Research topic C: {input}","config":{"output_key":"agent_2"}},
+    {"id":"agent_3","type":"llm","prompt":"Analyze dimension 1: {input}","config":{"output_key":"agent_3"}},
+    {"id":"agent_4","type":"llm","prompt":"Analyze dimension 2: {input}","config":{"output_key":"agent_4"}},
+    {"id":"agent_5","type":"llm","prompt":"Analyze dimension 3: {input}","config":{"output_key":"agent_5"}},
+    {"id":"agent_6","type":"llm","prompt":"Critique from angle X: {input}","config":{"output_key":"agent_6"}},
+    {"id":"agent_7","type":"llm","prompt":"Critique from angle Y: {input}","config":{"output_key":"agent_7"}},
+    {"id":"join","type":"join","config":{"inputs":["agent_0","agent_1","agent_2","agent_3","agent_4","agent_5","agent_6","agent_7"],"output":"collected","mode":"collect_array"}},
+    {"id":"report","type":"llm","prompt":"Synthesize findings from all agents and produce final report: {collected}","config":{"output_key":"report"}}
   ],
   "edges": [
-    {"from": "fanout", "to": "agent_0"}, {"from": "fanout", "to": "agent_1"},
-    {"from": "fanout", "to": "agent_2"}, {"from": "fanout", "to": "agent_3"},
-    {"from": "fanout", "to": "agent_4"}, {"from": "fanout", "to": "agent_5"},
-    {"from": "fanout", "to": "agent_6"}, {"from": "fanout", "to": "agent_7"},
-    {"from": "agent_0", "to": "join"}, {"from": "agent_1", "to": "join"},
-    {"from": "agent_2", "to": "join"}, {"from": "agent_3", "to": "join"},
-    {"from": "agent_4", "to": "join"}, {"from": "agent_5", "to": "join"},
-    {"from": "agent_6", "to": "join"}, {"from": "agent_7", "to": "join"},
-    {"from": "join", "to": "report"}, {"from": "report", "to": "END"}
+    {"from":"fanout","to":"agent_0"},
+    {"from":"fanout","to":"agent_1"},
+    {"from":"fanout","to":"agent_2"},
+    {"from":"fanout","to":"agent_3"},
+    {"from":"fanout","to":"agent_4"},
+    {"from":"fanout","to":"agent_5"},
+    {"from":"fanout","to":"agent_6"},
+    {"from":"fanout","to":"agent_7"},
+    {"from":"agent_0","to":"join"},
+    {"from":"agent_1","to":"join"},
+    {"from":"agent_2","to":"join"},
+    {"from":"agent_3","to":"join"},
+    {"from":"agent_4","to":"join"},
+    {"from":"agent_5","to":"join"},
+    {"from":"agent_6","to":"join"},
+    {"from":"agent_7","to":"join"},
+    {"from":"join","to":"report"},
+    {"from":"report","to":"END"}
   ],
   "max_parallelism": 9
 }
 ```
 
-All 9 LLM calls execute concurrently via Tokio `JoinSet`. The join node collects results from agents 0-7 into `{collected}`, then the report node synthesizes. Scale up to 16 branches per parallel node.
+The eight `agent_0` through `agent_7` branches are scheduled in parallel, subject to graph and provider-worker limits.  Each writes its own state key, the join collects those eight results into `{collected}`, and the report LLM call runs afterward.  The top-level `output_key` selects the final report.  This graph has nine LLM calls in total: eight parallel research calls and one serial report call.  The compiler caps parallel fan-out at 16.
 
 ## Loop and subgraph nodes
 
@@ -304,7 +314,7 @@ MCP Client ──→ agent-graph-mcp (proxy) ──Unix socket──→ agent-gr
 
 ![HITL approval workflow diagram showing agent execution pausing at approval checkpoints, the human making a decision, and the agent resuming with the approved state](assets/hitl-workflow.svg)
 
-Human-in-the-loop approvals are backed by durable SQLite checkpoints. When a graph reaches an approval node, execution pauses, a checkpoint is persisted, and the approval is surfaced via `graph_approval_list`. The human reviews and decides; the graph resumes from the checkpoint.
+Durable approvals are SQLite-backed decisions over an already-created deterministic-local checkpoint.  This resume subset contains only linear `passthrough` and `state_transform` chains; LLM, router, join, parallel, loop, subgraph and `human_approval` nodes are outside it.  Request a checkpoint with `checkpoint: true`, inspect/request its approval, and use the authenticated operator transport for the decision.  A `human_approval` node can emit an interrupt signal, but that does not establish durable pause/resume of an LLM workflow or permission to execute an external action.
 
 ## Tools (29)
 
@@ -352,7 +362,7 @@ cargo test --lib --test daemon_recovery --test mcp_integration
 | LLM nodes hang | Provider unreachable or model name wrong | Test endpoint: `curl <your-base-url>/models` (Ollama) or `curl -H "Authorization: Bearer $OPENAI_API_KEY" <your-base-url>/models` (cloud) |
 | `graph_run_start` returns immediately | Run is async by default | Use `graph_run_wait` to block on completion, or `graph_execute` for sync |
 | "socket not found" | Daemon not started or socket path mismatch | Ensure `--socket` matches between daemon and proxy. Default is `/tmp/agent-graph/mcp.sock` |
-| Approval stuck | Human hasn't decided | Check `graph_approval_list`, use `graph_approval_request` with decision |
+| Approval stuck | Deterministic checkpoint approval is pending | Inspect `graph_approval_list`/`graph_approval_get`; submit the decision through the authenticated operator transport |
 | Execution hangs silently | Logging too quiet | Run daemon with `RUST_LOG=debug agent-graph-mcpd ...` — logs to stderr. For `--direct` mode, add `RUST_LOG=debug` before the command |
 | Unknown model errors | Default model is `glm-5.2:cloud` | Always pass `--model`. The default exists for backward compatibility and won't exist on your endpoint |
 
