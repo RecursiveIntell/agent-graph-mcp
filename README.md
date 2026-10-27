@@ -161,15 +161,14 @@ OPENAI_API_KEY=sk-... agent-graph-mcpd --base-url https://llm-<id>.ap-southeast-
 npx -y @recursiveintell/agent-graph-mcp --direct --base-url https://api.deepseek.com/v1 --model deepseek-v4-pro
 ```
 
-### Current state
+### Provider examples and validation boundary
 
-| Provider | Tested | Notes |
-|----------|--------|-------|
-| Ollama (local) | ✅ daily | Lowest latency, no API key needed |
-| DeepSeek | ✅ daily | Primary cloud provider. `deepseek-v4-pro` for large councils, `deepseek-v4-flash` for fast fan-out |
-| OpenRouter | ✅ works | Any model, pay-per-token. Set `OPENAI_API_KEY` to your OpenRouter key |
-| OpenAI | ⚠️ compatible | Untested but OpenAI-compatible. Same flag pattern |
-| Alibaba MaaS | ⚠️ body-size limit | Gateway rejects payloads > ~100KB — trim council context before dispatch |
+| Provider | Configuration path | Check before relying on it |
+|----------|--------------------|----------------------------|
+| Ollama (local) | Local endpoint, no API key required by Ollama | Confirm the model is installed and the endpoint responds |
+| DeepSeek, OpenRouter, OpenAI, Alibaba MaaS | OpenAI-compatible endpoint plus the provider's key | Confirm the current URL, model, quota, request limits, and response behavior with that provider |
+
+These are configuration examples, not current live-provider test results. The earlier provider-uptime, latency, model-availability, and gateway-size assertions are not established by a source inspection or this README change.
 
 **Choosing a model for agent-graph:** An LLM node uses the daemon's `--model` unless its top-level `model` field supplies an override.  The compiler forwards that field to `LlmNode`, which selects it before the default model.  This source supports per-node model selection; availability still depends on the configured provider.  Graph fan-out limits and Codex App Server worker bounds remain separate from model selection.
 
@@ -352,7 +351,7 @@ cargo build --release
 cargo test --lib --test daemon_recovery --test mcp_integration
 ```
 
-**Test status (current `main`):** 57 lib tests pass, 1 known failure in `evidence::tests::witness_dependencies_verify_sqlite_content_and_span` (fixture dependency on semantic-memory-mcp binary path — tracked, does not affect runtime correctness). Integration tests (`daemon_recovery`, `mcp_integration`, `lifecycle`, `operator_authority`, etc.) pass.
+**Test evidence boundary:** No CI workflow is configured at this source revision. The commands above are suggested validation, not a fresh passing test result. The previous README reported a failure in `evidence::tests::witness_dependencies_verify_sqlite_content_and_span` related to a semantic-memory-mcp fixture path; its current state and impact need a new test run.
 
 ## Troubleshooting
 
@@ -368,12 +367,12 @@ cargo test --lib --test daemon_recovery --test mcp_integration
 
 ## Status and limitations
 
-- **Published:** crates.io + npm. Version 0.2.6.
-- **Tested on:** Linux (Nobara/Fedora). macOS works via npx. Windows untested.
+- **Source version:** The checked-in `Cargo.toml` declares `agent-graph-mcp` 0.3.0. Check crates.io and npm independently for published versions and package contents; a source version does not certify either release.
+- **Platforms:** The source and examples target Unix-socket operation. This review did not run Linux, macOS, or Windows installation and runtime checks.
 - **No CI currently configured.** All verification is local.
 - **Durable execution** requires the daemon. Direct mode is ephemeral.
 - **Max parallelism:** 16 nodes per parallel fan-out (compiler-enforced).
-- **LLM providers:** any OpenAI-compatible endpoint. See [Provider and model configuration](#provider-and-model-configuration) for tested providers and setup.
+- **LLM providers:** OpenAI-compatible transport is implemented. Check each endpoint and model in the target environment; see [Provider and model configuration](#provider-and-model-configuration) for setup examples.
 
 ## Support, security, and contributing
 
