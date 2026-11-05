@@ -2821,6 +2821,99 @@ mod tests {
     }
 
     #[test]
+    fn late_cancel_after_receipt_is_durable_and_consistent() {
+        use std::sync::{mpsc, Arc, Mutex};
+        use std::time::Duration;
+
+        configure_test_integrity_key();
+        let temp = tempfile::tempdir().expect("fixture store");
+        let store = PersistentStore::open(temp.path()).expect("store");
+        let spec: GraphSpec = serde_json::from_value(serde_json::json!({
+            "name":"late-cancel", "entry":"x",
+            "nodes":[{"id":"x","type":"passthrough"}],
+            "edges":[{"from":"x","to":"END"}]
+        }))
+        .expect("spec");
+        store
+            .save_graph(
+                "late-cancel",
+                &serde_json::to_string(&spec).unwrap(),
+                "version",
+                false,
+            )
+            .expect("save graph");
+        let (reached_tx, reached_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let hook = Arc::new(move || {
+            reached_tx.send(()).expect("notify receipt constructed");
+            release_rx
+                .lock()
+                .expect("release lock")
+                .recv_timeout(Duration::from_secs(10))
+                .expect("release terminal update");
+        });
+        let runs = RunManager::default().with_before_terminal_update_hook(hook);
+        let run_id = runs
+            .allocate("late-cancel", "version", Value::Null)
+            .expect("allocate");
+        store
+            .save_execution(&run_id, "late-cancel", "version", "running", "null")
+            .expect("save execution");
+        runs.admit_async(&run_id).expect("admit");
+        let completion_runs = runs.clone();
+        let completion_store = store.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        runs.start_with_completion_with_store(
+            run_id.clone(),
+            spec,
+            "http://localhost".into(),
+            "test-model".into(),
+            Some(store.clone()),
+            move |record| {
+                AgentGraphServer::persist_terminal_and_mark(
+                    completion_runs,
+                    Some(completion_store),
+                    record,
+                );
+                done_tx.send(()).expect("completion notification");
+            },
+        );
+        reached_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("receipt boundary reached");
+        runs.cancel(&run_id).expect("late cancellation accepted");
+        release_tx.send(()).expect("release");
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("terminal persistence completed");
+        let record = runs.get(&run_id).expect("record");
+        assert_eq!(record.status, "cancelled");
+        assert_eq!(record.persistence_status, "durable_terminal");
+        let persisted = store
+            .load_terminal_receipt(&run_id)
+            .expect("integrity verified")
+            .expect("receipt");
+        assert_eq!(persisted["receipt"]["error_code"], "CANCELLATION_REQUESTED");
+        assert_eq!(
+            persisted["bundle"]["payload"]["receipt"],
+            persisted["receipt"]
+        );
+        assert_eq!(
+            store.load_execution(&run_id).unwrap().unwrap()["status"],
+            "cancelled"
+        );
+        let events = store.load_events(&run_id, 0, 100).unwrap().unwrap();
+        let terminal_count = events["events"]
+            .as_array()
+            .expect("events")
+            .iter()
+            .filter(|item| item["event"].get("RunEnd").is_some())
+            .count();
+        assert_eq!(terminal_count, 1, "{events}");
+    }
+
+    #[test]
     fn terminal_projection_failure_rolls_back_sqlite_and_marks_run_volatile() {
         configure_test_integrity_key();
         let temp = tempfile::tempdir().expect("temp graph database");
