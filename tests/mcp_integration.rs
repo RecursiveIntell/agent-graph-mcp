@@ -356,6 +356,150 @@ fn successful_llm_run_counts_preinvocation_attempt() {
 }
 
 #[test]
+fn cancelled_spawned_run_has_durable_cancellation_receipt() {
+    let temp = tempfile::tempdir().expect("fake codex workspace");
+    let data_dir = temp.path().join("graph-data");
+    let fake_bin = fake_codex_bin_dir(temp.path());
+    let marker = temp.path().join("provider-started");
+    let fake = fake_bin.join("codex");
+    let script = format!(
+        r##"#!/bin/sh
+read line
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+read line
+read line
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"thread":{{"id":"thread-test"}}}}}}'
+read line
+printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"turn":{{"id":"turn-test"}}}}}}'
+printf 'started' > '{}'
+sleep 10
+"##,
+        marker.display()
+    );
+    std::fs::write(&fake, script).expect("write blocked provider fixture");
+    let mut mcp = Mcp::new_with_data_dir_and_fake_codex(&data_dir, &fake_bin);
+    let created = mcp.call("graph_create", json!({"spec":{
+        "name":"cancel-durable-witness", "entry":"ask", "output_key":"answer",
+        "nodes":[{"id":"ask","type":"llm","model":"fake-model","prompt":"reply","config":{"output_key":"answer","timeout_ms":10_000}}],
+        "edges":[{"from":"ask","to":"END"}]
+    }}));
+    assert_eq!(created["ok"], true, "{created}");
+    let started = mcp.call(
+        "graph_run_start",
+        json!({"graph_id":"cancel-durable-witness"}),
+    );
+    let run_id = started["run_id"].as_str().expect("run id").to_owned();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !marker.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(marker.exists(), "provider fixture did not reach its pause");
+    let cancel = mcp.call("graph_run_cancel", json!({"run_id":run_id}));
+    assert_eq!(cancel["ok"], true, "{cancel}");
+    let done = mcp.call(
+        "graph_run_wait",
+        json!({"run_id":run_id,"timeout_ms":15_000}),
+    );
+    assert_eq!(done["data"]["status"], "cancelled", "{done}");
+    let receipt = mcp.call("graph_run_receipt", json!({"run_id":run_id}));
+    assert_eq!(receipt["ok"], true, "{receipt}");
+    assert_eq!(
+        receipt["data"]["receipt"]["error_code"], "CANCELLATION_REQUESTED",
+        "{receipt}"
+    );
+    let db = Connection::open(data_dir.join("agent-graph.db")).expect("open fixture store");
+    let (status, finished_at, raw): (String, Option<String>, String) = db.query_row(
+        "SELECT e.status, e.finished_at, r.receipt_json FROM executions e JOIN terminal_receipts r USING(run_id) WHERE e.run_id=?1",
+        [&run_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    ).expect("durable terminal receipt");
+    assert_eq!(status, "cancelled");
+    assert!(
+        finished_at.is_some(),
+        "terminal timestamp must be persisted"
+    );
+    let terminal_events: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE run_id=?1 AND event_type='RunEnd'",
+            [&run_id],
+            |row| row.get(0),
+        )
+        .expect("terminal event count");
+    assert_eq!(terminal_events, 1);
+    let durable: Value = serde_json::from_str(&raw).expect("receipt json");
+    assert_eq!(durable["error_code"], "CANCELLATION_REQUESTED");
+    let original_bundle: String = db
+        .query_row(
+            "SELECT bundle_json FROM terminal_receipts WHERE run_id=?1",
+            [&run_id],
+            |row| row.get(0),
+        )
+        .expect("durable bundle");
+    drop(db);
+    drop(mcp);
+
+    let mut restarted = Mcp::new_with_data_dir_and_fake_codex(&data_dir, &fake_bin);
+    let intact = restarted.call("graph_run_receipt", json!({"run_id":run_id}));
+    assert_eq!(intact["ok"], true, "positive restart control: {intact}");
+    assert_eq!(
+        intact["data"]["receipt"]["error_code"],
+        "CANCELLATION_REQUESTED"
+    );
+    assert!(intact["data"]["receipt_digest"]
+        .as_str()
+        .is_some_and(|s| s.starts_with("hmac-sha256:")));
+    drop(restarted);
+
+    let db = Connection::open(data_dir.join("agent-graph.db")).expect("fixture database");
+    db.execute(
+        "UPDATE terminal_receipts SET receipt_json=?1 WHERE run_id=?2",
+        rusqlite::params![json!({"tampered":"receipt-secret"}).to_string(), &run_id],
+    )
+    .expect("tamper receipt");
+    drop(db);
+    let mut restarted = Mcp::new_with_data_dir_and_fake_codex(&data_dir, &fake_bin);
+    let rejected = restarted.call("graph_run_receipt", json!({"run_id":run_id}));
+    assert_eq!(
+        rejected["error_code"], "RECEIPT_INTEGRITY_FAILURE",
+        "{rejected}"
+    );
+    assert!(!rejected.to_string().contains("receipt-secret"));
+    drop(restarted);
+
+    let db = Connection::open(data_dir.join("agent-graph.db")).expect("fixture database");
+    db.execute(
+        "UPDATE terminal_receipts SET receipt_json=?1, bundle_json=?2 WHERE run_id=?3",
+        rusqlite::params![
+            raw,
+            json!({"tampered":"bundle-secret"}).to_string(),
+            &run_id
+        ],
+    )
+    .expect("restore receipt, tamper bundle");
+    drop(db);
+    let mut restarted = Mcp::new_with_data_dir_and_fake_codex(&data_dir, &fake_bin);
+    let rejected = restarted.call("graph_run_receipt", json!({"run_id":run_id}));
+    assert_eq!(
+        rejected["error_code"], "BUNDLE_INTEGRITY_FAILURE",
+        "{rejected}"
+    );
+    assert!(!rejected.to_string().contains("bundle-secret"));
+    drop(restarted);
+    let db = Connection::open(data_dir.join("agent-graph.db")).expect("fixture database");
+    db.execute(
+        "UPDATE terminal_receipts SET bundle_json=?1 WHERE run_id=?2",
+        rusqlite::params![original_bundle, &run_id],
+    )
+    .expect("restore bundle");
+    drop(db);
+    let mut restarted = Mcp::new_with_data_dir_and_fake_codex(&data_dir, &fake_bin);
+    let restored = restarted.call("graph_run_receipt", json!({"run_id":run_id}));
+    assert_eq!(
+        restored["ok"], true,
+        "restored positive control: {restored}"
+    );
+}
+
+#[test]
 fn max_llm_calls_reserves_before_a_second_provider_attempt() {
     let temp = tempfile::tempdir().expect("fake codex workspace");
     let data_dir = temp.path().join("graph-data");
