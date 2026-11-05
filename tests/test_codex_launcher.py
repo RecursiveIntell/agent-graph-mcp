@@ -26,7 +26,7 @@ class LauncherTests(unittest.TestCase):
             )
             daemon.chmod(0o700)
             env = {
-                'HOME': str(root), 'PATH': os.defpath,
+                'HOME': str(root), 'PATH': str(root) + os.pathsep + os.defpath,
                 'AGENT_GRAPH_CODEX_COMMAND': str(codex),
                 'AGENT_GRAPH_DAEMON_COMMAND': str(daemon),
                 'AGENT_GRAPH_MODEL': 'fixture-model',
@@ -65,6 +65,33 @@ class LauncherTests(unittest.TestCase):
         result = self.run_launcher('raise AssertionError("discovery must not run")\n', preselected='[]')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)['disabled'], '[]')
+
+    def test_invalid_preselected_never_starts_daemon(self):
+        for value in ('', 'not-json', '{}', '["bad.name"]', '[123]', json.dumps(['a'] * 129)):
+            with self.subTest(value=value):
+                result = self.run_launcher('raise AssertionError("must not discover")\n', preselected=value)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, '')
+
+    def test_discovery_executable_must_match_worker_path(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            discovery = root / 'discovery'
+            discovery.write_text('#!/bin/sh\nprintf "[]"\n')
+            discovery.chmod(0o700)
+            worker = root / 'codex'
+            worker.write_text('#!/bin/sh\nexit 0\n')
+            worker.chmod(0o700)
+            daemon = root / 'daemon'
+            daemon.write_text('#!/bin/sh\nprintf "daemon started"\n')
+            daemon.chmod(0o700)
+            env = {'HOME': str(root), 'PATH': str(root) + os.pathsep + os.defpath,
+                   'AGENT_GRAPH_CODEX_COMMAND': str(discovery),
+                   'AGENT_GRAPH_DAEMON_COMMAND': str(daemon)}
+            result = subprocess.run(['bash', str(ROOT / 'scripts/launch-codex-daemon.sh')],
+                                    env=env, capture_output=True, text=True, timeout=5)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, '')
 
 
 if __name__ == '__main__':
