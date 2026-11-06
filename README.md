@@ -1,6 +1,8 @@
 # agent-graph-mcp
 
-**Run 9 agents at once.** MCP server for graph-orchestrated LLM workflows — dispatch up to 16 LLM nodes in parallel fan-out with typed joins, checkpoint/resume, human-in-the-loop approvals, and HMAC-authenticated execution receipts. 29 typed tools.
+<!-- last-verified: 2026-10-27 -->
+
+**Compose multi-step LLM workflows with parallel fan-out.** This MCP server exposes the `ri-agent-graph` runtime through 29 typed tools for joins, checkpoint/resume, human approvals, source witnessing, and HMAC-authenticated receipts.
 
 [![Crates.io](https://img.shields.io/crates/v/agent-graph-mcp)](https://crates.io/crates/agent-graph-mcp)
 [![docs.rs](https://img.shields.io/docsrs/agent-graph-mcp)](https://docs.rs/agent-graph-mcp)
