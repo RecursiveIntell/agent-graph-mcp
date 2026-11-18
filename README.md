@@ -1,8 +1,6 @@
 # agent-graph-mcp
 
-<!-- last-verified: 2026-10-27 -->
-
-**Compose multi-step LLM workflows with parallel fan-out.** This MCP server exposes the `ri-agent-graph` runtime through 29 typed tools for joins, checkpoint/resume, human approvals, source witnessing, and HMAC-authenticated receipts.
+**Compose multi-step LLM workflows with parallel fan-out subject to graph limits; Codex App Server worker processes are subject to their configured process-admission limit.** This MCP server exposes `ri-agent-graph` for declarative graphs with typed joins. With daemon SQLite storage and an integrity key configured, checkpoint/resume is available only for eligible deterministic-local linear `passthrough`/`state_transform` chains. Durable checkpoint approvals require the same key; approval decisions are not exposed through the model-facing MCP tools.
 
 [![Crates.io](https://img.shields.io/crates/v/agent-graph-mcp)](https://crates.io/crates/agent-graph-mcp)
 [![docs.rs](https://img.shields.io/docsrs/agent-graph-mcp)](https://docs.rs/agent-graph-mcp)
@@ -12,7 +10,7 @@
 
 ![Architecture diagram showing MCP client connecting via stdin/stdout to the agent-graph-mcp proxy, which communicates over Unix socket to the agent-graph-mcpd daemon backed by SQLite](assets/architecture.svg)
 
-> **Expose the `ri-agent-graph` runtime engine over MCP.** Compile declarative JSON workflow specs, execute synchronously or asynchronously, checkpoint/resume, request human approval, capture source witnesses, and get cryptographic receipts — all through 29 typed MCP tools. Normal execution is synchronous. Durable approval is supported only as a SQLite-backed decision.
+> **Expose the `ri-agent-graph` runtime engine over MCP.** Compile declarative JSON workflow specs and run graphs synchronously or with the separate asynchronous run-start tools. With daemon SQLite storage and an integrity key configured, eligible deterministic-local linear `passthrough`/`state_transform` chains can be checkpointed and resumed; approval decisions are not exposed through the model-facing MCP tools. Source witnesses can be captured; durable SQLite terminal receipts are HMAC-authenticated when an integrity key is configured.
 
 ## Who is this for?
 
@@ -24,7 +22,7 @@
 
 - An LLM endpoint (local Ollama, or any OpenAI-compatible API)
 - Node.js ≥ 18 (for npx) or Rust ≥ 1.75 (for cargo install)
-- A model available at your endpoint. Examples below use `llama3.2:3b` (pull with `ollama pull llama3.2:3b`). Any model works — just replace `--model`.
+- A model supported by your configured endpoint. Examples below use `llama3.2:3b` (pull with `ollama pull llama3.2:3b`); replace `--model` with a supported model.
 
 ### npx (recommended)
 
@@ -34,7 +32,7 @@ npx -y @recursiveintell/agent-graph-mcp --direct --base-url http://127.0.0.1:114
 
 > **Note:** `--direct` is deprecated. Prefer daemon mode (below) for persistence and multi-client support. Direct mode still works but will be removed in a future release.
 
-**Expected output:** MCP initialization handshake. Run `tools/list` to inspect the tool list for the installed version; this source registers 29 tools.
+**Expected output:** MCP initialization handshake. Run `tools/list` to inspect the tool list for the installed version.
 
 ### Cargo install
 
@@ -75,32 +73,32 @@ agent-graph-mcp --socket /tmp/agent-graph/mcp.sock
 | Mode | Use when |
 |------|----------|
 | `--direct` | Single MCP client, no persistence needed, simplest setup |
-| `--socket` (daemon) | Multiple clients, durable graph storage, long-running workflows, HITL approvals |
+| `--socket` (daemon) | Multiple clients, durable graph storage, long-running workflows, checkpoint-bound approval requests and metadata (not decision submission) |
 
 ## Provider and model configuration
 
-Every graph run sends LLM calls to an OpenAI-compatible endpoint. You control **where** (`--base-url`) and **which model** (`--model`). The API key flows through the `OPENAI_API_KEY` environment variable.
+Graphs containing LLM nodes send calls to an OpenAI-compatible endpoint. You control **where** (`--base-url`) and **which model** (`--model`). The API key flows through the `OPENAI_API_KEY` environment variable.
 
 ### Codex App Server mode
 
-When `--base-url codex-app-server://` is selected, the Rust daemon starts one long-lived local Codex App Server worker over a loopback WebSocket and reuses it across graph nodes. Turns are serialized through a bounded Rust-owned session; a failed or timed-out worker is terminated and recreated cleanly. This avoids the fixed memory multiplier from spawning one heavy App Server process per node.
+When `--base-url codex-app-server://` is selected, the Rust daemon uses Codex App Server workers. `AGENT_GRAPH_CODEX_MAX_PROCESSES` controls process admission: the Rust default is 3, clamped at 32; the launcher script sets 9 unless overridden. At process limit one, it reuses a persistent worker over a loopback WebSocket across graph nodes; higher configured limits admit bounded one-shot workers over stdio.
 
 The integration is bounded before launch and during streaming:
 
-- one persistent Codex App Server worker when the configured process limit is
-  one; higher limits use bounded one-shot workers for true provider concurrency;
-- the Luna service launcher enumerates enabled Codex MCP servers and disables
-  those servers plus plugin/app injection for prompt-only graph turns;
+- `scripts/launch-codex-daemon.sh` discovers enabled Codex MCP servers with
+  plugins and apps disabled, then passes the list to workers that disable those
+  servers for prompt-only graph turns;
 - each completed graph thread is deleted before the worker is reused, preventing
   the long-lived connection from retaining auto-subscribed thread state;
 - prompt input capped at 256 KiB;
-- model reasoning effort pinned to `low` for bounded graph lanes;
-- each JSON-RPC line capped at 4 MiB and each WebSocket message capped at 1 MiB;
+- model reasoning effort is configurable with `AGENT_GRAPH_CODEX_REASONING_EFFORT`
+  (default: `high`; accepted values: `minimal`, `low`, `medium`, `high`, `xhigh`);
+- each JSON-RPC line and WebSocket message is capped at 4 MiB;
 - streamed assistant output capped at 256 KiB;
 - stderr retained as an 8 KiB tail and redacted before MCP errors;
 - stdio-only Codex-compatible test executables may use the legacy one-shot compatibility path.
 
-`graph max_parallelism` controls graph scheduling, while the persistent worker provides provider-side serialization. Increase provider concurrency only by implementing and measuring additional workers; do not assume graph fan-out is safe by itself.
+The graph's `max_parallelism` controls graph scheduling. For Codex App Server, the configured process-admission limit bounds Codex worker processes: one persistent worker serializes turns at limit one, while higher limits admit bounded one-shot workers. These are separate controls; graph fan-out does not establish provider-side concurrency.
 
 ### Setting your API key
 
@@ -150,7 +148,7 @@ OPENAI_API_KEY=sk-... agent-graph-mcpd --base-url https://api.openai.com/v1 --mo
 # DeepSeek
 OPENAI_API_KEY=sk-... agent-graph-mcpd --base-url https://api.deepseek.com/v1 --model deepseek-v4-pro
 
-# OpenRouter (any model)
+# OpenRouter (a model supported by your configured endpoint)
 OPENAI_API_KEY=sk-or-... agent-graph-mcpd --base-url https://openrouter.ai/api/v1 --model openai/gpt-4o
 
 # Alibaba MaaS (note: has gateway body-size limits — large councils may need trimming)
@@ -232,7 +230,7 @@ mcp_servers:
 
 ### Try it out
 
-Once configured, your agent can use any of the 29 tools directly. Try these natural language prompts:
+Once configured, your agent can use the available tools directly. Try these natural language prompts:
 
 > "Use the `council_deliberation` template to debate the merits of Rust vs. Go for systems programming."
 
@@ -286,13 +284,13 @@ Fan out to eight LLM nodes in parallel, then join results into a ninth LLM call 
 }
 ```
 
-The eight `agent_0` through `agent_7` branches are scheduled in parallel, subject to graph and provider-worker limits.  Each writes its own state key, the join collects those eight results into `{collected}`, and the report LLM call runs afterward.  The top-level `output_key` selects the final report.  This graph has nine LLM calls in total: eight parallel research calls and one serial report call.
+The eight `agent_0` through `agent_7` branches are scheduled in parallel subject to graph limits. In Codex App Server mode, worker-process admission is a separate bound; neither establishes provider-side concurrency. Each writes its own state key, the join collects those eight results into `{collected}`, and the report LLM call runs afterward. The top-level `output_key` selects the final report. This graph has nine LLM calls in total: eight research nodes on parallel graph branches and one report node that runs after the branch results. This describes graph scheduling, not provider-side concurrency.
 
 ## Loop and subgraph nodes
 
 - **`loop`** — bounded iteration. Config: `{"entry": "<body node>", "exit": "<node>|END", "max_iterations": 1..=32}`. The loop node re-enters `entry` (body should edge back to the loop node to sustain the cycle) and navigates to `exit` once the iteration budget is exhausted. The iteration counter lives in `__loop__:<loop node id>` and can be read by the body via `input_key`. Graph-level `max_iterations` is the outer safety net.
 - **`subgraph`** — execute another registered graph. Config: `{"graph_name": "<registered graph>", "input_key": "__input__", "output_key": "__subgraph_output__"}`. The referenced graph runs in-process with the parent's budget counters and cancellation; its terminal output is written under `output_key`. Nesting depth limit: 4.
-- **`human_approval`** — effect gate. Writes `__approval_request__` (pending) to state and interrupts; the effect is NOT executed without authority. Durable approvals are checkpoint-bound (run with `checkpoint: true` on deterministic transform chains); deciding an approval requires the authenticated operator transport. See the doctrine register for the full §13 contract.
+- **`human_approval`** — a graph-schema node. Its presence does not establish an end-to-end durable operator-decision/resume path: the model-facing approval tools expose checkpoint-bound request/list/get operations, not decision submission. It does not itself authorize external actions.
 
 ## Built-in templates
 
@@ -313,22 +311,22 @@ MCP Client ──→ agent-graph-mcp (proxy) ──Unix socket──→ agent-gr
                stdin/stdout                 framed              Tokio async I/O
 ```
 
-![HITL approval workflow diagram showing agent execution pausing at approval checkpoints, the human making a decision, and the agent resuming with the approved state](assets/hitl-workflow.svg)
+![Conceptual HITL approval workflow; operator-decision and resume steps are illustrative only and are not exposed as a model-facing decision flow in this snapshot](assets/hitl-workflow.svg)
 
-Durable approvals are SQLite-backed decisions over an already-created deterministic-local checkpoint.  This resume subset contains only linear `passthrough` and `state_transform` chains; LLM, router, join, parallel, loop, subgraph and `human_approval` nodes are outside it.  Request a checkpoint with `checkpoint: true`, inspect/request its approval, and use the authenticated operator transport for the decision.  A `human_approval` node can emit an interrupt signal, but that does not establish durable pause/resume of an LLM workflow or permission to execute an external action.
+With daemon SQLite storage and an integrity key configured, checkpoint-bound approval requests and metadata can be stored and inspected. The current model-facing tools expose request/list/get operations but do not submit approval decisions. Checkpoint/resume is limited to eligible deterministic-local linear `passthrough` and `state_transform` chains; LLM, router, join, parallel, loop, subgraph and `human_approval` nodes are outside that resume subset. The presence of a `human_approval` node does not establish a durable operator-decision/resume path or permission to execute an external action.
 
-## Tools (29)
+## Tools
 
-This count describes the current source router, including run triage and paginated verified-artifact reads. Published npm/Cargo packages can lag source changes; check the running server's `tools/list` rather than assuming a package with the same version number includes every later commit.
+This list describes the source router, including run triage and paginated verified-artifact reads. Published npm/Cargo packages can lag source changes; check the running server's `tools/list` rather than assuming a package with the same version number includes every later commit.
 
-**Graph lifecycle (4):** `graph_create`, `graph_list`, `graph_inspect`, `graph_render`
-**Execution (6):** `graph_execute`, `graph_run_start`, `graph_run_wait`, `graph_run_cancel`, `graph_run_get`, `graph_run_triage`
-**State & checkpoint (4):** `graph_run_state`, `graph_run_events`, `graph_run_checkpoint`, `graph_run_resume`
-**HITL approval (3):** `graph_approval_list`, `graph_approval_get`, `graph_approval_request`
-**Evidence (3):** `graph_source_witness_capture`, `graph_source_witness_get`, `graph_run_artifact`
-**Templates (4):** `graph_template_list`, `graph_template_instantiate`, `graph_template_candidates`, `graph_template_outcomes`
-**Receipts & status (3):** `graph_policy_check`, `graph_run_receipt`, `graph_status`
-**Retention (2):** `graph_retention_review`, `graph_retention_set`
+**Graph lifecycle:** `graph_create`, `graph_list`, `graph_inspect`, `graph_render`
+**Execution:** `graph_execute`, `graph_run_start`, `graph_run_wait`, `graph_run_cancel`, `graph_run_get`, `graph_run_triage`
+**State & checkpoint:** `graph_run_state`, `graph_run_events`, `graph_run_checkpoint`, `graph_run_resume`
+**HITL approval:** `graph_approval_list`, `graph_approval_get`, `graph_approval_request`
+**Evidence:** `graph_source_witness_capture`, `graph_source_witness_get`, `graph_run_artifact`
+**Templates:** `graph_template_list`, `graph_template_instantiate`, `graph_template_candidates`, `graph_template_outcomes`
+**Receipts & status:** `graph_policy_check`, `graph_run_receipt`, `graph_status`
+**Retention:** `graph_retention_review`, `graph_retention_set`
 
 ## Ecosystem
 
@@ -353,7 +351,7 @@ cargo build --release
 cargo test --lib --test daemon_recovery --test mcp_integration
 ```
 
-**Test evidence boundary:** No CI workflow is configured at this source revision. The commands above are suggested validation, not a fresh passing test result. The previous README reported a failure in `evidence::tests::witness_dependencies_verify_sqlite_content_and_span` related to a semantic-memory-mcp fixture path; its current state and impact need a new test run.
+**Test evidence boundary:** No GitHub Actions workflows are present under `.github/workflows/`; other CI systems and remote checks are not assessed here. The commands above are suggested local validation, not a report that those commands have passed for a particular checkout. Check the exact source revision and current remote checks separately before relying on test evidence.
 
 ## Troubleshooting
 
@@ -363,7 +361,7 @@ cargo test --lib --test daemon_recovery --test mcp_integration
 | LLM nodes hang | Provider unreachable or model name wrong | Test endpoint: `curl <your-base-url>/models` (Ollama) or `curl -H "Authorization: Bearer $OPENAI_API_KEY" <your-base-url>/models` (cloud) |
 | `graph_run_start` returns immediately | Run is async by default | Use `graph_run_wait` to block on completion, or `graph_execute` for sync |
 | "socket not found" | Daemon not started or socket path mismatch | Ensure `--socket` matches between daemon and proxy. Default is `/tmp/agent-graph/mcp.sock` |
-| Approval stuck | Deterministic checkpoint approval is pending | Inspect `graph_approval_list`/`graph_approval_get`; submit the decision through the authenticated operator transport |
+| Approval stuck | Deterministic checkpoint approval is pending | Inspect `graph_approval_list`/`graph_approval_get`; approval decisions are not exposed through the model-facing MCP tools |
 | Execution hangs silently | Logging too quiet | Run daemon with `RUST_LOG=debug agent-graph-mcpd ...` — logs to stderr. For `--direct` mode, add `RUST_LOG=debug` before the command |
 | Unknown model errors | Default model is `glm-5.2:cloud` | Always pass `--model`. The default exists for backward compatibility and won't exist on your endpoint |
 
@@ -371,9 +369,9 @@ cargo test --lib --test daemon_recovery --test mcp_integration
 
 - **Source version:** The checked-in `Cargo.toml` declares `agent-graph-mcp` 0.3.0. Check crates.io and npm independently for published versions and package contents; a source version does not certify either release.
 - **Platforms:** The source and examples target Unix-socket operation. This review did not run Linux, macOS, or Windows installation and runtime checks.
-- **No CI currently configured.** All verification is local.
+- **CI boundary:** this source snapshot has no GitHub Actions workflows under `.github/workflows/`; other CI systems and remote checks are not assessed here.
 - **Durable execution** requires the daemon. Direct mode is ephemeral.
-- **Max parallelism:** 16 nodes per parallel fan-out (compiler-enforced).
+- **Graph-level parallelism:** configurable from 1 through 100 per graph (default 8). This is a graph scheduling bound, not a claim about provider-side concurrency; Codex worker admission limits Codex worker processes.
 - **LLM providers:** OpenAI-compatible transport is implemented. Check each endpoint and model in the target environment; see [Provider and model configuration](#provider-and-model-configuration) for setup examples.
 
 ## Support, security, and contributing

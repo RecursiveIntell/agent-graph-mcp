@@ -920,12 +920,91 @@ fn model_mcp_cannot_nominate_an_executed_graph_for_deletion() {
 }
 
 #[test]
-fn readme_action_claims_match_the_callable_graph_execute_contract() {
+fn readme_claim_wording_guard() {
     let readme =
         std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md")).expect("README");
-    assert!(readme.contains("Normal execution is synchronous."));
+    let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+        .expect("Cargo.toml");
+    let approval_diagram = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/assets/hitl-workflow.svg"
+    ))
+    .expect("approval diagram");
+    assert!(readme.contains("A model supported by your configured endpoint."));
+    assert!(!readme.contains("Any model works"));
+    assert!(readme.contains("Graphs containing LLM nodes send calls"));
+    assert!(!readme.contains("Every graph run sends LLM calls"));
+    assert!(readme.contains("OpenRouter (a model supported by your configured endpoint)"));
+    assert!(!readme.contains("OpenRouter (any model)"));
+    assert!(readme
+        .contains("checkpoint-bound approval requests and metadata (not decision submission)"));
+    assert!(!readme.contains("HITL approvals"));
+    assert!(readme.contains("The commands above are suggested local validation, not a report that those commands have passed for a particular checkout."));
+    assert!(!readme.contains("The selected local candidate suite passed on 2026-11-16"));
+    assert!(!readme.contains("a previous README snapshot reported a failure"));
+    assert!(readme.contains("No GitHub Actions workflows are present under `.github/workflows/`; other CI systems and remote checks are not assessed here."));
+    assert!(!readme.contains("No CI workflow is configured at this source revision."));
+    assert!(readme.contains(
+        "parallel fan-out subject to graph limits; Codex App Server worker processes are subject to their configured process-admission limit"
+    ));
+    assert!(readme.contains("configurable from 1 through 100 per graph (default 8)"));
+    assert!(!readme.contains("16 nodes per parallel fan-out"));
+    assert!(readme.contains(
+        "With daemon SQLite storage and an integrity key configured, checkpoint/resume is available only for eligible deterministic-local linear"
+    ));
+    assert!(
+        readme.contains("approval decisions are not exposed through the model-facing MCP tools")
+    );
+    assert!(!readme.contains("a failed or timed-out turn discards that worker"));
+    assert!(readme.contains(
+        "the Rust default is 3, clamped at 32; the launcher script sets 9 unless overridden"
+    ));
+    assert!(readme.contains("higher configured limits admit bounded one-shot workers"));
+    assert!(readme.contains("configured process-admission limit bounds Codex worker processes"));
+    assert!(!readme.contains("workers for provider concurrency"));
+    assert!(readme.contains("does not establish provider-side concurrency"));
+    assert!(!readme.contains("provider-side concurrency may be lower"));
+    assert!(readme
+        .contains("This is a graph scheduling bound, not a claim about provider-side concurrency"));
+    assert!(readme.contains("worker-process admission is a separate bound; neither establishes provider-side concurrency"));
+    assert!(!readme.contains("subject to graph and provider-worker limits"));
+    assert!(readme.contains("accepted values: `minimal`, `low`, `medium`, `high`, `xhigh`"));
+    assert!(readme.contains("no GitHub Actions workflows under `.github/workflows/`"));
+    assert!(readme.contains("operator-decision and resume steps are illustrative only"));
+    assert!(!readme.contains("Durable approvals are SQLite-backed decisions"));
+    assert!(!readme.contains("an operator making a decision"));
+    assert!(!readme.contains("authenticated operator transport"));
+    assert!(readme.contains("a graph-schema node. Its presence does not establish an end-to-end durable operator-decision/resume path"));
+    assert!(readme
+        .contains("checkpoint-bound approval requests and metadata can be stored and inspected"));
+    assert!(approval_diagram.contains("ILLUSTRATIVE ONLY"));
+    assert!(approval_diagram.contains("Decision and resume path omitted"));
+    assert!(approval_diagram.contains("binds to an existing checkpoint"));
+    assert!(approval_diagram.contains("not resume-eligible"));
+    assert!(!approval_diagram.contains("writes checkpoint"));
+    assert!(!approval_diagram.contains("Graph pauses at"));
+    assert!(!approval_diagram.contains("marker-end"));
+    assert!(approval_diagram.contains("requires a configured integrity key"));
+    assert!(!approval_diagram.contains("AGENT_GRAPH_INTEGRITY_KEY_PATH"));
+    assert!(!approval_diagram.contains("Approve → Resume"));
+    assert!(!approval_diagram.contains("Reject → Terminal"));
+    assert!(readme.contains("This describes graph scheduling, not provider-side concurrency."));
+    assert!(!readme.contains("eight parallel research calls and one serial report call"));
+    assert!(readme
+        .contains("At process limit one, it reuses a persistent worker over a loopback WebSocket"));
+    assert!(readme.contains("higher configured limits admit bounded one-shot workers over stdio"));
+    assert!(readme.contains("scripts/launch-codex-daemon.sh` discovers enabled Codex MCP servers"));
+    assert!(readme.contains("AGENT_GRAPH_CODEX_REASONING_EFFORT`"));
+    assert!(readme.contains("(default: `high`; accepted values:"));
+    assert!(readme.contains("each JSON-RPC line and WebSocket message is capped at 4 MiB"));
+    assert!(!readme.contains("all through 29 typed MCP tools"));
+    assert!(!readme.contains("29 tools"));
+    assert!(!readme.contains("Run 9 agents at once"));
+    assert!(!manifest.contains("Run 9 agents at once"));
+    assert!(!manifest.contains("up to 16 nodes"));
+    assert!(!manifest.contains("HITL approvals"));
+    assert!(manifest.contains("checkpoint-bound approval request inspection"));
     assert!(!readme.contains("graph_execute {\"action\":\"start\",\"wait\":\"accepted\"}"));
-    assert!(readme.contains("Durable approval is supported only as a SQLite-backed decision"));
 }
 
 #[test]
@@ -940,7 +1019,7 @@ fn approval_tools_require_durable_sqlite_state() {
         ),
     ] {
         let response = mcp.call(tool, arguments);
-        // AG-002: approval tools removed from model MCP tool set; now return METHOD_NOT_FOUND
+        // graph_approval_decide is not a model-facing tool; list/get may still be registered but fail closed without durable storage.
         assert!(
             !response.get("ok").and_then(|v| v.as_bool()).unwrap_or(true)
                 || response.get("ok").is_none()
@@ -1381,7 +1460,7 @@ fn graph_delete_rejects_durable_execution_reference() {
     assert_eq!(waited["data"]["persistence_status"], "durable_terminal");
 
     // graph_delete is no longer a model-facing tool (AG-002).
-    // Model clients must use the authenticated operator path.
+    // This model-facing MCP call is not an authorized deletion route.
     let deleted = mcp.call("graph_delete", json!({"graph_id":"referenced"}));
     // Tool not registered → response has error_code but no "ok" field
     assert!(deleted.get("ok").is_none() || deleted["ok"] == false || deleted["ok"].is_null());
@@ -2623,7 +2702,7 @@ fn daemon_socket_proxy_lifecycle() {
         "within_limit"
     );
 
-    // AG-002: approval tools absent (removed from model tool set)
+    // AG-002: graph_approval_decide is absent; approval list/get/request remain separate tools.
     assert!(
         !names.contains(&"graph_approval_decide"),
         "graph_approval_decide should not be in tools list"
