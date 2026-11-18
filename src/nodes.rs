@@ -65,6 +65,32 @@ impl std::fmt::Debug for SubgraphExecutor {
     }
 }
 
+fn reserve_counter(counter: &AtomicU64, limit: Option<u64>, code: &str) -> Result<u64> {
+    reserve_counter_with_hook(counter, limit, code, || {})
+}
+
+fn reserve_counter_with_hook(
+    counter: &AtomicU64,
+    limit: Option<u64>,
+    code: &str,
+    before_exchange: impl Fn(),
+) -> Result<u64> {
+    let mut used = counter.load(Ordering::SeqCst);
+    loop {
+        if limit.is_some_and(|limit| used >= limit) {
+            return Err(AgentGraphError::PayloadError(code.to_owned()));
+        }
+        let next = used
+            .checked_add(1)
+            .ok_or_else(|| AgentGraphError::PayloadError(code.to_owned()))?;
+        before_exchange();
+        match counter.compare_exchange_weak(used, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return Ok(next),
+            Err(current) => used = current,
+        }
+    }
+}
+
 impl RunContext {
     fn check(&self) -> Result<()> {
         if self.cancelled.load(Ordering::SeqCst) {
@@ -78,37 +104,11 @@ impl RunContext {
     /// so failed and timed-out attempts still count and concurrent nodes cannot
     /// race past the budget. A denied attempt leaves the counter unchanged.
     pub fn reserve_llm_attempt(&self) -> Result<u64> {
-        match self
-            .llm_calls
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
-                if self.max_llm_calls.is_some_and(|limit| used >= limit) {
-                    None
-                } else {
-                    Some(used + 1)
-                }
-            }) {
-            // fetch_update returns the PREVIOUS value; the stored counter was
-            // already advanced to used+1, so the attempt number is used+1.
-            Ok(used) => Ok(used.saturating_add(1)),
-            Err(_) => Err(AgentGraphError::PayloadError("BUDGET_EXHAUSTED".to_owned())),
-        }
+        reserve_counter(&self.llm_calls, self.max_llm_calls, "BUDGET_EXHAUSTED")
     }
 
     pub fn reserve_node(&self) -> Result<u64> {
-        match self
-            .node_calls
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
-                if self.max_nodes.is_some_and(|limit| used >= limit) {
-                    None
-                } else {
-                    Some(used + 1)
-                }
-            }) {
-            Ok(used) => Ok(used.saturating_add(1)),
-            Err(_) => Err(AgentGraphError::PayloadError(
-                "MAX_NODES_EXCEEDED".to_owned(),
-            )),
-        }
+        reserve_counter(&self.node_calls, self.max_nodes, "MAX_NODES_EXCEEDED")
     }
 }
 
@@ -461,6 +461,81 @@ mod tests {
     use serde_json::json;
     use std::sync::{atomic::AtomicBool, Arc};
     use tokio::sync::Notify;
+
+    fn budget_test_context() -> super::RunContext {
+        super::RunContext {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            cancellation: Arc::new(Notify::new()),
+            llm_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            max_llm_calls: None,
+            node_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            max_nodes: None,
+            executor: crate::model_executor::ExecutorHandle::none(),
+            llm_invocations: Arc::new(std::sync::Mutex::new(Vec::new())),
+            subgraph: None,
+            subgraph_depth: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            subgraph_limit: 4,
+        }
+    }
+
+    #[test]
+    fn synchronized_contenders_cannot_both_reserve_last_slot() {
+        let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let threads: Vec<_> = (0..2)
+            .map(|_| {
+                let counter = counter.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let first = std::cell::Cell::new(true);
+                    super::reserve_counter_with_hook(&counter, Some(1), "BUDGET_EXHAUSTED", || {
+                        if first.replace(false) {
+                            barrier.wait();
+                        }
+                    })
+                    .is_ok()
+                })
+            })
+            .collect();
+        let accepted = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("worker"))
+            .filter(|accepted| *accepted)
+            .count();
+        assert_eq!(accepted, 1);
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn budget_counters_refuse_overflow_without_panic_or_wraparound() {
+        use std::sync::atomic::Ordering;
+        let ctx = budget_test_context();
+        ctx.llm_calls.store(u64::MAX, Ordering::SeqCst);
+        ctx.node_calls.store(u64::MAX, Ordering::SeqCst);
+        assert!(ctx.reserve_llm_attempt().is_err());
+        assert!(ctx.reserve_node().is_err());
+        assert_eq!(ctx.llm_calls.load(Ordering::SeqCst), u64::MAX);
+        assert_eq!(ctx.node_calls.load(Ordering::SeqCst), u64::MAX);
+    }
+
+    #[test]
+    fn budget_reservations_never_exceed_cap_under_contention() {
+        let mut ctx = budget_test_context();
+        ctx.max_llm_calls = Some(7);
+        let workers: Vec<_> = (0..16)
+            .map(|_| {
+                let ctx = ctx.clone();
+                std::thread::spawn(move || ctx.reserve_llm_attempt().is_ok())
+            })
+            .collect();
+        let admitted = workers
+            .into_iter()
+            .map(|w| w.join().expect("worker did not panic"))
+            .filter(|ok| *ok)
+            .count();
+        assert_eq!(admitted, 7);
+        assert_eq!(ctx.llm_calls.load(std::sync::atomic::Ordering::SeqCst), 7);
+    }
 
     #[tokio::test]
     async fn cancellation_primitive_wakes_a_pending_wait() {

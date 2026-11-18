@@ -199,6 +199,14 @@ fn execution_error_code(error: &str) -> &'static str {
 
 fn terminalize_early_failure(manager: &RunManager, run_id: &str, error: String) {
     let _ = manager.update(run_id, |record| {
+        let cancelled = record.cancelled.load(Ordering::SeqCst);
+        let terminal_error = (!cancelled).then_some(error.as_str());
+        let terminal = terminal_outcome(cancelled, terminal_error);
+        let error_code = if cancelled {
+            "CANCELLATION_REQUESTED"
+        } else {
+            execution_error_code(&error)
+        };
         let receipt = serde_json::json!({
             "schema": "agent-graph-mcp-receipt-v2",
             "run_id": record.run_id,
@@ -206,10 +214,10 @@ fn terminalize_early_failure(manager: &RunManager, run_id: &str, error: String) 
             "graph_version": record.graph_version,
             "input_digest": digest(&record.input),
             "output_digest": digest(&Value::Null),
-            "status": "failed",
-            "success": false,
-            "error": error,
-            "error_code": execution_error_code(&error),
+            "status": terminal.status,
+            "success": terminal.success,
+            "error": terminal_error,
+            "error_code": error_code,
             "persistence_status": "pending",
             "budgets": record
                 .budgets
@@ -227,8 +235,8 @@ fn terminalize_early_failure(manager: &RunManager, run_id: &str, error: String) 
             &record.state,
             &receipt,
         );
-        record.status = "failed".into();
-        record.success = Some(false);
+        record.status = terminal.status.into();
+        record.success = Some(terminal.success);
         record.error = receipt
             .get("error")
             .and_then(Value::as_str)
@@ -249,6 +257,8 @@ pub struct BudgetCounters {
 pub struct RunManager {
     inner: Arc<Mutex<Inner>>,
     counter: Arc<AtomicU64>,
+    #[cfg(test)]
+    before_terminal_update: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Provider API key attached to http(s) llm-pipeline calls as a Bearer
     /// header. Never serialized; codex-app-server:// carries no auth.
     api_key: Option<String>,
@@ -270,6 +280,8 @@ impl Default for RunManager {
                 reserved_async_slots: 0,
             })),
             counter: Arc::new(AtomicU64::new(1)),
+            #[cfg(test)]
+            before_terminal_update: None,
             api_key: None,
             provekv_executor: None,
         }
@@ -277,6 +289,15 @@ impl Default for RunManager {
 }
 
 impl RunManager {
+    #[cfg(test)]
+    pub(crate) fn with_before_terminal_update_hook(
+        mut self,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        self.before_terminal_update = Some(hook);
+        self
+    }
+
     pub fn with_provekv_executor(
         mut self,
         executor: Option<crate::provekv_executor::ProveKvExecutor>,
@@ -967,20 +988,17 @@ impl RunManager {
             "budget_counters":budget_counters,"budget_exhausted":budget_exhausted,
             "error_code":error.as_deref().map(execution_error_code)});
         let artifact = bundle(run_id, &graph_version, &input, &state_value, &receipt);
+        #[cfg(test)]
+        if let Some(hook) = &self.before_terminal_update {
+            hook();
+        }
         self.update(run_id, |r| {
-            let cancellation_observed = r.cancelled.load(Ordering::SeqCst);
-            let terminal_error = (!cancellation_observed).then(|| error.clone()).flatten();
-            let terminal = terminal_outcome(cancellation_observed, terminal_error.as_deref());
-            r.status = terminal.status.into();
-            r.success = Some(terminal.success);
             r.state = state_value.clone();
+            finalize_execution_outcome(r, &error, &receipt, &artifact);
             r.final_state = final_state.clone();
             r.steps = steps.clone();
-            r.error = terminal_error;
             r.budget_counters = budget_counters.clone();
             r.budget_exhausted = budget_exhausted.clone();
-            r.receipt = receipt.clone();
-            r.bundle = artifact.clone();
             r.persistence_status = "pending".into();
             for event in graph_events {
                 push_event(r, serde_json::to_value(event).unwrap_or(Value::Null));
@@ -1178,6 +1196,38 @@ impl RunManager {
 struct TerminalOutcome {
     status: &'static str,
     success: bool,
+}
+
+fn finalize_execution_outcome(
+    record: &mut RunRecord,
+    error: &Option<String>,
+    receipt: &Value,
+    artifact: &Value,
+) {
+    let cancelled = record.cancelled.load(Ordering::SeqCst);
+    let terminal_error = (!cancelled).then(|| error.clone()).flatten();
+    let terminal = terminal_outcome(cancelled, terminal_error.as_deref());
+    record.status = terminal.status.into();
+    record.success = Some(terminal.success);
+    record.error = terminal_error;
+    record.receipt = receipt.clone();
+    if cancelled {
+        if let Some(object) = record.receipt.as_object_mut() {
+            object.insert(
+                "error_code".into(),
+                Value::String("CANCELLATION_REQUESTED".into()),
+            );
+        }
+        record.bundle = bundle(
+            &record.run_id,
+            &record.graph_version,
+            &record.input,
+            &record.state,
+            &record.receipt,
+        );
+    } else {
+        record.bundle = artifact.clone();
+    }
 }
 
 fn terminal_outcome(cancelled: bool, error: Option<&str>) -> TerminalOutcome {
@@ -1390,6 +1440,75 @@ mod tests {
             "TOOL_EXECUTION_FAILURE"
         );
         assert_eq!(execution_error_code("compile failed"), "EXECUTION_FAILURE");
+    }
+
+    #[test]
+    fn cancellation_after_receipt_construction_reconciles_owner_and_bundle() {
+        let manager = RunManager::default();
+        let id = manager
+            .allocate("graph", "version", Value::Null)
+            .expect("allocate");
+        manager.admit_async(&id).expect("admit");
+        let error = Some("provider disconnected".to_owned());
+        let receipt = serde_json::json!({"error_code":"PROVIDER_FAILURE"});
+        let artifact = bundle(&id, "version", &Value::Null, &Value::Null, &receipt);
+        manager.cancel(&id).expect("cancel accepted");
+        manager
+            .update(&id, |record| {
+                finalize_execution_outcome(record, &error, &receipt, &artifact)
+            })
+            .expect("finalize");
+        let record = manager.get(&id).expect("run");
+        assert_eq!(record.status, "cancelled");
+        assert_eq!(record.receipt["error_code"], "CANCELLATION_REQUESTED");
+        assert_eq!(record.bundle["payload"]["receipt"], record.receipt);
+        assert_eq!(crate::evidence::verify(&record.bundle)["verified"], true);
+    }
+
+    #[test]
+    fn finalization_without_cancellation_preserves_execution_receipt_and_bundle() {
+        for error in [None, Some("provider disconnected".to_owned())] {
+            let manager = RunManager::default();
+            let id = manager
+                .allocate("graph", "version", Value::Null)
+                .expect("allocate");
+            let receipt =
+                serde_json::json!({"error_code":error.as_deref().map(execution_error_code)});
+            let artifact = bundle(&id, "version", &Value::Null, &Value::Null, &receipt);
+            manager
+                .update(&id, |record| {
+                    finalize_execution_outcome(record, &error, &receipt, &artifact)
+                })
+                .expect("finalize");
+            let record = manager.get(&id).expect("run");
+            assert_eq!(
+                record.status,
+                if error.is_some() {
+                    "failed"
+                } else {
+                    "completed"
+                }
+            );
+            assert_eq!(record.receipt, receipt);
+            assert_eq!(record.bundle, artifact);
+            assert_eq!(crate::evidence::verify(&record.bundle)["verified"], true);
+        }
+    }
+
+    #[test]
+    fn early_failure_after_accepted_cancellation_has_consistent_terminal_receipt() {
+        let manager = RunManager::default();
+        let id = manager
+            .allocate("graph", "version", Value::Null)
+            .expect("allocate");
+        manager.cancel(&id).expect("cancellation accepted");
+        terminalize_early_failure(&manager, &id, "provider disconnected".to_owned());
+        let run = manager.get(&id).expect("run exists");
+        assert_eq!(run.status, "cancelled");
+        assert_eq!(run.success, Some(false));
+        assert_eq!(run.receipt["status"], "cancelled");
+        assert_eq!(run.receipt["error_code"], "CANCELLATION_REQUESTED");
+        assert_eq!(run.bundle["payload"]["receipt"], run.receipt);
     }
 
     #[test]
