@@ -1158,10 +1158,7 @@ pub fn run_turn_pooled(
         changed.notify_all();
         return Err(error);
     }
-    let mut server = match server {
-        Ok(server) => server,
-        Err(error) => return Err(error),
-    };
+    let mut server = server?;
     let result = server.run_turn(cwd, prompt, timeout);
     let stderr = if result.is_err() {
         shared_stderr_text(&server.stderr)

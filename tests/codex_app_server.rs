@@ -223,8 +223,8 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"turn":{"id"
                     fake.parent().unwrap(),
                     "hello",
                     Duration::from_millis(700),
-        None,
-        None,
+                    None,
+                    None,
                 )
             })
         })

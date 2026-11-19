@@ -615,7 +615,7 @@ fn worker_supplied_ledger_alone_is_not_proof() {
         &json!({"x":1}),
         "forged",
         Utc::now(),
-        &vec![0x99; 32], // wrong key
+        &[0x99; 32], // wrong key
     )
     .unwrap();
     assert_eq!(
