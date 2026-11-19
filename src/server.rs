@@ -1154,7 +1154,9 @@ impl AgentGraphServer {
                 self.base_url.clone(),
                 self.default_model.clone(),
                 self.store.clone(),
-                move |record| Self::persist_terminal_and_mark(completion_runs, terminal_store, record),
+                move |record| {
+                    Self::persist_terminal_and_mark(completion_runs, terminal_store, record)
+                },
             );
         }
 
