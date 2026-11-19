@@ -128,6 +128,9 @@ pub struct GraphExecuteParams {
     /// Optional idempotency key. Reusing a key returns the existing run result.
     #[serde(default)]
     pub idempotency_key: Option<String>,
+    /// LOCK contract-v1 host grant for managed launches (see RunStartParams).
+    #[serde(default)]
+    pub host_grant: Option<Value>,
 }
 
 // ─── Status ───────────────────────────────────────────────────────────
@@ -243,6 +246,11 @@ pub struct RunStartParams {
     /// and leave the run paused until graph_run_resume consumes it.
     #[serde(default)]
     pub checkpoint: Option<bool>,
+    /// LOCK contract-v1 host grant for managed launches. Opaque reference
+    /// material issued by the Ares session owner; the daemon validates the
+    /// binding but never treats a graph-supplied route as authorization.
+    #[serde(default)]
+    pub host_grant: Option<Value>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]

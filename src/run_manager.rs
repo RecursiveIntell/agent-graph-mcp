@@ -85,6 +85,8 @@ pub struct RunRecord {
     pub checkpoint_digest: Option<String>,
     pub approval: Option<Value>,
     pub resumed: bool,
+    /// Opaque host admission reference; never included in public projections.
+    pub host_grant: Option<Value>,
     pub cancelled: Arc<AtomicBool>,
     pub cancellation: Arc<Notify>,
 }
@@ -359,10 +361,18 @@ impl RunManager {
             checkpoint_digest: None,
             approval: None,
             resumed: false,
+            host_grant: None,
             cancelled: Arc::new(AtomicBool::new(false)),
             cancellation: Arc::new(Notify::new()),
         };
         self.insert_record(record)
+    }
+
+    pub fn set_host_grant(&self, id: &str, grant: Value) -> Result<(), String> {
+        let mut inner = self.inner.lock().map_err(|_| "run registry poisoned")?;
+        let record = inner.runs.get_mut(id).ok_or("run not found")?;
+        record.host_grant = Some(grant);
+        Ok(())
     }
 
     fn insert_record(&self, record: RunRecord) -> Result<String, String> {
@@ -419,6 +429,7 @@ impl RunManager {
             checkpoint_digest: Some(resumed.checkpoint_digest),
             approval: resumed.approval,
             resumed: true,
+            host_grant: None,
             cancelled: Arc::new(AtomicBool::new(false)),
             cancellation: Arc::new(Notify::new()),
         };
@@ -554,6 +565,9 @@ impl RunManager {
             checkpoint_digest,
             approval,
             resumed,
+            host_grant,
+            record_graph_id,
+            record_graph_version,
         ) = {
             let inner = self.inner.lock().map_err(|_| "run registry poisoned")?;
             let r = inner.runs.get(run_id).ok_or("run not found")?;
@@ -567,6 +581,9 @@ impl RunManager {
                 r.checkpoint_digest.clone(),
                 r.approval.clone(),
                 r.resumed,
+                r.host_grant.clone(),
+                r.graph_id.clone(),
+                r.graph_version.clone(),
             )
         };
         let provider = safe_provider_label(&base_url);
@@ -588,6 +605,8 @@ impl RunManager {
         let subgraph_depth = Arc::new(AtomicU32::new(0));
         let subgraph_limit: u32 = 4;
         let subgraph_holder: Arc<Mutex<Option<SubgraphExecutor>>> = Arc::new(Mutex::new(None));
+        let host_grant_for_subgraphs = host_grant.clone();
+        let parent_run_id = run_id.to_owned();
         let sub_runner: SubgraphExecutor = SubgraphExecutor {
             inner: Arc::new({
                 let holder = subgraph_holder.clone();
@@ -618,12 +637,14 @@ impl RunManager {
                     let llm_calls = llm_calls.clone();
                     let node_calls = node_calls.clone();
                     let llm_invocations = llm_invocations.clone();
+                    let host_grant = host_grant_for_subgraphs.clone();
+                    let run_id = parent_run_id.clone();
                     let subgraph_depth = subgraph_depth.clone();
                     Box::pin(async move {
                         let Some(store) = store.as_ref() else {
                             return Err("subgraph: store unavailable".into());
                         };
-                        let Some((spec_json, _hash)) = store
+                        let Some((spec_json, graph_version)) = store
                             .load_graph(&graph_name)
                             .map_err(|e| format!("subgraph load error: {e}"))?
                         else {
@@ -641,6 +662,10 @@ impl RunManager {
                             CompileContext {
                                 base_url: base_url.clone(),
                                 default_model: default_model.clone(),
+                                host_grant: host_grant.clone(),
+                                run_id: run_id.clone(),
+                                graph_id: graph_name.clone(),
+                                graph_version: graph_version.clone(),
                                 cancelled: cancelled.clone(),
                                 cancellation: cancellation.clone(),
                                 events: sub_events.clone(),
@@ -698,6 +723,10 @@ impl RunManager {
             CompileContext {
                 base_url,
                 default_model,
+                host_grant: host_grant.clone(),
+                run_id: run_id.to_owned(),
+                graph_id: record_graph_id,
+                graph_version: record_graph_version,
                 cancelled: cancelled.clone(),
                 cancellation: cancellation.clone(),
                 events: events.clone(),
