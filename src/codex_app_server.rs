@@ -310,6 +310,7 @@ pub fn run_turn(
     prompt: &str,
     timeout: Duration,
     requested_effort: Option<&str>,
+    _authorization_scope: Option<&str>,
 ) -> Result<String, String> {
     if model.trim().is_empty() {
         return Err("codex model must not be empty".to_owned());
@@ -323,8 +324,9 @@ pub fn run_turn(
     let _process_permit = acquire_process()?;
     let deadline = Instant::now() + timeout;
     let model_config = format!("model={model:?}");
-    let reasoning_effort = requested_effort.map(str::to_owned).unwrap_or_else(||
-        std::env::var("AGENT_GRAPH_CODEX_REASONING_EFFORT").unwrap_or_else(|_| "high".to_owned()));
+    let reasoning_effort = requested_effort.map(str::to_owned).unwrap_or_else(|| {
+        std::env::var("AGENT_GRAPH_CODEX_REASONING_EFFORT").unwrap_or_else(|_| "high".to_owned())
+    });
     if !matches!(
         reasoning_effort.as_str(),
         "minimal" | "low" | "medium" | "high" | "xhigh"
@@ -751,7 +753,12 @@ struct PersistentAppServer {
 }
 
 impl PersistentAppServer {
-    fn start(codex_bin: &str, model: &str, cwd: &Path, requested_effort: Option<&str>) -> Result<Self, String> {
+    fn start(
+        codex_bin: &str,
+        model: &str,
+        cwd: &Path,
+        requested_effort: Option<&str>,
+    ) -> Result<Self, String> {
         let process_permit = acquire_process()?;
         let listener = TcpListener::bind("127.0.0.1:0")
             .map_err(|e| format!("reserve codex app-server listener: {e}"))?;
@@ -762,8 +769,10 @@ impl PersistentAppServer {
         drop(listener);
         let listen_url = format!("ws://127.0.0.1:{port}");
         let model_config = format!("model={model:?}");
-        let reasoning_effort = requested_effort.map(str::to_owned).unwrap_or_else(||
-            std::env::var("AGENT_GRAPH_CODEX_REASONING_EFFORT").unwrap_or_else(|_| "high".to_owned()));
+        let reasoning_effort = requested_effort.map(str::to_owned).unwrap_or_else(|| {
+            std::env::var("AGENT_GRAPH_CODEX_REASONING_EFFORT")
+                .unwrap_or_else(|_| "high".to_owned())
+        });
         if !matches!(
             reasoning_effort.as_str(),
             "minimal" | "low" | "medium" | "high" | "xhigh"
@@ -996,7 +1005,9 @@ impl PersistentAppServer {
     }
 
     fn matches(&self, codex_bin: &str, model: &str, cwd: &Path, reasoning_effort: &str) -> bool {
-        self.codex_bin == codex_bin && self.model == model && self.cwd == cwd
+        self.codex_bin == codex_bin
+            && self.model == model
+            && self.cwd == cwd
             && self.reasoning_effort == reasoning_effort
     }
 }
@@ -1014,6 +1025,7 @@ struct PoolKey {
     model: String,
     cwd: PathBuf,
     reasoning_effort: String,
+    authorization_scope: Option<String>,
 }
 
 struct PoolLane {
@@ -1029,7 +1041,12 @@ struct PersistentPool {
 static PERSISTENT_POOL: OnceLock<(Mutex<PersistentPool>, Condvar)> = OnceLock::new();
 
 fn persistent_pool() -> &'static (Mutex<PersistentPool>, Condvar) {
-    PERSISTENT_POOL.get_or_init(|| (Mutex::new(PersistentPool { lanes: Vec::new() }), Condvar::new()))
+    PERSISTENT_POOL.get_or_init(|| {
+        (
+            Mutex::new(PersistentPool { lanes: Vec::new() }),
+            Condvar::new(),
+        )
+    })
 }
 
 fn pool_lane_limit() -> usize {
@@ -1040,7 +1057,10 @@ fn pool_lane_limit() -> usize {
         return 1;
     }
     let configured = std::env::var("AGENT_GRAPH_CODEX_POOL_LANES")
-        .ok().and_then(|v| v.parse::<usize>().ok()).filter(|v| *v > 0).unwrap_or(2);
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(2);
     configured.min(process_admission().limit).min(8)
 }
 
@@ -1055,6 +1075,7 @@ pub fn run_turn_pooled(
     prompt: &str,
     timeout: Duration,
     requested_effort: Option<&str>,
+    authorization_scope: Option<&str>,
 ) -> Result<String, String> {
     if model.trim().is_empty() {
         return Err("codex model must not be empty".to_owned());
@@ -1065,26 +1086,45 @@ pub fn run_turn_pooled(
             MAX_PROMPT_BYTES
         ));
     }
-    let reasoning_effort = requested_effort.map(str::to_owned).unwrap_or_else(||
-        std::env::var("AGENT_GRAPH_CODEX_REASONING_EFFORT").unwrap_or_else(|_| "high".to_owned()));
-    if !matches!(reasoning_effort.as_str(), "minimal" | "low" | "medium" | "high" | "xhigh") {
-        return Err(format!("unsupported Codex reasoning effort: {reasoning_effort}"));
+    let reasoning_effort = requested_effort.map(str::to_owned).unwrap_or_else(|| {
+        std::env::var("AGENT_GRAPH_CODEX_REASONING_EFFORT").unwrap_or_else(|_| "high".to_owned())
+    });
+    if !matches!(
+        reasoning_effort.as_str(),
+        "minimal" | "low" | "medium" | "high" | "xhigh"
+    ) {
+        return Err(format!(
+            "unsupported Codex reasoning effort: {reasoning_effort}"
+        ));
     }
-    let key = PoolKey { codex_bin: codex_bin.to_owned(), model: model.to_owned(),
-                        cwd: cwd.to_path_buf(), reasoning_effort: reasoning_effort.clone() };
+    let key = PoolKey {
+        codex_bin: codex_bin.to_owned(),
+        model: model.to_owned(),
+        cwd: cwd.to_path_buf(),
+        reasoning_effort: reasoning_effort.clone(),
+        authorization_scope: authorization_scope.map(str::to_owned),
+    };
     let (pool_lock, changed) = persistent_pool();
     let limit = pool_lane_limit();
 
     let (index, server) = loop {
         let mut pool = pool_lock.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some(index) = pool.lanes.iter().position(|lane| !lane.busy && lane.key == key) {
+        if let Some(index) = pool
+            .lanes
+            .iter()
+            .position(|lane| !lane.busy && lane.key == key)
+        {
             pool.lanes[index].busy = true;
             let server = pool.lanes[index].server.take();
             break (index, server);
         }
         if pool.lanes.len() < limit {
             let index = pool.lanes.len();
-            pool.lanes.push(PoolLane { key: key.clone(), busy: true, server: None });
+            pool.lanes.push(PoolLane {
+                key: key.clone(),
+                busy: true,
+                server: None,
+            });
             break (index, None);
         }
         if let Some(index) = pool.lanes.iter().position(|lane| !lane.busy) {
@@ -1095,7 +1135,8 @@ pub fn run_turn_pooled(
             drop(server); // retire idle mismatched worker before replacement
             break (index, None);
         }
-        let (next, wait) = changed.wait_timeout(pool, ADMISSION_WAIT_TIMEOUT)
+        let (next, wait) = changed
+            .wait_timeout(pool, ADMISSION_WAIT_TIMEOUT)
             .unwrap_or_else(|error| error.into_inner());
         if wait.timed_out() {
             return Err("persistent Codex pool lane admission timed out".to_owned());
@@ -1110,7 +1151,10 @@ pub fn run_turn_pooled(
     };
     if let Err(error) = server {
         let mut pool = pool_lock.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(lane) = pool.lanes.get_mut(index) { lane.busy = false; lane.server = None; }
+        if let Some(lane) = pool.lanes.get_mut(index) {
+            lane.busy = false;
+            lane.server = None;
+        }
         changed.notify_all();
         return Err(error);
     }
@@ -1119,14 +1163,22 @@ pub fn run_turn_pooled(
         Err(error) => return Err(error),
     };
     let result = server.run_turn(cwd, prompt, timeout);
-    let stderr = if result.is_err() { shared_stderr_text(&server.stderr) } else { String::new() };
+    let stderr = if result.is_err() {
+        shared_stderr_text(&server.stderr)
+    } else {
+        String::new()
+    };
     let mut pool = pool_lock.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(lane) = pool.lanes.get_mut(index) {
         lane.busy = false;
         lane.server = if result.is_ok() { Some(server) } else { None };
     }
     changed.notify_all();
-    if result.is_err() { attach_stderr_context(result, stderr) } else { result }
+    if result.is_err() {
+        attach_stderr_context(result, stderr)
+    } else {
+        result
+    }
 }
 
 #[cfg(test)]

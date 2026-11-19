@@ -318,6 +318,15 @@ impl Node for LlmNode {
             let prompt = rendered.clone();
             let timeout = std::time::Duration::from_millis(self.timeout_ms);
             let reasoning_effort = self.reasoning_effort.clone();
+            // Warm workers may be reused only within the same owner grant
+            // until a separate host-issued pool lease exists.
+            let authorization_scope = self
+                .ctx
+                .host_grant
+                .as_ref()
+                .and_then(|grant| grant.get("reference"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             let cwd = std::env::current_dir().map_err(|e| {
                 AgentGraphError::PayloadError(format!("codex working directory unavailable: {e}"))
             })?;
@@ -325,11 +334,11 @@ impl Node for LlmNode {
                 result = tokio::task::spawn_blocking(move || {
                     if crate::codex_app_server::use_persistent_worker() {
                         crate::codex_app_server::run_turn_pooled(
-                            "codex", &model, &cwd, &prompt, timeout, reasoning_effort.as_deref(),
+                            "codex", &model, &cwd, &prompt, timeout, reasoning_effort.as_deref(), authorization_scope.as_deref(),
                         )
                     } else {
                         crate::codex_app_server::run_turn(
-                            "codex", &model, &cwd, &prompt, timeout, reasoning_effort.as_deref(),
+                            "codex", &model, &cwd, &prompt, timeout, reasoning_effort.as_deref(), authorization_scope.as_deref(),
                         )
                     }
                 }) => {

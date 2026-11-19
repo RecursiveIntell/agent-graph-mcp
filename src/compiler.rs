@@ -390,9 +390,12 @@ pub fn compile(spec: &GraphSpec, cx: CompileContext) -> Result<AgentGraph, Strin
                 let reasoning_effort = match node.config.get("reasoning_effort") {
                     None | Some(serde_json::Value::Null) => None,
                     Some(value) => {
-                        let effort = value.as_str().ok_or_else(|| format!(
-                            "node '{}': config.reasoning_effort must be a string", node.id
-                        ))?;
+                        let effort = value.as_str().ok_or_else(|| {
+                            format!(
+                                "node '{}': config.reasoning_effort must be a string",
+                                node.id
+                            )
+                        })?;
                         if !matches!(effort, "minimal" | "low" | "medium" | "high" | "xhigh") {
                             return Err(format!(
                                 "node '{}': unsupported config.reasoning_effort '{}'; expected minimal|low|medium|high|xhigh",
@@ -839,7 +842,8 @@ mod tests {
             host_grant: None,
             run_id: "effort-test-run".into(),
             graph_id: "effort-test-graph".into(),
-            graph_version: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            graph_version:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
             cancelled: Arc::new(AtomicBool::new(false)),
             cancellation: Arc::new(tokio::sync::Notify::new()),
             events: Arc::new(Mutex::new(Vec::new())),
@@ -873,7 +877,10 @@ mod tests {
 
     #[test]
     fn per_node_effort_rejects_unknown_and_wrong_type() {
-        for config in [json!({"reasoning_effort":"turbo"}), json!({"reasoning_effort":3})] {
+        for config in [
+            json!({"reasoning_effort":"turbo"}),
+            json!({"reasoning_effort":3}),
+        ] {
             let spec = effort_spec(config);
             assert!(compile(&spec, test_compile_context("codex-app-server://")).is_err());
         }
