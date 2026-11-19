@@ -57,13 +57,25 @@ fn structured_output(value: Value) -> Json<StructuredOutput> {
 pub(crate) const HOST_ADMISSION_SCHEMA: &str = "ares.graph-admission/v1";
 const HOST_ADMISSION_MAX_FRAME: usize = 65_536;
 
+fn resolve_host_admission_endpoint(
+    explicit: Option<std::ffi::OsString>,
+    hermes_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> PathBuf {
+    if let Some(path) = explicit {
+        return PathBuf::from(path);
+    }
+    if let Some(profile_home) = hermes_home.filter(|value| !value.is_empty()) {
+        return PathBuf::from(profile_home).join("run/graph-admission/authority.sock");
+    }
+    PathBuf::from(home.unwrap_or_default()).join(".ares/run/graph-admission/authority.sock")
+}
+
 fn host_admission_endpoint() -> PathBuf {
-    std::env::var_os("AGENT_GRAPH_ADMISSION_SOCKET")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
-                .join(".ares/run/graph-admission/authority.sock")
-        })
+    let explicit = std::env::var_os("AGENT_GRAPH_ADMISSION_SOCKET");
+    let hermes_home = std::env::var_os("HERMES_HOME");
+    let home = std::env::var_os("HOME");
+    resolve_host_admission_endpoint(explicit, hermes_home, home)
 }
 
 /// Ask the live Ares owner over its peer-credentialed Unix socket. This is the
@@ -3177,6 +3189,52 @@ mod tests {
     use super::*;
     use crate::run_manager::RunManager;
     use crate::store::PersistentStore;
+
+    #[test]
+    fn host_admission_endpoint_uses_profile_home_before_default_home() {
+        let endpoint = resolve_host_admission_endpoint(
+            None,
+            Some("/profiles/secondary".into()),
+            Some("/home/operator".into()),
+        );
+        assert_eq!(
+            endpoint,
+            PathBuf::from("/profiles/secondary/run/graph-admission/authority.sock")
+        );
+    }
+
+    #[test]
+    fn explicit_admission_socket_override_wins_over_profile_home() {
+        let endpoint = resolve_host_admission_endpoint(
+            Some("/run/custom/authority.sock".into()),
+            Some("/profiles/secondary".into()),
+            Some("/home/operator".into()),
+        );
+        assert_eq!(endpoint, PathBuf::from("/run/custom/authority.sock"));
+    }
+
+    #[test]
+    fn empty_explicit_admission_socket_override_does_not_fall_back() {
+        let endpoint = resolve_host_admission_endpoint(
+            Some("".into()),
+            Some("/profiles/secondary".into()),
+            Some("/home/operator".into()),
+        );
+        assert_eq!(endpoint, PathBuf::new());
+    }
+
+    #[test]
+    fn absent_or_empty_profile_home_preserves_default_profile_path() {
+        let default = PathBuf::from("/home/operator/.ares/run/graph-admission/authority.sock");
+        assert_eq!(
+            resolve_host_admission_endpoint(None, None, Some("/home/operator".into())),
+            default
+        );
+        assert_eq!(
+            resolve_host_admission_endpoint(None, Some("".into()), Some("/home/operator".into()),),
+            default
+        );
+    }
 
     fn configure_test_integrity_key() {
         let path = std::env::temp_dir().join("agent-graph-mcp-unit-integrity.key");
