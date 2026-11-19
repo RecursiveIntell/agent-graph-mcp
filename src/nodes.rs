@@ -26,6 +26,12 @@ use crate::tool_exec::ToolExecContext;
 pub struct RunContext {
     pub cancelled: Arc<AtomicBool>,
     pub cancellation: Arc<Notify>,
+    /// Opaque host authority reference and its immutable run binding. Never
+    /// included in graph state, prompts, receipts, or public run projections.
+    pub host_grant: Option<Value>,
+    pub run_id: String,
+    pub graph_id: String,
+    pub graph_version: String,
     /// Shared pre-invocation attempt counter. Incremented atomically for every
     /// provider attempt, including attempts that later fail or time out.
     pub llm_calls: Arc<AtomicU64>,
@@ -110,6 +116,55 @@ impl RunContext {
     pub fn reserve_node(&self) -> Result<u64> {
         reserve_counter(&self.node_calls, self.max_nodes, "MAX_NODES_EXCEEDED")
     }
+
+    /// Obtain a fresh owner claim immediately before every provider attempt.
+    /// A configured route or static host_grant field is not permission.
+    pub async fn authorize_host_provider(
+        &self,
+        node_id: &str,
+        attempt: u64,
+        model: &str,
+        requested_effort: &str,
+    ) -> Result<()> {
+        let Some(grant) = self.host_grant.as_ref() else {
+            return Ok(());
+        };
+        let reference = grant
+            .get("reference")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AgentGraphError::PayloadError("HOST_GRANT_INVALID".into()))?;
+        let route = grant
+            .get("execution_route")
+            .cloned()
+            .ok_or_else(|| AgentGraphError::PayloadError("HOST_GRANT_INVALID".into()))?;
+        if route.get("model").and_then(Value::as_str) != Some(model) {
+            return Err(AgentGraphError::PayloadError(
+                "HOST_GRANT_ROUTE_MISMATCH".into(),
+            ));
+        }
+        let request = serde_json::json!({
+            "schema": crate::server::HOST_ADMISSION_SCHEMA,
+            "reference": reference,
+            "stage": "provider",
+            "graph_id": self.graph_id,
+            "graph_version": self.graph_version,
+            "request_digest": grant.get("request_digest").cloned().unwrap_or(Value::Null),
+            "execution_route": route,
+            "run_id": self.run_id,
+            "node_id": node_id,
+            "invocation_ref": format!("{}:{}", node_id, attempt),
+            "requested_effort": requested_effort,
+        });
+        let reply =
+            tokio::task::spawn_blocking(move || crate::server::call_host_admission_owner(&request))
+                .await
+                .map_err(|_| AgentGraphError::PayloadError("HOST_OWNER_UNAVAILABLE".into()))?
+                .map_err(|code| AgentGraphError::PayloadError(code.into()))?;
+        if reply.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err(AgentGraphError::PayloadError("HOST_OWNER_DENIED".into()));
+        }
+        Ok(())
+    }
 }
 
 async fn cancellation_requested(
@@ -146,6 +201,8 @@ pub struct LlmNode {
     pub evidence_required: bool,
     pub max_tokens: Option<usize>,
     pub timeout_ms: u64,
+    /// Optional per-node Codex effort. `None` inherits the daemon process policy.
+    pub reasoning_effort: Option<String>,
     pub input_key: String,
     pub output_key: String,
     /// Optional file path to prepend to the prompt for project-specific context.
@@ -185,6 +242,20 @@ impl Node for LlmNode {
         // Reserve the provider attempt before any invocation; the limit cannot
         // be bypassed by parallel nodes and failed calls still count.
         let attempt = self.ctx.reserve_llm_attempt()?;
+        // Every provider attempt requires a fresh SessionDB owner claim. Tool
+        // loops and nested subgraphs are refused in managed mode until every
+        // internal provider send has a corresponding claim boundary.
+        let inherited_effort;
+        let effective_effort = if let Some(effort) = self.reasoning_effort.as_deref() {
+            effort
+        } else {
+            inherited_effort = std::env::var("AGENT_GRAPH_CODEX_REASONING_EFFORT")
+                .unwrap_or_else(|_| "high".to_owned());
+            inherited_effort.as_str()
+        };
+        self.ctx
+            .authorize_host_provider(&self.id, attempt, model, effective_effort)
+            .await?;
         // Check for a local model executor before falling through to the
         // default provider path. Lease material never enters the prompt,
         // graph state, or provider body — only the lease digest is safe
@@ -246,6 +317,16 @@ impl Node for LlmNode {
             let model = model.to_owned();
             let prompt = rendered.clone();
             let timeout = std::time::Duration::from_millis(self.timeout_ms);
+            let reasoning_effort = self.reasoning_effort.clone();
+            // Warm workers may be reused only within the same owner grant
+            // until a separate host-issued pool lease exists.
+            let authorization_scope = self
+                .ctx
+                .host_grant
+                .as_ref()
+                .and_then(|grant| grant.get("reference"))
+                .and_then(Value::as_str)
+                .map(str::to_owned);
             let cwd = std::env::current_dir().map_err(|e| {
                 AgentGraphError::PayloadError(format!("codex working directory unavailable: {e}"))
             })?;
@@ -253,11 +334,11 @@ impl Node for LlmNode {
                 result = tokio::task::spawn_blocking(move || {
                     if crate::codex_app_server::use_persistent_worker() {
                         crate::codex_app_server::run_turn_pooled(
-                            "codex", &model, &cwd, &prompt, timeout,
+                            "codex", &model, &cwd, &prompt, timeout, reasoning_effort.as_deref(), authorization_scope.as_deref(),
                         )
                     } else {
                         crate::codex_app_server::run_turn(
-                            "codex", &model, &cwd, &prompt, timeout,
+                            "codex", &model, &cwd, &prompt, timeout, reasoning_effort.as_deref(), authorization_scope.as_deref(),
                         )
                     }
                 }) => {
@@ -466,6 +547,10 @@ mod tests {
         super::RunContext {
             cancelled: Arc::new(AtomicBool::new(false)),
             cancellation: Arc::new(Notify::new()),
+            host_grant: None,
+            run_id: "fixture-run".into(),
+            graph_id: "fixture-graph".into(),
+            graph_version: "fixture-version".into(),
             llm_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             max_llm_calls: None,
             node_calls: Arc::new(std::sync::atomic::AtomicU64::new(0)),

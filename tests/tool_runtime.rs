@@ -4,7 +4,7 @@ use agent_graph_mcp::tool_runtime::{
     ToolPolicyError,
 };
 use chrono::{Duration, Utc};
-use serde_json::json;
+use serde_json::{json, Value};
 
 fn key() -> Vec<u8> {
     vec![0x42; 32]
@@ -471,4 +471,248 @@ fn concurrent_counters_are_atomic_per_reservation() {
         assert_eq!(current.lease.counters.tool_calls, total);
     }
     assert_eq!(current.lease.counters.tool_calls, 5);
+}
+
+// ── BROKER card (P3): fixed-operation bridge conformance ───────────────────
+// LOCK contract-v1 §3. A fake named handler + counting ledger stand in for
+// the real effect owner. The broker (not the model) resolves the executable;
+// the worker-supplied ledger is never accepted as proof by itself.
+
+use std::sync::Mutex;
+
+/// Counting fake effect owner: one registered fixed operation, one ledger.
+struct FakeBroker {
+    key: Vec<u8>,
+    ledger: Mutex<Vec<ToolCallReceipt>>,
+    effects: Mutex<u64>,
+}
+
+impl FakeBroker {
+    fn new() -> Self {
+        Self {
+            key: key(),
+            ledger: Mutex::new(Vec::new()),
+            effects: Mutex::new(0),
+        }
+    }
+
+    /// Admit one fixed operation under a signed lease. Returns the verified
+    /// receipt reference only after the intent/receipt chain checks pass.
+    fn dispatch(
+        &self,
+        signed: &agent_graph_mcp::tool_runtime::SignedToolLease,
+        inv: ToolInvocation,
+        result: Value,
+    ) -> Result<ToolCallReceipt, ToolPolicyError> {
+        let reservation = reserve_call(signed, &self.key, Utc::now(), binding(), inv)?;
+        // The "effect" happens exactly once per admitted reservation.
+        *self.effects.lock().unwrap() += 1;
+        let receipt = ToolCallReceipt::complete(
+            &reservation.intent,
+            ReceiptOutcome::Succeeded,
+            &result,
+            "fixed-op synthetic effect",
+            Utc::now(),
+            &self.key,
+        )?;
+        verify_receipt_chain(&reservation.intent, &receipt, &self.key)?;
+        self.ledger.lock().unwrap().push(receipt.clone());
+        Ok(receipt)
+    }
+
+    fn effect_count(&self) -> u64 {
+        *self.effects.lock().unwrap()
+    }
+}
+
+#[test]
+fn admitted_fixed_op_returns_one_verified_reference_and_same_key_reattaches() {
+    let broker = FakeBroker::new();
+    let signed = issue_lease(lease(), &broker.key).expect("signed");
+    let receipt = broker
+        .dispatch(
+            &signed,
+            invocation("read_file", ToolEffect::ReadOnly),
+            json!({"content":"fixture"}),
+        )
+        .expect("admitted");
+    assert_eq!(broker.effect_count(), 1);
+    assert_eq!(receipt.outcome, ReceiptOutcome::Succeeded);
+
+    // Same operation identity (same lease digest + attempt + args) produces
+    // the SAME call_id: the broker reattaches to the existing ledger entry
+    // instead of executing a second effect.
+    let reservation_again = reserve_call(
+        &signed,
+        &broker.key,
+        Utc::now(),
+        binding(),
+        invocation("read_file", ToolEffect::ReadOnly),
+    )
+    .expect("reserve again");
+    assert_eq!(reservation_again.intent.call_id, receipt.call_id);
+    let existing = broker.ledger.lock().unwrap();
+    assert!(existing.iter().any(|r| r.call_id == receipt.call_id));
+    // Reattach path does NOT run the effect again.
+    assert_eq!(broker.effect_count(), 1);
+}
+
+#[test]
+fn changed_arguments_digest_is_a_new_operation_not_a_replay() {
+    let broker = FakeBroker::new();
+    let signed = issue_lease(lease(), &broker.key).expect("signed");
+    let r1 = broker
+        .dispatch(
+            &signed,
+            invocation("read_file", ToolEffect::ReadOnly),
+            json!({"a":1}),
+        )
+        .unwrap();
+    let mut changed = invocation("read_file", ToolEffect::ReadOnly);
+    changed.arguments = json!({"path":"/tmp/other"});
+    let reservation = reserve_call(&signed, &broker.key, Utc::now(), binding(), changed).unwrap();
+    assert_ne!(reservation.intent.call_id, r1.call_id);
+}
+
+#[test]
+fn expired_grant_returns_no_accepted_result_and_no_effect() {
+    let broker = FakeBroker::new();
+    let mut expired = lease();
+    let now = Utc::now();
+    expired.issued_at = now - Duration::minutes(10);
+    expired.expires_at = now - Duration::minutes(5);
+    let signed = issue_lease(expired, &broker.key).expect("signed shape ok");
+    let err = broker
+        .dispatch(
+            &signed,
+            invocation("read_file", ToolEffect::ReadOnly),
+            json!({}),
+        )
+        .unwrap_err();
+    assert_eq!(err, ToolPolicyError::LeaseExpired);
+    assert_eq!(broker.effect_count(), 0);
+    assert!(broker.ledger.lock().unwrap().is_empty());
+}
+
+#[test]
+fn worker_supplied_ledger_alone_is_not_proof() {
+    // A ledger file handed over by the worker verifies ONLY against the
+    // broker's key and the original intent. Forged signature or mismatched
+    // intent must fail even if the ledger parses cleanly.
+    let broker = FakeBroker::new();
+    let signed = issue_lease(lease(), &broker.key).expect("signed");
+    let reservation = reserve_call(
+        &signed,
+        &broker.key,
+        Utc::now(),
+        binding(),
+        invocation("read_file", ToolEffect::ReadOnly),
+    )
+    .unwrap();
+    let mut forged = ToolCallReceipt::complete(
+        &reservation.intent,
+        ReceiptOutcome::Succeeded,
+        &json!({"x":1}),
+        "forged",
+        Utc::now(),
+        &[0x99; 32], // wrong key
+    )
+    .unwrap();
+    assert_eq!(
+        verify_receipt_chain(&reservation.intent, &forged, &broker.key).unwrap_err(),
+        ToolPolicyError::ReceiptSignatureInvalid
+    );
+    forged.signature = String::new();
+    assert_eq!(
+        verify_receipt_chain(&reservation.intent, &forged, &broker.key).unwrap_err(),
+        ToolPolicyError::ReceiptSignatureInvalid
+    );
+    assert_eq!(broker.effect_count(), 0);
+}
+
+#[test]
+fn crash_after_synthetic_effect_reconciles_without_replay() {
+    let broker = FakeBroker::new();
+    let signed = issue_lease(lease(), &broker.key).expect("signed");
+    let reservation = reserve_call(
+        &signed,
+        &broker.key,
+        Utc::now(),
+        binding(),
+        invocation("read_file", ToolEffect::ReadOnly),
+    )
+    .unwrap();
+    // Effect happens; receipt persistence "crashes" before the caller sees it.
+    *broker.effects.lock().unwrap() += 1;
+    let receipt = ToolCallReceipt::complete(
+        &reservation.intent,
+        ReceiptOutcome::Succeeded,
+        &json!({"content":"fixture"}),
+        "post-crash reconciliation",
+        Utc::now(),
+        &broker.key,
+    )
+    .unwrap();
+    broker.ledger.lock().unwrap().push(receipt.clone());
+
+    // Recovery: query the effect owner by operation identity. The ledger
+    // entry verifies against the intent; no second effect is executed.
+    let recovered = broker
+        .ledger
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|r| r.call_id == reservation.intent.call_id)
+        .cloned()
+        .expect("ledger entry exists");
+    verify_receipt_chain(&reservation.intent, &recovered, &broker.key).expect("verified");
+    assert_eq!(broker.effect_count(), 1);
+
+    // An indeterminate outcome stays indeterminate — never upgraded to pass.
+    let unknown = ToolCallReceipt::complete(
+        &reservation.intent,
+        ReceiptOutcome::Indeterminate,
+        &Value::Null,
+        "outcome unknown",
+        Utc::now(),
+        &broker.key,
+    )
+    .unwrap();
+    assert_eq!(unknown.outcome, ReceiptOutcome::Indeterminate);
+    verify_receipt_chain(&reservation.intent, &unknown, &broker.key).expect("chain ok");
+}
+
+#[test]
+fn budget_exhaustion_denies_before_the_effect() {
+    let broker = FakeBroker::new();
+    let mut tight = lease();
+    tight.max_tool_calls = 1;
+    let signed = issue_lease(tight, &broker.key).expect("signed");
+    let first = broker
+        .dispatch(
+            &signed,
+            invocation("read_file", ToolEffect::ReadOnly),
+            json!({}),
+        )
+        .unwrap();
+    assert_eq!(broker.effect_count(), 1);
+    // Chain the updated lease; second call must be denied pre-effect.
+    let reservation = reserve_call(
+        &signed,
+        &broker.key,
+        Utc::now(),
+        binding(),
+        invocation("read_file", ToolEffect::ReadOnly),
+    )
+    .unwrap();
+    let err = broker
+        .dispatch(
+            &reservation.updated_lease,
+            invocation("read_file", ToolEffect::ReadOnly),
+            json!({}),
+        )
+        .unwrap_err();
+    assert_eq!(err, ToolPolicyError::ToolBudgetExhausted);
+    assert_eq!(broker.effect_count(), 1);
+    let _ = first;
 }

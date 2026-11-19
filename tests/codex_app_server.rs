@@ -58,6 +58,8 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"turn":{"id"
         dir.path(),
         "hello",
         Duration::from_secs(2),
+        None,
+        None,
     )
     .unwrap();
     assert_eq!(text, "safe result");
@@ -85,6 +87,8 @@ exit 2
         dir.path(),
         "hello",
         Duration::from_secs(2),
+        None,
+        None,
     )
     .unwrap_err();
 
@@ -114,6 +118,8 @@ exit 2
         dir.path(),
         "hello",
         Duration::from_secs(2),
+        None,
+        None,
     )
     .unwrap_err();
 
@@ -136,6 +142,8 @@ fn rejects_oversized_prompt_before_starting_child() {
         dir.path(),
         &prompt,
         Duration::from_secs(2),
+        None,
+        None,
     )
     .unwrap_err();
 
@@ -174,6 +182,8 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"turn":{"id"
         dir.path(),
         "hello",
         Duration::from_secs(2),
+        None,
+        None,
     )
     .unwrap_err();
 
@@ -213,6 +223,8 @@ printf '%s\n' '{"jsonrpc":"2.0","method":"turn/completed","params":{"turn":{"id"
                     fake.parent().unwrap(),
                     "hello",
                     Duration::from_millis(700),
+                    None,
+                    None,
                 )
             })
         })
@@ -314,6 +326,8 @@ server.close()
         dir.path(),
         "hello",
         Duration::from_secs(5),
+        None,
+        None,
     )
     .unwrap();
     assert_eq!(text, "memory-safe result");

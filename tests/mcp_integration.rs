@@ -1,8 +1,10 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::{mpsc, Mutex, OnceLock};
+use std::thread::JoinHandle;
 
+use agent_graph_mcp::evidence::digest;
 use rusqlite::Connection;
 use serde_json::{json, Value};
 
@@ -13,6 +15,8 @@ struct Mcp {
     output: BufReader<ChildStdout>,
     stderr: ChildStderr,
     id: u64,
+    host_auth_stop: Option<mpsc::Sender<()>>,
+    host_auth_thread: Option<JoinHandle<()>>,
 }
 
 impl Mcp {
@@ -39,6 +43,15 @@ impl Mcp {
         Self::spawn_with_fake_codex(data_dir, fake_codex_bin_dir, None)
     }
 
+    fn new_managed_with_fake_codex(
+        data_dir: &std::path::Path,
+        fake_codex_bin_dir: &std::path::Path,
+    ) -> Self {
+        // Operator-owned startup opt-in for managed enforcement (LOCK v1),
+        // set on the daemon child env only — never the shared test process.
+        Self::spawn_with_fake_codex_managed(data_dir, fake_codex_bin_dir, None, true)
+    }
+
     fn new_with_data_dir_fake_codex_and_api_key(
         data_dir: &std::path::Path,
         fake_codex_bin_dir: &std::path::Path,
@@ -51,6 +64,15 @@ impl Mcp {
         data_dir: &std::path::Path,
         fake_codex_bin_dir: &std::path::Path,
         api_key: Option<&str>,
+    ) -> Self {
+        Self::spawn_with_fake_codex_managed(data_dir, fake_codex_bin_dir, api_key, false)
+    }
+
+    fn spawn_with_fake_codex_managed(
+        data_dir: &std::path::Path,
+        fake_codex_bin_dir: &std::path::Path,
+        api_key: Option<&str>,
+        managed: bool,
     ) -> Self {
         let key_path = test_integrity_key();
         let mut paths = vec![fake_codex_bin_dir.to_path_buf()];
@@ -80,8 +102,22 @@ impl Mcp {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        let authority_path = data_dir.join("run").join("authority.sock");
+        let (host_auth_stop, host_auth_thread) = if managed {
+            let (stop, thread) = start_fake_host_authority(&authority_path);
+            (Some(stop), Some(thread))
+        } else {
+            (None, None)
+        };
         if let Some(api_key) = api_key {
             daemon_cmd.args(["--api-key", api_key]);
+        }
+        if managed {
+            daemon_cmd
+                .env("AGENT_GRAPH_MANAGED_ENFORCEMENT", "1")
+                .env("AGENT_GRAPH_ADMISSION_SOCKET", &authority_path);
+        } else {
+            daemon_cmd.env_remove("AGENT_GRAPH_MANAGED_ENFORCEMENT");
         }
         let daemon = daemon_cmd.spawn().expect("daemon spawn");
         let mut connected = false;
@@ -108,6 +144,8 @@ impl Mcp {
             .env("PATH", &path_env);
         let mut mcp = Self::from_command(command);
         mcp.daemon = Some(daemon);
+        mcp.host_auth_stop = host_auth_stop;
+        mcp.host_auth_thread = host_auth_thread;
         mcp
     }
 
@@ -153,6 +191,8 @@ impl Mcp {
             output,
             stderr,
             id: 0,
+            host_auth_stop: None,
+            host_auth_thread: None,
         };
         let _ = mcp.request(
             "initialize",
@@ -287,6 +327,111 @@ fn test_integrity_key() -> &'static std::path::Path {
     path
 }
 
+fn start_fake_host_authority(socket_path: &std::path::Path) -> (mpsc::Sender<()>, JoinHandle<()>) {
+    use std::collections::HashSet;
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent).expect("authority socket parent");
+    }
+    let _ = std::fs::remove_file(socket_path);
+    let listener = UnixListener::bind(socket_path).expect("fake authority bind");
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
+        .expect("authority socket mode");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let launched = Arc::new(Mutex::new(HashSet::<(String, String)>::new()));
+    let invocations = Arc::new(Mutex::new(HashSet::<(String, String)>::new()));
+    let attempt = Arc::new(AtomicU64::new(1));
+    let thread = std::thread::spawn(move || loop {
+        if stop_rx.try_recv().is_ok() {
+            break;
+        }
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .ok();
+                stream
+                    .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+                    .ok();
+                let reply = (|| -> std::io::Result<Value> {
+                    let mut header = [0u8; 4];
+                    stream.read_exact(&mut header)?;
+                    let n = u32::from_be_bytes(header) as usize;
+                    if n == 0 || n > 65536 { return Ok(json!({"schema":"ares.graph-admission/v1","ok":false,"code":"graph_admission_request_invalid"})); }
+                    let mut body = vec![0u8; n];
+                    stream.read_exact(&mut body)?;
+                    let req: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    let reference = req.get("reference").and_then(Value::as_str).unwrap_or("").to_string();
+                    let run_id = req.get("run_id").and_then(Value::as_str).unwrap_or("").to_string();
+                    let stage = req.get("stage").and_then(Value::as_str).unwrap_or("");
+                    let graph = req.get("graph_id").and_then(Value::as_str).unwrap_or("");
+                    let version = req.get("graph_version").and_then(Value::as_str).unwrap_or("");
+                    let digest = req.get("request_digest").and_then(Value::as_str).unwrap_or("");
+                    let route_ok = req.get("execution_route").and_then(Value::as_object).is_some();
+                    let mut ok = !reference.is_empty()
+                        && !graph.is_empty() && version.starts_with("sha256:")
+                        && digest.starts_with("sha256:") && route_ok;
+                    let mut code = "HOST_OWNER_DENIED";
+                    if ok && stage == "launch" {
+                        if reference == "fixture-reference" {
+                            ok = false;
+                            code = "graph_admission_unknown";
+                        } else if reference.starts_with("expired-") {
+                            ok = false;
+                            code = "graph_admission_expired";
+                        } else if reference.starts_with("revoked-")
+                            && !reference.starts_with("revoked-provider-")
+                        {
+                            ok = false;
+                            code = "orchestration_revision_changed";
+                        } else {
+                            ok = launched.lock().unwrap().insert((reference.clone(), run_id.clone()));
+                            code = "graph_admission_replay";
+                        }
+                    } else if ok && stage == "provider" {
+                        let node = req.get("node_id").and_then(Value::as_str).unwrap_or("");
+                        let inv = req.get("invocation_ref").and_then(Value::as_str).unwrap_or("");
+                        if reference.starts_with("revoked-provider-") {
+                            ok = false;
+                            code = "orchestration_revision_changed";
+                        } else {
+                            ok = launched.lock().unwrap().contains(&(reference.clone(), run_id.clone()))
+                                && !node.is_empty() && !inv.is_empty()
+                                && invocations.lock().unwrap().insert((reference.clone(), inv.to_string()));
+                            code = "graph_admission_replay";
+                        }
+                    } else if ok {
+                        ok = false;
+                        code = "graph_admission_request_invalid";
+                    }
+                    let id = attempt.fetch_add(1, Ordering::SeqCst);
+                    if ok {
+                        Ok(json!({"schema":"ares.graph-admission/v1","ok":true,
+                                  "admission":{"attempt_id":format!("fake-{id}"),"session_id":"[REDACTED]","revision":1,"effect":"graph","status":"admitted"}}))
+                    } else {
+                        Ok(json!({"schema":"ares.graph-admission/v1","ok":false,"code":code}))
+                    }
+                })().unwrap_or_else(|_| json!({"schema":"ares.graph-admission/v1","ok":false,"code":"HOST_OWNER_UNAVAILABLE"}));
+                if let Ok(body) = serde_json::to_vec(&reply) {
+                    let _ = stream.write_all(&(body.len() as u32).to_be_bytes());
+                    let _ = stream.write_all(&body);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(_) => break,
+        }
+    });
+    (stop_tx, thread)
+}
+
 fn fake_codex_bin_dir(root: &std::path::Path) -> std::path::PathBuf {
     let bin_dir = root.join("fake-codex-bin");
     std::fs::create_dir_all(&bin_dir).expect("fake codex directory");
@@ -317,6 +462,12 @@ impl Drop for Mcp {
         if let Some(mut daemon) = self.daemon.take() {
             let _ = daemon.kill();
             let _ = daemon.wait();
+        }
+        if let Some(stop) = self.host_auth_stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(thread) = self.host_auth_thread.take() {
+            let _ = thread.join();
         }
     }
 }
@@ -2716,4 +2867,409 @@ fn daemon_socket_proxy_lifecycle() {
     drop(stream);
     let _ = daemon.kill();
     let _ = daemon.wait();
+}
+
+fn make_host_grant(
+    graph_id: &str,
+    graph_version: &str,
+    input: Value,
+    idempotency_key: &str,
+    budgets: Option<Value>,
+    reference: &str,
+) -> Value {
+    let request_digest = digest(&json!({
+        "operation":"graph_run_start",
+        "graph_id":graph_id,
+        "graph_version":graph_version,
+        "input":input,
+        "thread_id":null,
+        "budgets":budgets,
+        "checkpoint":false,
+        "idempotency_key":idempotency_key,
+    }));
+    json!({
+        "schema":"ares.graph-admission/v1",
+        "reference":reference,
+        "graph_id":graph_id,
+        "graph_version":graph_version,
+        "request_digest":request_digest,
+        "execution_route":{"provider":"openai-codex","model":"fake-model","reasoning_effort":"low"},
+        "deadline_seconds":60.0,
+        "budget_invocations":budgets.as_ref()
+            .and_then(|b| b.get("max_llm_calls"))
+            .and_then(Value::as_u64).unwrap_or(4),
+        "route_generation":1,
+    })
+}
+
+// ── DAEMON card (P1): host-grant enforcement witnesses ─────────────────────
+// LOCK contract-v1 §3. Counting fake provider: each invocation appends one
+// line to a ledger file, so admitted/denied attempt counts are observed from
+// the effect owner, not inferred from run status.
+
+fn counting_fake_codex_bin_dir(
+    root: &std::path::Path,
+    ledger: &std::path::Path,
+) -> std::path::PathBuf {
+    let bin_dir = root.join("counting-codex-bin");
+    std::fs::create_dir_all(&bin_dir).expect("counting codex directory");
+    let fake_codex = bin_dir.join("codex");
+    let script = format!(
+        r##"#!/bin/sh
+printf 'invocation\n' >> '{ledger}'
+read line
+printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{}}}}'
+read line
+read line
+printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"thread":{{"id":"thread-test"}}}}}}'
+read line
+printf '%s\n' '{{"jsonrpc":"2.0","id":3,"result":{{"turn":{{"id":"turn-test"}}}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{{"delta":"deterministic LLM output"}}}}'
+printf '%s\n' '{{"jsonrpc":"2.0","method":"turn/completed","params":{{"turn":{{"id":"turn-test"}}}}}}'
+"##,
+        ledger = ledger.display()
+    );
+    std::fs::write(&fake_codex, script).expect("counting codex script");
+    std::fs::set_permissions(&fake_codex, std::fs::Permissions::from_mode(0o700))
+        .expect("counting codex mode");
+    bin_dir
+}
+
+fn ledger_count(ledger: &std::path::Path) -> usize {
+    std::fs::read_to_string(ledger)
+        .map(|s| s.lines().filter(|l| !l.is_empty()).count())
+        .unwrap_or(0)
+}
+
+fn single_llm_spec(name: &str) -> Value {
+    json!({"spec":{
+        "name":name, "entry":"ask", "output_key":"answer",
+        "nodes":[{"id":"ask","type":"llm","model":"fake-model","prompt":"reply","config":{"output_key":"answer","timeout_ms":4_000}}],
+        "edges":[{"from":"ask","to":"END"}]
+    }})
+}
+
+#[test]
+fn managed_launch_requires_host_grant_and_unmanaged_path_is_not_a_fallback() {
+    let temp = tempfile::tempdir().expect("workspace");
+    let data_dir = temp.path().join("graph-data");
+    let ledger = temp.path().join("invocations.log");
+    let bins = counting_fake_codex_bin_dir(temp.path(), &ledger);
+    let mut mcp = Mcp::new_managed_with_fake_codex(&data_dir, &bins);
+    // Managed enforcement is operator-owned (daemon startup flag). There is
+    // no MCP toggle: a model cannot enable, disable, or query-grant itself.
+    let created = mcp.call("graph_create", single_llm_spec("managed-no-grant"));
+    assert_eq!(created["ok"], true, "{created}");
+
+    // No grant: typed refusal BEFORE any provider invocation.
+    let denied = mcp.call(
+        "graph_run_start",
+        json!({"graph_id":"managed-no-grant","input":{"request":"no grant"}}),
+    );
+    assert_eq!(denied["ok"], false, "{denied}");
+    assert_eq!(denied["error_code"], "HOST_GRANT_REQUIRED");
+    assert_eq!(ledger_count(&ledger), 0);
+
+    // Even a well-shaped, caller-supplied reference/digest is not authority.
+    let forged_input = json!({"request":"forged"});
+    let forged_grant = make_host_grant(
+        "managed-no-grant",
+        created["graph_version"].as_str().unwrap(),
+        forged_input.clone(),
+        "forged-op",
+        None,
+        "fixture-reference",
+    );
+    let forged = mcp.call(
+        "graph_run_start",
+        json!({
+            "graph_id":"managed-no-grant", "graph_version":created["graph_version"],
+            "input":forged_input.clone(),
+            "idempotency_key":"forged-op", "host_grant":forged_grant
+        }),
+    );
+    assert_eq!(forged["ok"], false, "{forged}");
+    assert_eq!(forged["error_code"], "HOST_OWNER_DENIED");
+    assert_eq!(ledger_count(&ledger), 0);
+}
+
+#[test]
+fn admitted_grant_counts_one_attempt_and_duplicate_start_reattaches() {
+    let temp = tempfile::tempdir().expect("workspace");
+    let data_dir = temp.path().join("graph-data");
+    let ledger = temp.path().join("invocations.log");
+    let bins = counting_fake_codex_bin_dir(temp.path(), &ledger);
+    let mut mcp = Mcp::new_managed_with_fake_codex(&data_dir, &bins);
+    let created = mcp.call("graph_create", single_llm_spec("managed-admitted"));
+    assert_eq!(created["ok"], true, "{created}");
+    let version = created["graph_version"].as_str().unwrap();
+    let input = json!({"request":"admitted"});
+    let grant = make_host_grant(
+        "managed-admitted",
+        version,
+        input.clone(),
+        "op-1",
+        None,
+        "owner-issued-fixture",
+    );
+
+    let started = mcp.call(
+        "graph_run_start",
+        json!({"graph_id":"managed-admitted","graph_version":version,
+            "input":input,"idempotency_key":"op-1","host_grant":grant}),
+    );
+    assert_eq!(started["ok"], true, "{started}");
+    let run_id = started["run_id"].as_str().expect("run id").to_owned();
+    let completed = mcp.call(
+        "graph_run_wait",
+        json!({"run_id":run_id,"timeout_ms":8_000}),
+    );
+    assert_eq!(completed["data"]["status"], "completed", "{completed}");
+    assert_eq!(ledger_count(&ledger), 1);
+
+    // Same operation key + same material: original handle, no second start.
+    let again = mcp.call(
+        "graph_run_start",
+        json!({"graph_id":"managed-admitted","graph_version":version,
+            "input":input,"idempotency_key":"op-1","host_grant":grant}),
+    );
+    assert_eq!(again["ok"], true, "{again}");
+    assert_eq!(again["run_id"], run_id);
+    assert_eq!(ledger_count(&ledger), 1);
+
+    // Changed digest under the same key: conflict, no new invocation.
+    let changed_input = json!({"request":"different"});
+    let changed_grant = make_host_grant(
+        "managed-admitted",
+        version,
+        changed_input.clone(),
+        "op-1",
+        None,
+        "owner-issued-fixture",
+    );
+    let conflict = mcp.call(
+        "graph_run_start",
+        json!({"graph_id":"managed-admitted","graph_version":version,
+            "input":changed_input,"idempotency_key":"op-1","host_grant":changed_grant}),
+    );
+    assert_eq!(conflict["ok"], false, "{conflict}");
+    assert_eq!(conflict["error_code"], "IDEMPOTENCY_CONFLICT");
+    assert_eq!(ledger_count(&ledger), 1);
+}
+
+#[test]
+fn expired_or_revoked_owner_grant_never_reaches_the_provider() {
+    let temp = tempfile::tempdir().expect("workspace");
+    let data_dir = temp.path().join("graph-data");
+    let ledger = temp.path().join("invocations.log");
+    let bins = counting_fake_codex_bin_dir(temp.path(), &ledger);
+    let mut mcp = Mcp::new_managed_with_fake_codex(&data_dir, &bins);
+    let created = mcp.call("graph_create", single_llm_spec("managed-expired"));
+    assert_eq!(created["ok"], true, "{created}");
+    let version = created["graph_version"].as_str().unwrap();
+
+    let expired_input = json!({"request":"expired"});
+    let expired_grant = make_host_grant(
+        "managed-expired",
+        version,
+        expired_input.clone(),
+        "expired-op",
+        None,
+        "expired-owner-reference",
+    );
+    let expired = mcp.call(
+        "graph_run_start",
+        json!({
+        "graph_id":"managed-expired","graph_version":version,
+        "input":expired_input,"idempotency_key":"expired-op","host_grant":expired_grant}),
+    );
+    assert_eq!(expired["ok"], false, "{expired}");
+    assert_eq!(expired["error_code"], "HOST_GRANT_EXPIRED");
+    assert_eq!(ledger_count(&ledger), 0);
+
+    let revoked_input = json!({"request":"revoked"});
+    let revoked_grant = make_host_grant(
+        "managed-expired",
+        version,
+        revoked_input.clone(),
+        "revoked-op",
+        None,
+        "revoked-owner-reference",
+    );
+    let revoked = mcp.call(
+        "graph_run_start",
+        json!({
+        "graph_id":"managed-expired","graph_version":version,
+        "input":revoked_input,"idempotency_key":"revoked-op","host_grant":revoked_grant}),
+    );
+    assert_eq!(revoked["ok"], false, "{revoked}");
+    assert_eq!(revoked["error_code"], "HOST_GRANT_REVOKED");
+    assert_eq!(ledger_count(&ledger), 0);
+}
+
+#[test]
+fn grant_budget_is_enforced_across_parallel_branches_before_invocation() {
+    let temp = tempfile::tempdir().expect("workspace");
+    let data_dir = temp.path().join("graph-data");
+    let ledger = temp.path().join("invocations.log");
+    let bins = counting_fake_codex_bin_dir(temp.path(), &ledger);
+    let mut mcp = Mcp::new_managed_with_fake_codex(&data_dir, &bins);
+    let spec = json!({"spec":{
+        "name":"managed-budget","entry":"fork","output_key":"joined","max_parallelism":2,
+        "nodes":[
+            {"id":"fork","type":"passthrough"},
+            {"id":"a","type":"llm","model":"fake-model","prompt":"a","config":{"output_key":"a_out","timeout_ms":4_000}},
+            {"id":"b","type":"llm","model":"fake-model","prompt":"b","config":{"output_key":"b_out","timeout_ms":4_000}},
+            {"id":"join","type":"join","config":{"inputs":["a_out","b_out"],"mode":"collect_object","output":"joined"}}
+        ],
+        "edges":[{"from":"fork","to":"a"},{"from":"fork","to":"b"},{"from":"a","to":"join"},{"from":"b","to":"join"},{"from":"join","to":"END"}]
+    }});
+    let created = mcp.call("graph_create", spec);
+    assert_eq!(created["ok"], true, "{created}");
+    let version = created["graph_version"].as_str().unwrap();
+    let input = json!({"request":"two branches"});
+    let budgets = json!({"max_llm_calls":1,"max_wall_clock_ms":60000});
+    let grant = make_host_grant(
+        "managed-budget",
+        version,
+        input.clone(),
+        "budget-op",
+        Some(budgets.clone()),
+        "owner-issued-fixture",
+    );
+    let started = mcp.call(
+        "graph_run_start",
+        json!({"graph_id":"managed-budget","graph_version":version,
+            "input":input,"idempotency_key":"budget-op","budgets":budgets,"host_grant":grant}),
+    );
+    assert_eq!(started["ok"], true, "{started}");
+    let run_id = started["run_id"].as_str().expect("run id").to_owned();
+    let completed = mcp.call(
+        "graph_run_wait",
+        json!({"run_id":run_id,"timeout_ms":8_000}),
+    );
+    // The concurrent branches race at pre-invocation reservation: at most one
+    // provider effect can start; cancellation may win before the admitted
+    // branch reaches the fake provider, so zero is also truthful.
+    assert!(ledger_count(&ledger) <= 1, "{completed}");
+    assert_eq!(completed["data"]["status"], "failed", "{completed}");
+}
+
+#[test]
+fn direct_managed_execute_entry_also_requires_the_grant() {
+    let temp = tempfile::tempdir().expect("workspace");
+    let data_dir = temp.path().join("graph-data");
+    let ledger = temp.path().join("invocations.log");
+    let bins = counting_fake_codex_bin_dir(temp.path(), &ledger);
+    let mut mcp = Mcp::new_managed_with_fake_codex(&data_dir, &bins);
+    assert_eq!(
+        mcp.call("graph_create", single_llm_spec("managed-execute"))["ok"],
+        true
+    );
+    let denied = mcp.call(
+        "graph_execute",
+        json!({"graph_id":"managed-execute","input":{"request":"direct"},"mode":"async"}),
+    );
+    assert_eq!(denied["ok"], false, "{denied}");
+    assert_eq!(denied["error_code"], "HOST_GRANT_OPERATION_UNQUALIFIED");
+    assert_eq!(ledger_count(&ledger), 0);
+}
+
+#[test]
+fn daemon_down_owner_socket_denies_before_run_start() {
+    let temp = tempfile::tempdir().expect("workspace");
+    let data_dir = temp.path().join("graph-data");
+    let ledger = temp.path().join("invocations.log");
+    let bins = counting_fake_codex_bin_dir(temp.path(), &ledger);
+    let mut mcp = Mcp::new_managed_with_fake_codex(&data_dir, &bins);
+    // Remove the real fixture owner before submission: managed mode must
+    // fail closed, never invoke the provider or fall back to legacy.
+    if let Some(stop) = mcp.host_auth_stop.take() {
+        let _ = stop.send(());
+    }
+    if let Some(thread) = mcp.host_auth_thread.take() {
+        let _ = thread.join();
+    }
+    let created = mcp.call("graph_create", single_llm_spec("managed-owner-down"));
+    assert_eq!(created["ok"], true, "{created}");
+    let version = created["graph_version"].as_str().unwrap();
+    let input = json!({"request":"owner down"});
+    let grant = make_host_grant(
+        "managed-owner-down",
+        version,
+        input.clone(),
+        "owner-down-op",
+        None,
+        "owner-issued-fixture",
+    );
+    let result = mcp.call(
+        "graph_run_start",
+        json!({
+            "graph_id":"managed-owner-down", "graph_version":version,
+            "input":input, "idempotency_key":"owner-down-op", "host_grant":grant
+        }),
+    );
+    assert_eq!(result["ok"], false, "{result}");
+    assert_eq!(result["error_code"], "HOST_OWNER_UNAVAILABLE");
+    assert_eq!(ledger_count(&ledger), 0);
+}
+
+#[test]
+fn owner_revocation_between_launch_and_provider_denies_actual_provider_call() {
+    let temp = tempfile::tempdir().expect("workspace");
+    let data_dir = temp.path().join("graph-data");
+    let ledger = temp.path().join("invocations.log");
+    let bins = counting_fake_codex_bin_dir(temp.path(), &ledger);
+    let mut mcp = Mcp::new_managed_with_fake_codex(&data_dir, &bins);
+    let created = mcp.call("graph_create", single_llm_spec("managed-revoked"));
+    assert_eq!(created["ok"], true, "{created}");
+    let version = created["graph_version"].as_str().unwrap();
+    let input = json!({"request":"revoked before provider"});
+    let grant = make_host_grant(
+        "managed-revoked",
+        version,
+        input.clone(),
+        "revoked-provider-op",
+        None,
+        "revoked-provider-fixture",
+    );
+    let started = mcp.call(
+        "graph_run_start",
+        json!({
+            "graph_id":"managed-revoked", "graph_version":version,
+            "input":input, "idempotency_key":"revoked-provider-op", "host_grant":grant
+        }),
+    );
+    assert_eq!(started["ok"], true, "{started}");
+    let run_id = started["run_id"].as_str().unwrap();
+    let done = mcp.call("graph_run_wait", json!({"run_id":run_id,"timeout_ms":8000}));
+    assert_eq!(done["data"]["status"], "failed", "{done}");
+    assert_eq!(
+        ledger_count(&ledger),
+        0,
+        "provider must not be invoked after revocation"
+    );
+}
+
+#[test]
+fn host_admission_capability_is_advertised_only_when_enabled() {
+    let temp = tempfile::tempdir().expect("workspace");
+    let data = temp.path().join("graph-data");
+    let ledger = temp.path().join("invocations.log");
+    let bins = counting_fake_codex_bin_dir(temp.path(), &ledger);
+    let mut managed = Mcp::new_managed_with_fake_codex(&data, &bins);
+    let status = managed.call("graph_status", json!({}));
+    let admission = &status["data"]["capabilities"]["host_admission"];
+    assert_eq!(admission["protocol"], "ares.graph-admission/v1", "{status}");
+    assert_eq!(admission["launch_owner_claim"], true, "{status}");
+    assert_eq!(admission["provider_owner_claim"], true, "{status}");
+    drop(managed);
+
+    let data2 = temp.path().join("graph-data-unmanaged");
+    let mut unmanaged = Mcp::new_with_data_dir_and_fake_codex(&data2, &bins);
+    let status2 = unmanaged.call("graph_status", json!({}));
+    assert!(
+        status2["data"]["capabilities"]["host_admission"].is_null(),
+        "{status2}"
+    );
 }

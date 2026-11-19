@@ -289,6 +289,10 @@ fn strategy_join_proof_carrying(
 pub struct CompileContext {
     pub base_url: String,
     pub default_model: String,
+    pub host_grant: Option<Value>,
+    pub run_id: String,
+    pub graph_id: String,
+    pub graph_version: String,
     pub cancelled: Arc<AtomicBool>,
     pub cancellation: Arc<Notify>,
     pub events: Arc<Mutex<Vec<GraphEvent>>>,
@@ -341,6 +345,10 @@ pub fn compile(spec: &GraphSpec, cx: CompileContext) -> Result<AgentGraph, Strin
     let run = RunContext {
         cancelled: cx.cancelled,
         cancellation: cx.cancellation,
+        host_grant: cx.host_grant,
+        run_id: cx.run_id,
+        graph_id: cx.graph_id,
+        graph_version: cx.graph_version,
         llm_calls: cx.llm_calls,
         max_llm_calls: cx.max_llm_calls,
         node_calls: cx.node_calls,
@@ -379,6 +387,30 @@ pub fn compile(spec: &GraphSpec, cx: CompileContext) -> Result<AgentGraph, Strin
                     .get("context_file")
                     .and_then(|v| v.as_str())
                     .map(str::to_owned);
+                let reasoning_effort = match node.config.get("reasoning_effort") {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(value) => {
+                        let effort = value.as_str().ok_or_else(|| {
+                            format!(
+                                "node '{}': config.reasoning_effort must be a string",
+                                node.id
+                            )
+                        })?;
+                        if !matches!(effort, "minimal" | "low" | "medium" | "high" | "xhigh") {
+                            return Err(format!(
+                                "node '{}': unsupported config.reasoning_effort '{}'; expected minimal|low|medium|high|xhigh",
+                                node.id, effort
+                            ));
+                        }
+                        if cx.base_url != "codex-app-server://" {
+                            return Err(format!(
+                                "node '{}': config.reasoning_effort is only supported by codex-app-server transport",
+                                node.id
+                            ));
+                        }
+                        Some(effort.to_owned())
+                    }
+                };
                 let tools: Vec<serde_json::Value> = node
                     .config
                     .get("tools")
@@ -410,6 +442,7 @@ pub fn compile(spec: &GraphSpec, cx: CompileContext) -> Result<AgentGraph, Strin
                             .and_then(|v| v.as_u64())
                             .unwrap_or(120_000),
                     ),
+                    reasoning_effort,
                     input_key,
                     output_key,
                     context_file,
@@ -802,6 +835,63 @@ mod tests {
     use ri_agent_graph::state::AgentState;
     use serde_json::json;
 
+    fn test_compile_context(base_url: &str) -> CompileContext {
+        CompileContext {
+            base_url: base_url.to_owned(),
+            default_model: "gpt-6-luna".into(),
+            host_grant: None,
+            run_id: "effort-test-run".into(),
+            graph_id: "effort-test-graph".into(),
+            graph_version:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            cancellation: Arc::new(tokio::sync::Notify::new()),
+            events: Arc::new(Mutex::new(Vec::new())),
+            llm_calls: Arc::new(AtomicU64::new(0)),
+            max_llm_calls: Some(2),
+            node_calls: Arc::new(AtomicU64::new(0)),
+            max_nodes: Some(4),
+            llm_invocations: Arc::new(Mutex::new(Vec::new())),
+            api_key: None,
+            executor: ExecutorHandle::none(),
+            subgraph: None,
+            subgraph_depth: Arc::new(AtomicU32::new(0)),
+            subgraph_limit: 4,
+        }
+    }
+
+    fn effort_spec(config: Value) -> GraphSpec {
+        serde_json::from_value(json!({
+            "spec_version":"2", "name":"effort-test", "entry":"ask", "output_key":"answer",
+            "nodes":[{"id":"ask","type":"llm","model":"gpt-6-luna","prompt":"reply","config":config}],
+            "edges":[{"from":"ask","to":"END"}]
+        })).expect("valid fixture spec")
+    }
+
+    #[test]
+    fn per_node_codex_effort_accepts_medium() {
+        let spec = effort_spec(json!({"input_key":"__input__","output_key":"answer",
+                                      "reasoning_effort":"medium"}));
+        assert!(compile(&spec, test_compile_context("codex-app-server://")).is_ok());
+    }
+
+    #[test]
+    fn per_node_effort_rejects_unknown_and_wrong_type() {
+        for config in [
+            json!({"reasoning_effort":"turbo"}),
+            json!({"reasoning_effort":3}),
+        ] {
+            let spec = effort_spec(config);
+            assert!(compile(&spec, test_compile_context("codex-app-server://")).is_err());
+        }
+    }
+
+    #[test]
+    fn per_node_effort_rejects_non_codex_transport() {
+        let spec = effort_spec(json!({"reasoning_effort":"medium"}));
+        assert!(compile(&spec, test_compile_context("https://api.example/v1")).is_err());
+    }
+
     fn artifact(key: &str, value: Value) -> (String, Value) {
         (key.to_owned(), value)
     }
@@ -925,6 +1015,10 @@ mod tests {
         RunContext {
             cancelled: Arc::new(AtomicBool::new(false)),
             cancellation: Arc::new(tokio::sync::Notify::new()),
+            host_grant: None,
+            run_id: "fixture-run".into(),
+            graph_id: "fixture-graph".into(),
+            graph_version: "fixture-version".into(),
             llm_calls: Arc::new(AtomicU64::new(0)),
             max_llm_calls: None,
             node_calls: Arc::new(AtomicU64::new(0)),
