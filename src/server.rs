@@ -4,6 +4,9 @@
 //! The rmcp macro auto-generates JSON Schema from the parameter structs in tools.rs.
 
 use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::os::unix::io::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -49,6 +52,101 @@ fn structured_output(value: Value) -> Json<StructuredOutput> {
         graph_version: None,
         run_id: None,
     })
+}
+
+pub(crate) const HOST_ADMISSION_SCHEMA: &str = "ares.graph-admission/v1";
+const HOST_ADMISSION_MAX_FRAME: usize = 65_536;
+
+fn host_admission_endpoint() -> PathBuf {
+    std::env::var_os("AGENT_GRAPH_ADMISSION_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+                .join(".ares/run/graph-admission/authority.sock")
+        })
+}
+
+/// Ask the live Ares owner over its peer-credentialed Unix socket. This is the
+/// authority boundary; grant-shaped JSON fields are correlation only.
+pub(crate) fn call_host_admission_owner(request: &Value) -> Result<Value, &'static str> {
+    let endpoint = host_admission_endpoint();
+    let mut stream = UnixStream::connect(&endpoint).map_err(|_| "HOST_OWNER_UNAVAILABLE")?;
+    // Require a same-UID peer on this local IPC boundary. The actual owner
+    // still validates the opaque reference against its SessionDB claim.
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut cred as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 || cred.uid != unsafe { libc::geteuid() } {
+        return Err("HOST_OWNER_PEER_UNAUTHORIZED");
+    }
+    let body = serde_json::to_vec(request).map_err(|_| "HOST_OWNER_REQUEST_INVALID")?;
+    if body.is_empty() || body.len() > HOST_ADMISSION_MAX_FRAME {
+        return Err("HOST_OWNER_REQUEST_INVALID");
+    }
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .ok();
+    stream
+        .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+        .ok();
+    stream
+        .write_all(&(body.len() as u32).to_be_bytes())
+        .map_err(|_| "HOST_OWNER_UNAVAILABLE")?;
+    stream
+        .write_all(&body)
+        .map_err(|_| "HOST_OWNER_UNAVAILABLE")?;
+    let mut header = [0u8; 4];
+    stream
+        .read_exact(&mut header)
+        .map_err(|_| "HOST_OWNER_UNAVAILABLE")?;
+    let size = u32::from_be_bytes(header) as usize;
+    if size == 0 || size > HOST_ADMISSION_MAX_FRAME {
+        return Err("HOST_OWNER_REPLY_INVALID");
+    }
+    let mut reply = vec![0u8; size];
+    stream
+        .read_exact(&mut reply)
+        .map_err(|_| "HOST_OWNER_UNAVAILABLE")?;
+    let value: Value = serde_json::from_slice(&reply).map_err(|_| "HOST_OWNER_REPLY_INVALID")?;
+    if value.get("schema").and_then(Value::as_str) != Some(HOST_ADMISSION_SCHEMA) {
+        return Err("HOST_OWNER_REPLY_INVALID");
+    }
+    if value.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(match value.get("code").and_then(Value::as_str) {
+            Some("graph_admission_expired") | Some("graph_admission_deadline_expired") => {
+                "HOST_GRANT_EXPIRED"
+            }
+            Some("orchestration_revision_changed") | Some("graph_disabled") => "HOST_GRANT_REVOKED",
+            Some("graph_admission_replay") => "HOST_GRANT_REPLAY",
+            _ => "HOST_OWNER_DENIED",
+        });
+    }
+    Ok(value)
+}
+
+fn host_request_digest_start(
+    graph_id: &str,
+    graph_version: Option<&str>,
+    input: &Option<Value>,
+    thread_id: &Option<String>,
+    budgets: &Option<Value>,
+    checkpoint: Option<bool>,
+    idempotency_key: &Option<String>,
+) -> String {
+    digest(&serde_json::json!({
+        "operation": "graph_run_start", "graph_id": graph_id,
+        "graph_version": graph_version, "input": input,
+        "thread_id": thread_id, "budgets": budgets,
+        "checkpoint": checkpoint.unwrap_or(false), "idempotency_key": idempotency_key,
+    }))
 }
 
 fn error_output(message: impl Into<String>, code: impl Into<String>) -> Json<StructuredOutput> {
@@ -241,6 +339,10 @@ pub struct AgentGraphServer {
     /// B2: shared provider-path health, updated by the daemon probe task and
     /// surfaced through `graph_status`.
     provider_health: crate::provider_health::ProviderHealth,
+    /// LOCK contract-v1 managed enforcement. Default OFF: operator-only
+    /// workflows keep their existing behavior. When ON, every launch/resume/
+    /// execute entry requires a validated host grant before any provider work.
+    managed_enforcement: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AgentGraphServer {
@@ -331,6 +433,11 @@ impl AgentGraphServer {
             max_graphs,
             tool_router: Self::tool_router(),
             provider_health: crate::provider_health::ProviderHealth::new(),
+            managed_enforcement: Arc::new(std::sync::atomic::AtomicBool::new(
+                std::env::var("AGENT_GRAPH_MANAGED_ENFORCEMENT")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false),
+            )),
         };
 
         // Restore persisted graphs on startup
@@ -481,6 +588,72 @@ impl AgentGraphServer {
         Ok(Some(record))
     }
 
+    /// Validate host-grant correlation fields, then ask the real Ares owner.
+    /// Non-empty strings alone never authorize. The owner validates scope,
+    /// expiry, revision, route and budget against its live SessionDB record.
+    fn authorize_host_grant(
+        &self,
+        graph_id: &str,
+        graph_version: &str,
+        request_digest: &str,
+        run_id: &str,
+        grant: Option<&Value>,
+    ) -> Result<(), &'static str> {
+        if !self
+            .managed_enforcement
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(());
+        }
+        let Some(grant) = grant.and_then(Value::as_object) else {
+            return Err("HOST_GRANT_REQUIRED");
+        };
+        if grant.get("schema").and_then(Value::as_str) != Some(HOST_ADMISSION_SCHEMA)
+            || grant.get("graph_id").and_then(Value::as_str) != Some(graph_id)
+            || grant.get("graph_version").and_then(Value::as_str) != Some(graph_version)
+            || grant.get("request_digest").and_then(Value::as_str) != Some(request_digest)
+        {
+            return Err("HOST_GRANT_BINDING_MISMATCH");
+        }
+        let reference = grant.get("reference").and_then(Value::as_str).unwrap_or("");
+        let route = grant
+            .get("execution_route")
+            .cloned()
+            .ok_or("HOST_GRANT_INVALID")?;
+        let deadline = grant
+            .get("deadline_seconds")
+            .and_then(Value::as_f64)
+            .ok_or("HOST_GRANT_INVALID")?;
+        let budget = grant
+            .get("budget_invocations")
+            .and_then(Value::as_u64)
+            .ok_or("HOST_GRANT_INVALID")?;
+        if reference.is_empty() || !deadline.is_finite() || deadline <= 0.0 || budget == 0 {
+            return Err("HOST_GRANT_INVALID");
+        }
+        if route.get("provider").and_then(Value::as_str) != Some("openai-codex")
+            || self.base_url != "codex-app-server://"
+        {
+            return Err("HOST_GRANT_PROVIDER_UNQUALIFIED");
+        }
+        let request = serde_json::json!({
+            "schema": HOST_ADMISSION_SCHEMA,
+            "reference": reference,
+            "stage": "launch",
+            "graph_id": graph_id,
+            "graph_version": graph_version,
+            "request_digest": request_digest,
+            "execution_route": route,
+            "run_id": run_id,
+        });
+        call_host_admission_owner(&request).map(|_| ())
+    }
+
+    fn host_grant_is_required(&self) -> bool {
+        self.managed_enforcement
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn resolve_graph(
         &self,
         graph_id: &str,
@@ -600,6 +773,17 @@ impl AgentGraphServer {
 
 #[tool_router]
 impl AgentGraphServer {
+    /// LOCK contract-v1 §3: same idempotency key with changed grant material
+    /// is a conflict even when the graph request digest is unchanged. The
+    /// stored request digest is extended with the canonical grant digest so
+    /// the existing idempotency owner enforces this without a second store.
+    fn grant_bound_digest(request_digest: &str, _host_grant: Option<&Value>) -> String {
+        // The existing request digest already binds graph/version/input/budget.
+        // Do not include the opaque reference: a retry may acquire a fresh
+        // reference but must reattach to the original idempotent operation.
+        request_digest.to_owned()
+    }
+
     // ── graph_create ──────────────────────────────────────────────────
 
     #[tool(
@@ -822,7 +1006,7 @@ impl AgentGraphServer {
     #[tool(
         description = "Execute a registered graph. Sync mode blocks until completion; async mode returns immediately with a run_id. DEPRECATED for long runs: prefer graph_run_start (async) + graph_run_get polling — sync mode can abort on client-side read timeouts while the run continues server-side, creating apparent duplicates."
     )]
-    fn graph_execute(
+    async fn graph_execute(
         &self,
         Parameters(GraphExecuteParams {
             graph_id,
@@ -831,8 +1015,16 @@ impl AgentGraphServer {
             thread_id,
             mode,
             idempotency_key,
+            host_grant,
         }): Parameters<GraphExecuteParams>,
     ) -> Result<Json<StructuredOutput>, ErrorData> {
+        if self.host_grant_is_required() {
+            return Ok(error_output(
+                "managed graph_execute has no qualified asynchronous owner-claim path; use graph_run_start",
+                "HOST_GRANT_OPERATION_UNQUALIFIED",
+            ));
+        }
+        let _ = host_grant; // unmanaged compatibility path; no grant is consumed
         let input = input.unwrap_or(Value::Null);
         ensure_size(&input, MAX_INPUT_BYTES, "execution input").map_err(invalid_params)?;
         let sync = mode.as_deref().map_or(true, |m| m == "sync");
@@ -871,40 +1063,90 @@ impl AgentGraphServer {
             "mode": mode.clone().unwrap_or_else(|| "sync".into()),
             "thread_id": thread_id,
         }));
+        let request_digest = Self::grant_bound_digest(&request_digest, host_grant.as_ref());
 
-        let runs = self
-            .runs
-            .lock()
-            .map_err(|e| internal_error(e.to_string()))?;
-        if let Some(idem) = idempotency_key.as_deref() {
-            if let Some(cached) =
-                check_idempotency(self.store.as_ref(), Some(idem), &request_digest)?
-            {
-                return Ok(cached);
+        // D1 fix: scope the setup MutexGuard so it is dropped before any
+        // await point in the sync wait loop below (a std MutexGuard alive
+        // across .await makes the handler future non-Send).
+        let (run_id, is_async) = {
+            let runs = self
+                .runs
+                .lock()
+                .map_err(|e| internal_error(e.to_string()))?;
+            if let Some(idem) = idempotency_key.as_deref() {
+                if let Some(cached) =
+                    check_idempotency(self.store.as_ref(), Some(idem), &request_digest)?
+                {
+                    return Ok(cached);
+                }
             }
-        }
 
-        let run_id = runs
-            .allocate(&graph_id, &graph.version, input.clone())
-            .map_err(internal_error)?;
+            let run_id = runs
+                .allocate(&graph_id, &graph.version, input.clone())
+                .map_err(internal_error)?;
 
-        if let Err(e) = runs.admit_async(&run_id) {
-            runs.remove(&run_id);
-            return Ok(error_output(e, "RUN_CAPACITY"));
-        }
-        if let Some(ref store) = self.store {
-            let _ = store.save_execution(
-                &run_id,
-                &graph_id,
-                &graph.version,
-                "running",
-                &input.to_string(),
-            );
-        }
+            if let Err(e) = runs.admit_async(&run_id) {
+                runs.remove(&run_id);
+                return Ok(error_output(e, "RUN_CAPACITY"));
+            }
+            if let Some(ref store) = self.store {
+                let _ = store.save_execution(
+                    &run_id,
+                    &graph_id,
+                    &graph.version,
+                    "running",
+                    &input.to_string(),
+                );
+            }
 
-        let is_async = mode.as_deref() == Some("async");
-        if is_async {
-            let terminal_store = self.store.clone();
+            let is_async = mode.as_deref() == Some("async");
+            if is_async {
+                let terminal_store = self.store.clone();
+                let completion_runs = runs.clone();
+                runs.start_with_completion_with_store(
+                    run_id.clone(),
+                    graph.spec.clone(),
+                    self.base_url.clone(),
+                    self.default_model.clone(),
+                    self.store.clone(),
+                    move |record| {
+                        Self::persist_terminal_and_mark(completion_runs, terminal_store, record)
+                    },
+                );
+                let output = output_with_meta(
+                    serde_json::json!({
+                        "run_id": run_id,
+                        "status": "accepted",
+                        "thread_id": thread_id,
+                        "storage_class": "volatile",
+                        "cancellation": "provider_future_best_effort_drop; underlying_request_may_continue"
+                    }),
+                    Some(&graph_id),
+                    Some(&graph.version),
+                    Some(&run_id),
+                );
+                if let Some(ref store) = self.store {
+                    if let Some(idem) = idempotency_key {
+                        if let Some(cached) =
+                            persist_idempotency(store, &idem, &request_digest, &output)?
+                        {
+                            return Ok(cached);
+                        }
+                    }
+                }
+                return Ok(output);
+            }
+            (run_id, is_async)
+        };
+        let _ = is_async;
+
+        // Sync path: re-lock per iteration; no guard is held across the await.
+        let runs_handle = self.runs.clone();
+        let terminal_store = self.store.clone();
+        {
+            let runs = runs_handle
+                .lock()
+                .map_err(|e| internal_error(e.to_string()))?;
             let completion_runs = runs.clone();
             runs.start_with_completion_with_store(
                 run_id.clone(),
@@ -912,66 +1154,43 @@ impl AgentGraphServer {
                 self.base_url.clone(),
                 self.default_model.clone(),
                 self.store.clone(),
-                move |record| {
-                    Self::persist_terminal_and_mark(completion_runs, terminal_store, record)
-                },
+                move |record| Self::persist_terminal_and_mark(completion_runs, terminal_store, record),
             );
-            let output = output_with_meta(
-                serde_json::json!({
-                    "run_id": run_id,
-                    "status": "accepted",
-                    "thread_id": thread_id,
-                    "storage_class": "volatile",
-                    "cancellation": "provider_future_best_effort_drop; underlying_request_may_continue"
-                }),
-                Some(&graph_id),
-                Some(&graph.version),
-                Some(&run_id),
-            );
-            if let Some(ref store) = self.store {
-                if let Some(idem) = idempotency_key {
-                    if let Some(cached) =
-                        persist_idempotency(store, &idem, &request_digest, &output)?
-                    {
-                        return Ok(cached);
-                    }
-                }
-            }
-            return Ok(output);
         }
-
-        let terminal_store = self.store.clone();
-        let completion_runs = runs.clone();
-        runs.start_with_completion_with_store(
-            run_id.clone(),
-            graph.spec,
-            self.base_url.clone(),
-            self.default_model.clone(),
-            self.store.clone(),
-            move |record| Self::persist_terminal_and_mark(completion_runs, terminal_store, record),
-        );
 
         let deadline = Instant::now() + Duration::from_millis(300_000);
         let output = loop {
-            let r = runs
-                .get(&run_id)
-                .ok_or_else(|| internal_error(format!("run '{run_id}' not found")))?;
-            if matches!(r.status.as_str(), "completed" | "failed" | "cancelled") {
+            let (status, public, cancellation) = {
+                let runs = runs_handle
+                    .lock()
+                    .map_err(|e| internal_error(e.to_string()))?;
+                let r = runs
+                    .get(&run_id)
+                    .ok_or_else(|| internal_error(format!("run '{run_id}' not found")))?;
+                if matches!(r.status.as_str(), "completed" | "failed" | "cancelled") {
+                    (r.status.clone(), Some(r.public()), None)
+                } else if Instant::now() >= deadline {
+                    let cancellation = runs.cancel(&run_id).unwrap_or_else(
+                        |_| serde_json::json!({"run_id": run_id, "status": "cancellation_requested"}),
+                    );
+                    (r.status.clone(), None, Some(cancellation))
+                } else {
+                    (r.status.clone(), None, None)
+                }
+            };
+            if let Some(public) = public {
                 break output_with_meta(
-                    r.public(),
+                    public,
                     Some(&graph_id),
                     Some(&graph.version),
                     Some(&run_id),
                 );
             }
-            if Instant::now() >= deadline {
-                let cancellation = runs.cancel(&run_id).unwrap_or_else(
-                    |_| serde_json::json!({"run_id": run_id, "status": "cancellation_requested"}),
-                );
+            if let Some(cancellation) = cancellation {
                 break output_with_meta(
                     serde_json::json!({
                         "run_id": run_id,
-                        "status": r.status,
+                        "status": status,
                         "timed_out": true,
                         "completion_unknown": true,
                         "cancellation": "requested",
@@ -982,7 +1201,9 @@ impl AgentGraphServer {
                     Some(&run_id),
                 );
             }
-            std::thread::sleep(Duration::from_millis(100));
+            // D1 fix (same class as graph_run_wait): yield, don't block the
+            // serve loop while waiting for sync-mode completion.
+            tokio::time::sleep(Duration::from_millis(100)).await;
         };
 
         if let Some(ref store) = self.store {
@@ -1161,6 +1382,15 @@ impl AgentGraphServer {
                 },
                 "capabilities": {
                     "runtime": "agent_graph",
+                    "host_admission": if self.managed_enforcement.load(std::sync::atomic::Ordering::SeqCst) {
+                        serde_json::json!({
+                            "protocol": HOST_ADMISSION_SCHEMA,
+                            "launch_owner_claim": true,
+                            "provider_owner_claim": true,
+                        })
+                    } else {
+                        Value::Null
+                    },
                     "async_start": true,
                     "api_key_configured": self.api_key.is_some(),
                     "cancellation": "provider_future_best_effort_drop; underlying_request_may_continue",
@@ -1847,14 +2077,62 @@ impl AgentGraphServer {
             idempotency_key,
             budgets,
             checkpoint,
+            host_grant,
         }): Parameters<RunStartParams>,
     ) -> Result<Json<StructuredOutput>, ErrorData> {
-        let requested_budgets = match RunBudgets::parse(budgets.as_ref()) {
+        if self.host_grant_is_required() && host_grant.is_none() {
+            return Ok(error_output(
+                "managed launch refused: HOST_GRANT_REQUIRED",
+                "HOST_GRANT_REQUIRED",
+            ));
+        }
+        let host_request_digest = host_request_digest_start(
+            &graph_id,
+            graph_version.as_deref(),
+            &input,
+            &thread_id,
+            &budgets,
+            checkpoint,
+            &idempotency_key,
+        );
+        let mut requested_budgets = match RunBudgets::parse(budgets.as_ref()) {
             Ok(budgets) => budgets,
             Err(error) => return Ok(error_output(error, "INVALID_BUDGETS")),
         };
+        // LOCK contract-v1: the host grant's invocation budget is an upper
+        // bound charged across ALL branches. It can tighten, never widen,
+        // the caller-requested max_llm_calls.
+        if let Some(grant_budget) = host_grant
+            .as_ref()
+            .and_then(|g| g.get("budget_invocations"))
+            .and_then(Value::as_u64)
+        {
+            let capped = match requested_budgets.as_mut() {
+                Some(b) => {
+                    b.max_llm_calls = Some(match b.max_llm_calls {
+                        Some(existing) => existing.min(grant_budget),
+                        None => grant_budget,
+                    });
+                    true
+                }
+                None => false,
+            };
+            if !capped {
+                requested_budgets = Some(RunBudgets {
+                    max_wall_clock_ms: None,
+                    max_nodes: None,
+                    max_llm_calls: Some(grant_budget),
+                });
+            }
+        }
         let input = input.unwrap_or(Value::Null);
         let checkpoint_requested = checkpoint.unwrap_or(false);
+        if self.host_grant_is_required() && checkpoint_requested {
+            return Ok(error_output(
+                "managed checkpoint admission is not qualified",
+                "HOST_GRANT_OPERATION_UNQUALIFIED",
+            ));
+        }
         ensure_size(&input, MAX_INPUT_BYTES, "execution input").map_err(invalid_params)?;
 
         let RegisteredGraph {
@@ -1863,6 +2141,54 @@ impl AgentGraphServer {
             version,
             ..
         } = self.resolve_graph(&graph_id, graph_version.as_deref())?;
+
+        if self.host_grant_is_required() {
+            let Some(grant_obj) = host_grant.as_ref().and_then(Value::as_object) else {
+                return Ok(error_output(
+                    "managed launch refused: HOST_GRANT_REQUIRED",
+                    "HOST_GRANT_REQUIRED",
+                ));
+            };
+            if grant_obj.get("schema").and_then(Value::as_str) != Some(HOST_ADMISSION_SCHEMA)
+                || grant_obj.get("graph_id").and_then(Value::as_str) != Some(graph_id.as_str())
+                || grant_obj.get("graph_version").and_then(Value::as_str) != Some(version.as_str())
+                || grant_obj.get("request_digest").and_then(Value::as_str)
+                    != Some(host_request_digest.as_str())
+            {
+                return Ok(error_output(
+                    "managed launch grant binding mismatch",
+                    "HOST_GRANT_BINDING_MISMATCH",
+                ));
+            }
+            let Some(route_model) = grant_obj
+                .get("execution_route")
+                .and_then(|r| r.get("model"))
+                .and_then(Value::as_str)
+            else {
+                return Ok(error_output(
+                    "managed graph has no owner-pinned route",
+                    "HOST_GRANT_INVALID",
+                ));
+            };
+            if spec.nodes.iter().any(|node| {
+                matches!(
+                    node.node_type,
+                    crate::spec::NodeType::Tool | crate::spec::NodeType::Subgraph
+                ) || (node.node_type == crate::spec::NodeType::Llm
+                    && node
+                        .config
+                        .get("tools")
+                        .and_then(Value::as_array)
+                        .is_some_and(|a| !a.is_empty()))
+                    || (node.node_type == crate::spec::NodeType::Llm
+                        && node.model.as_deref().unwrap_or(&self.default_model) != route_model)
+            }) {
+                return Ok(error_output(
+                    "managed graph contains an unqualified model route, tool loop, or subgraph",
+                    "HOST_GRANT_GRAPH_UNQUALIFIED",
+                ));
+            }
+        }
 
         if Self::graph_requires_witness_store(&spec) && self.store.is_none() {
             return Ok(error_output(
@@ -1893,6 +2219,8 @@ impl AgentGraphServer {
                 .unwrap_or(Value::Null),
             "checkpoint": checkpoint_requested,
         }));
+
+        let request_digest = Self::grant_bound_digest(&request_digest, host_grant.as_ref());
 
         let runs = self
             .runs
@@ -1990,6 +2318,25 @@ impl AgentGraphServer {
         let run_id = runs
             .allocate_with_budgets(&graph_id, &version, input.clone(), requested_budgets)
             .map_err(internal_error)?;
+        if let Err(code) = self.authorize_host_grant(
+            &graph_id,
+            &version,
+            &host_request_digest,
+            &run_id,
+            host_grant.as_ref(),
+        ) {
+            runs.remove(&run_id);
+            return Ok(error_output(
+                format!("managed launch refused: {code}"),
+                code,
+            ));
+        }
+        if let Some(grant) = host_grant.clone() {
+            if let Err(error) = runs.set_host_grant(&run_id, grant) {
+                runs.remove(&run_id);
+                return Ok(error_output(error, "HOST_GRANT_STORE_FAILED"));
+            }
+        }
         if let Err(e) = runs.admit_async(&run_id) {
             runs.remove(&run_id);
             return Ok(error_output(e, "RUN_CAPACITY"));
@@ -2083,6 +2430,18 @@ impl AgentGraphServer {
             run_id,
         }): Parameters<RunResumeParams>,
     ) -> Result<Json<StructuredOutput>, ErrorData> {
+        // LOCK contract-v1: resume is a launch-class effect. Under managed
+        // enforcement there is no host grant on this operator path, so it
+        // refuses typed rather than becoming an unmanaged fallback.
+        if self
+            .managed_enforcement
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(error_output(
+                "managed resume refused: HOST_GRANT_REQUIRED",
+                "HOST_GRANT_REQUIRED",
+            ));
+        }
         let Some(store) = self.store.as_ref() else {
             return Ok(error_output(
                 "SQLite persistence is required for deterministic resume",
@@ -2206,7 +2565,7 @@ impl AgentGraphServer {
     #[tool(
         description = "Wait for an async run to complete, with optional timeout. Bounded by timeout_ms (default 300000): on expiry returns {status, timed_out: true} cleanly instead of dropping the connection. Canonical flow: graph_run_start -> graph_run_get polling."
     )]
-    fn graph_run_wait(
+    async fn graph_run_wait(
         &self,
         Parameters(RunWaitParams { run_id, timeout_ms }): Parameters<RunWaitParams>,
     ) -> Result<Json<StructuredOutput>, ErrorData> {
@@ -2257,7 +2616,10 @@ impl AgentGraphServer {
                     Some(&run_id),
                 ));
             }
-            std::thread::sleep(Duration::from_millis(100));
+            // D1 fix: yield the tokio worker instead of blocking the serve
+            // loop. A sync std::thread::sleep here wedged every other MCP
+            // client (even initialize) for the full wait duration.
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
@@ -3009,6 +3371,7 @@ mod tests {
                     idempotency_key: None,
                     budgets: None,
                     checkpoint: Some(true),
+                    host_grant: None,
                 }))
                 .expect("checkpoint start")
                 .0

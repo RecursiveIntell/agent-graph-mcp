@@ -199,6 +199,9 @@ fn process_admission() -> &'static ProcessAdmission {
 /// bounded one-shot workers so graph fan-out is real provider concurrency.
 pub fn use_persistent_worker() -> bool {
     process_admission().limit == 1
+        || std::env::var("AGENT_GRAPH_CODEX_POOL_ENABLED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
 }
 
 fn acquire_process() -> Result<ProcessPermit<'static>, String> {
@@ -306,6 +309,7 @@ pub fn run_turn(
     cwd: &Path,
     prompt: &str,
     timeout: Duration,
+    requested_effort: Option<&str>,
 ) -> Result<String, String> {
     if model.trim().is_empty() {
         return Err("codex model must not be empty".to_owned());
@@ -319,8 +323,8 @@ pub fn run_turn(
     let _process_permit = acquire_process()?;
     let deadline = Instant::now() + timeout;
     let model_config = format!("model={model:?}");
-    let reasoning_effort =
-        std::env::var("AGENT_GRAPH_CODEX_REASONING_EFFORT").unwrap_or_else(|_| "high".to_owned());
+    let reasoning_effort = requested_effort.map(str::to_owned).unwrap_or_else(||
+        std::env::var("AGENT_GRAPH_CODEX_REASONING_EFFORT").unwrap_or_else(|_| "high".to_owned()));
     if !matches!(
         reasoning_effort.as_str(),
         "minimal" | "low" | "medium" | "high" | "xhigh"
@@ -742,10 +746,13 @@ struct PersistentAppServer {
     codex_bin: String,
     model: String,
     cwd: PathBuf,
+    reasoning_effort: String,
+    _process_permit: ProcessPermit<'static>,
 }
 
 impl PersistentAppServer {
-    fn start(codex_bin: &str, model: &str, cwd: &Path) -> Result<Self, String> {
+    fn start(codex_bin: &str, model: &str, cwd: &Path, requested_effort: Option<&str>) -> Result<Self, String> {
+        let process_permit = acquire_process()?;
         let listener = TcpListener::bind("127.0.0.1:0")
             .map_err(|e| format!("reserve codex app-server listener: {e}"))?;
         let port = listener
@@ -755,8 +762,8 @@ impl PersistentAppServer {
         drop(listener);
         let listen_url = format!("ws://127.0.0.1:{port}");
         let model_config = format!("model={model:?}");
-        let reasoning_effort = std::env::var("AGENT_GRAPH_CODEX_REASONING_EFFORT")
-            .unwrap_or_else(|_| "high".to_owned());
+        let reasoning_effort = requested_effort.map(str::to_owned).unwrap_or_else(||
+            std::env::var("AGENT_GRAPH_CODEX_REASONING_EFFORT").unwrap_or_else(|_| "high".to_owned()));
         if !matches!(
             reasoning_effort.as_str(),
             "minimal" | "low" | "medium" | "high" | "xhigh"
@@ -854,6 +861,8 @@ impl PersistentAppServer {
             codex_bin: codex_bin.to_owned(),
             model: model.to_owned(),
             cwd: cwd.to_owned(),
+            reasoning_effort,
+            _process_permit: process_permit,
         };
         server.initialize(startup_deadline)?;
         Ok(server)
@@ -986,8 +995,9 @@ impl PersistentAppServer {
         }
     }
 
-    fn matches(&self, codex_bin: &str, model: &str, cwd: &Path) -> bool {
+    fn matches(&self, codex_bin: &str, model: &str, cwd: &Path, reasoning_effort: &str) -> bool {
         self.codex_bin == codex_bin && self.model == model && self.cwd == cwd
+            && self.reasoning_effort == reasoning_effort
     }
 }
 
@@ -998,74 +1008,125 @@ impl Drop for PersistentAppServer {
     }
 }
 
-struct PersistentPool {
+#[derive(Clone, PartialEq, Eq)]
+struct PoolKey {
+    codex_bin: String,
+    model: String,
+    cwd: PathBuf,
+    reasoning_effort: String,
+}
+
+struct PoolLane {
+    key: PoolKey,
+    busy: bool,
     server: Option<PersistentAppServer>,
 }
 
-static PERSISTENT_POOL: OnceLock<Mutex<PersistentPool>> = OnceLock::new();
-
-fn persistent_pool() -> &'static Mutex<PersistentPool> {
-    PERSISTENT_POOL.get_or_init(|| Mutex::new(PersistentPool { server: None }))
+struct PersistentPool {
+    lanes: Vec<PoolLane>,
 }
 
-/// Run a turn through one long-lived Codex app-server worker.
-///
-/// The worker is deliberately single-lane: the Rust mutex serializes turns,
-/// while the heavy Codex process is reused across graph nodes. This removes the
-/// fixed memory multiplier from spawning one app-server per node. A failed or
-/// timed-out turn tears down the worker so the next call gets a clean session.
+static PERSISTENT_POOL: OnceLock<(Mutex<PersistentPool>, Condvar)> = OnceLock::new();
+
+fn persistent_pool() -> &'static (Mutex<PersistentPool>, Condvar) {
+    PERSISTENT_POOL.get_or_init(|| (Mutex::new(PersistentPool { lanes: Vec::new() }), Condvar::new()))
+}
+
+fn pool_lane_limit() -> usize {
+    let enabled = std::env::var("AGENT_GRAPH_CODEX_POOL_ENABLED")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !enabled {
+        return 1;
+    }
+    let configured = std::env::var("AGENT_GRAPH_CODEX_POOL_LANES")
+        .ok().and_then(|v| v.parse::<usize>().ok()).filter(|v| *v > 0).unwrap_or(2);
+    configured.min(process_admission().limit).min(8)
+}
+
+/// Run one turn on a bounded warm lane keyed by binary/model/cwd/effort.
+/// A lane owns its process-admission permit for its lifetime. The pool lock
+/// protects only lane reservation; it is never held across startup or protocol
+/// I/O. Busy lanes preserve sibling fan-out up to the configured cap.
 pub fn run_turn_pooled(
     codex_bin: &str,
     model: &str,
     cwd: &Path,
     prompt: &str,
     timeout: Duration,
+    requested_effort: Option<&str>,
 ) -> Result<String, String> {
     if model.trim().is_empty() {
         return Err("codex model must not be empty".to_owned());
     }
     if prompt.len() > MAX_PROMPT_BYTES {
         return Err(format!(
-            "codex prompt exceeds bounded input limit ({} bytes)",
+            "codex app-server prompt exceeds bounded input limit ({} bytes)",
             MAX_PROMPT_BYTES
         ));
     }
-    let mut pool = persistent_pool()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
-    let replace = pool
-        .server
-        .as_ref()
-        .map_or(true, |server| !server.matches(codex_bin, model, cwd));
-    if replace {
-        pool.server.take();
-        match PersistentAppServer::start(codex_bin, model, cwd) {
-            Ok(server) => pool.server = Some(server),
-            Err(error) if error.contains("exited during startup (exit status: 0)") => {
-                // Keep stdio-only Codex-compatible executables usable for deterministic
-                // harnesses. The production Codex CLI supports the listener path and
-                // remains on the persistent worker path.
-                drop(pool);
-                return run_turn(codex_bin, model, cwd, prompt, timeout);
-            }
-            Err(error) => return Err(error),
+    let reasoning_effort = requested_effort.map(str::to_owned).unwrap_or_else(||
+        std::env::var("AGENT_GRAPH_CODEX_REASONING_EFFORT").unwrap_or_else(|_| "high".to_owned()));
+    if !matches!(reasoning_effort.as_str(), "minimal" | "low" | "medium" | "high" | "xhigh") {
+        return Err(format!("unsupported Codex reasoning effort: {reasoning_effort}"));
+    }
+    let key = PoolKey { codex_bin: codex_bin.to_owned(), model: model.to_owned(),
+                        cwd: cwd.to_path_buf(), reasoning_effort: reasoning_effort.clone() };
+    let (pool_lock, changed) = persistent_pool();
+    let limit = pool_lane_limit();
+
+    let (index, server) = loop {
+        let mut pool = pool_lock.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(index) = pool.lanes.iter().position(|lane| !lane.busy && lane.key == key) {
+            pool.lanes[index].busy = true;
+            let server = pool.lanes[index].server.take();
+            break (index, server);
         }
+        if pool.lanes.len() < limit {
+            let index = pool.lanes.len();
+            pool.lanes.push(PoolLane { key: key.clone(), busy: true, server: None });
+            break (index, None);
+        }
+        if let Some(index) = pool.lanes.iter().position(|lane| !lane.busy) {
+            pool.lanes[index].busy = true;
+            pool.lanes[index].key = key.clone();
+            let server = pool.lanes[index].server.take();
+            drop(pool);
+            drop(server); // retire idle mismatched worker before replacement
+            break (index, None);
+        }
+        let (next, wait) = changed.wait_timeout(pool, ADMISSION_WAIT_TIMEOUT)
+            .unwrap_or_else(|error| error.into_inner());
+        if wait.timed_out() {
+            return Err("persistent Codex pool lane admission timed out".to_owned());
+        }
+        drop(next);
+    };
+
+    let server = match server {
+        Some(server) if server.matches(codex_bin, model, cwd, &reasoning_effort) => Ok(server),
+        Some(_) => PersistentAppServer::start(codex_bin, model, cwd, Some(&reasoning_effort)),
+        None => PersistentAppServer::start(codex_bin, model, cwd, Some(&reasoning_effort)),
+    };
+    if let Err(error) = server {
+        let mut pool = pool_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(lane) = pool.lanes.get_mut(index) { lane.busy = false; lane.server = None; }
+        changed.notify_all();
+        return Err(error);
     }
-    let server = pool
-        .server
-        .as_mut()
-        .ok_or("persistent codex app-server worker unavailable")?;
+    let mut server = match server {
+        Ok(server) => server,
+        Err(error) => return Err(error),
+    };
     let result = server.run_turn(cwd, prompt, timeout);
-    if let Err(error) = result {
-        let stderr = pool
-            .server
-            .as_ref()
-            .map(|server| shared_stderr_text(&server.stderr))
-            .unwrap_or_default();
-        pool.server.take();
-        return attach_stderr_context(Err(error), stderr);
+    let stderr = if result.is_err() { shared_stderr_text(&server.stderr) } else { String::new() };
+    let mut pool = pool_lock.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(lane) = pool.lanes.get_mut(index) {
+        lane.busy = false;
+        lane.server = if result.is_ok() { Some(server) } else { None };
     }
-    result
+    changed.notify_all();
+    if result.is_err() { attach_stderr_context(result, stderr) } else { result }
 }
 
 #[cfg(test)]
