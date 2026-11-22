@@ -116,8 +116,9 @@ pub enum NodeType {
     /// Reserved effectful class. It is accepted for truthful classification
     /// but is not executable by this local runtime.
     External,
-    /// Reserved tool class. It is accepted for truthful classification but is
-    /// not executable by this local runtime.
+    /// Tool operation node, compiled for explicitly configured local execution.
+    /// Managed Ares admission separately denies this node type until its
+    /// owner-authorized broker contract is qualified.
     Tool,
     /// Explicit loop class; deterministic resume does not support it.
     Loop,

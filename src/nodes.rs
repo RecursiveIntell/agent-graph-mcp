@@ -1,6 +1,5 @@
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Command as StdCommand, Stdio};
+use std::process::{ExitStatus, Stdio};
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     Arc, Mutex,
@@ -16,6 +15,8 @@ use ri_agent_graph::node::Node;
 use ri_agent_graph::state::AgentState;
 use serde::Deserialize;
 use serde_json::{Map, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::Command as TokioCommand;
 use tokio::sync::Notify;
 
 use crate::evidence::validate_research_evidence;
@@ -174,7 +175,15 @@ async fn cancellation_requested(
     if cancelled.load(Ordering::SeqCst) {
         return Err(AgentGraphError::Cancelled);
     }
-    cancellation.notified().await;
+    let notified = cancellation.notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    // Register before rechecking the atomic flag so a notify_waiters() that
+    // races between the first load and waiting cannot be lost.
+    if cancelled.load(Ordering::SeqCst) {
+        return Err(AgentGraphError::Cancelled);
+    }
+    notified.await;
     Err(AgentGraphError::Cancelled)
 }
 
@@ -991,6 +1000,129 @@ fn parse_receipt_ledger(contents: &str) -> Result<Value> {
     Ok(Value::Array(receipts))
 }
 
+async fn run_tool_broker(
+    python: &str,
+    hermes_source: &str,
+    lease_path: &str,
+    receipt_dir: &str,
+    tool_name: &str,
+    tool_args: &Value,
+) -> Result<(String, ExitStatus, String)> {
+    let mut child = TokioCommand::new(python)
+        .args(["-m", "agent.transports.hermes_tools_mcp_server"])
+        .env("AGENT_GRAPH_LINEAGE", "1")
+        .env("AGENT_GRAPH_LINEAGE_LEASE_PATH", lease_path)
+        .env("AGENT_GRAPH_LINEAGE_RECEIPT_DIR", receipt_dir)
+        .env("PYTHONPATH", hermes_source)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| AgentGraphError::PayloadError(format!("broker spawn: {e}")))?;
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| AgentGraphError::PayloadError("no stdin".into()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AgentGraphError::PayloadError("no stdout".into()))?;
+    let stderr = child.stderr.take();
+
+    // MCP initialize handshake.
+    let init_req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "agent-graph-tool-node", "version": "0.1"}
+        }
+    });
+    let init_line = serde_json::to_string(&init_req)
+        .map_err(|e| AgentGraphError::PayloadError(format!("init: {e}")))?;
+    stdin
+        .write_all(format!("{init_line}\n").as_bytes())
+        .await
+        .map_err(|e| AgentGraphError::PayloadError(format!("write init: {e}")))?;
+    stdin
+        .flush()
+        .await
+        .map_err(|e| AgentGraphError::PayloadError(format!("flush init: {e}")))?;
+
+    let mut reader = BufReader::new(stdout);
+    let mut response = String::new();
+    reader
+        .read_line(&mut response)
+        .await
+        .map_err(|e| AgentGraphError::PayloadError(format!("read init: {e}")))?;
+
+    // Send initialized notification.
+    let notified = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized"
+    });
+    let notified_line = serde_json::to_string(&notified)
+        .map_err(|e| AgentGraphError::PayloadError(format!("notify: {e}")))?;
+    stdin
+        .write_all(format!("{notified_line}\n").as_bytes())
+        .await
+        .map_err(|e| AgentGraphError::PayloadError(format!("write notify: {e}")))?;
+    stdin
+        .flush()
+        .await
+        .map_err(|e| AgentGraphError::PayloadError(format!("flush notify: {e}")))?;
+
+    // Make the tool call.
+    let call_req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": tool_name,
+            "arguments": tool_args
+        }
+    });
+    let call_line = serde_json::to_string(&call_req)
+        .map_err(|e| AgentGraphError::PayloadError(format!("call: {e}")))?;
+    stdin
+        .write_all(format!("{call_line}\n").as_bytes())
+        .await
+        .map_err(|e| AgentGraphError::PayloadError(format!("write call: {e}")))?;
+    stdin
+        .flush()
+        .await
+        .map_err(|e| AgentGraphError::PayloadError(format!("flush call: {e}")))?;
+
+    response.clear();
+    reader
+        .read_line(&mut response)
+        .await
+        .map_err(|e| AgentGraphError::PayloadError(format!("read result: {e}")))?;
+
+    // Drop stdin to signal EOF, then wait for the broker under the same
+    // caller-owned deadline as spawn, handshake, writes, and response reads.
+    drop(stdin);
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| AgentGraphError::PayloadError(format!("wait: {e}")))?;
+
+    // Capture stderr for diagnostics, preserving the first-line behavior.
+    let stderr_output = if let Some(stderr) = stderr {
+        let mut buf = String::new();
+        let _ = BufReader::new(stderr).read_line(&mut buf).await;
+        buf
+    } else {
+        String::new()
+    };
+
+    Ok((response, status, stderr_output))
+}
+
 #[async_trait]
 impl Node for ToolNode {
     async fn execute(&self, state: &AgentState, _: &GraphConfig) -> Result<NodeOutput> {
@@ -1018,115 +1150,30 @@ impl Node for ToolNode {
             .await?
             .unwrap_or(Value::Null);
 
-        // Spawn the Hermes MCP broker.
-        let mut child = StdCommand::new(&self.python)
-            .args(["-m", "agent.transports.hermes_tools_mcp_server"])
-            .env("AGENT_GRAPH_LINEAGE", "1")
-            .env("AGENT_GRAPH_LINEAGE_LEASE_PATH", &lease_path)
-            .env("AGENT_GRAPH_LINEAGE_RECEIPT_DIR", &self.receipt_dir)
-            .env("PYTHONPATH", &self.hermes_source)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| AgentGraphError::PayloadError(format!("broker spawn: {e}")))?;
-
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| AgentGraphError::PayloadError("no stdin".into()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| AgentGraphError::PayloadError("no stdout".into()))?;
-        let stderr = child.stderr.take();
-
-        // MCP initialize handshake.
-        let init_req = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "agent-graph-tool-node", "version": "0.1"}
-            }
-        });
-        let init_line = serde_json::to_string(&init_req)
-            .map_err(|e| AgentGraphError::PayloadError(format!("init: {e}")))?;
-        writeln!(stdin, "{init_line}")
-            .map_err(|e| AgentGraphError::PayloadError(format!("write init: {e}")))?;
-        stdin
-            .flush()
-            .map_err(|e| AgentGraphError::PayloadError(format!("flush init: {e}")))?;
-
-        let mut reader = BufReader::new(stdout);
-        let mut response = String::new();
-        reader
-            .read_line(&mut response)
-            .map_err(|e| AgentGraphError::PayloadError(format!("read init: {e}")))?;
-
-        // Send initialized notification.
-        let notified = serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized"
-        });
-        writeln!(
-            stdin,
-            "{}",
-            serde_json::to_string(&notified)
-                .map_err(|e| AgentGraphError::PayloadError(format!("notify: {e}")))?
-        )
-        .map_err(|e| AgentGraphError::PayloadError(format!("write notify: {e}")))?;
-        stdin
-            .flush()
-            .map_err(|e| AgentGraphError::PayloadError(format!("flush notify: {e}")))?;
-
-        // Make the tool call.
-        let call_req = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {
-                "name": tool_name,
-                "arguments": tool_args
-            }
-        });
-        let call_line = serde_json::to_string(&call_req)
-            .map_err(|e| AgentGraphError::PayloadError(format!("call: {e}")))?;
-        writeln!(stdin, "{call_line}")
-            .map_err(|e| AgentGraphError::PayloadError(format!("write call: {e}")))?;
-        stdin
-            .flush()
-            .map_err(|e| AgentGraphError::PayloadError(format!("flush call: {e}")))?;
-
-        response.clear();
-        reader
-            .read_line(&mut response)
-            .map_err(|e| AgentGraphError::PayloadError(format!("read result: {e}")))?;
-
-        // Drop stdin to signal EOF.
-        drop(stdin);
-
-        // Wait for child with timeout.
+        // One deadline covers broker spawn, MCP handshake, tool dispatch,
+        // response capture, process exit, and diagnostic stderr collection.
         let timeout_dur = std::time::Duration::from_millis(self.timeout_ms);
-        let status = tokio::time::timeout(
-            timeout_dur,
-            tokio::task::spawn_blocking(move || child.wait()),
-        )
-        .await
-        .map_err(|_| AgentGraphError::PayloadError("broker timed out".into()))?
-        .map_err(|e| AgentGraphError::PayloadError(format!("join: {e}")))?
-        .map_err(|e| AgentGraphError::PayloadError(format!("wait: {e}")))?;
-
-        // Capture stderr for diagnostics.
-        let stderr_output = if let Some(stderr) = stderr {
-            let mut buf = String::new();
-            let _ = BufReader::new(stderr).read_line(&mut buf);
-            buf
-        } else {
-            String::new()
+        let broker_result = tokio::select! {
+            biased;
+            _ = cancellation_requested(self.ctx.cancelled.clone(), self.ctx.cancellation.clone()) => {
+                return Err(AgentGraphError::Cancelled);
+            }
+            result = tokio::time::timeout(
+                timeout_dur,
+                run_tool_broker(
+                    &self.python,
+                    &self.hermes_source,
+                    &lease_path,
+                    &self.receipt_dir,
+                    &tool_name,
+                    &tool_args,
+                ),
+            ) => {
+                result.map_err(|_| AgentGraphError::PayloadError("broker timed out".into()))?
+            }
         };
+        let (response, status, stderr_output) = broker_result?;
+        self.ctx.check()?;
 
         // Parse MCP response.
         let result: Value = serde_json::from_str(&response).map_err(|e| {
@@ -1164,13 +1211,248 @@ impl Node for ToolNode {
             Value::Null
         };
 
+        self.ctx.check()?;
         state
             .set_raw("__tool_result__", tool_output.clone())
             .await?;
+        self.ctx.check()?;
         state.set_raw("__tool_receipts__", receipt_evidence).await?;
+        self.ctx.check()?;
         state.set_raw("__tool_success__", Value::Bool(true)).await?;
 
         Ok(NodeOutput::Done)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tool_node_lifecycle_tests {
+    use super::{RunContext, ToolNode};
+    use ri_agent_graph::config::GraphConfig;
+    use ri_agent_graph::error::AgentGraphError;
+    use ri_agent_graph::node::Node;
+    use ri_agent_graph::state::AgentState;
+    use serde_json::json;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        Arc, Mutex,
+    };
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    fn context() -> RunContext {
+        RunContext {
+            cancelled: Arc::new(AtomicBool::new(false)),
+            cancellation: Arc::new(Notify::new()),
+            host_grant: None,
+            run_id: "tool-node-test-run".into(),
+            graph_id: "tool-node-test-graph".into(),
+            graph_version: "test".into(),
+            llm_calls: Arc::new(AtomicU64::new(0)),
+            max_llm_calls: None,
+            node_calls: Arc::new(AtomicU64::new(0)),
+            max_nodes: None,
+            executor: crate::model_executor::ExecutorHandle::none(),
+            llm_invocations: Arc::new(Mutex::new(Vec::new())),
+            subgraph: None,
+            subgraph_depth: Arc::new(AtomicU32::new(0)),
+            subgraph_limit: 4,
+        }
+    }
+
+    fn write_broker(temp: &tempfile::TempDir, body: &str) -> String {
+        let path = temp.path().join("broker.sh");
+        std::fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}")).expect("write fixture broker");
+        let mut permissions = std::fs::metadata(&path)
+            .expect("stat fixture broker")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).expect("make fixture broker executable");
+        path.to_string_lossy().into_owned()
+    }
+
+    fn node(
+        temp: &tempfile::TempDir,
+        python: String,
+        timeout_ms: u64,
+        ctx: RunContext,
+    ) -> ToolNode {
+        ToolNode {
+            id: "tool".into(),
+            python,
+            hermes_source: temp.path().to_string_lossy().into_owned(),
+            lease: json!({"fixture": true}),
+            receipt_dir: temp.path().to_string_lossy().into_owned(),
+            timeout_ms,
+            ctx,
+        }
+    }
+
+    fn assert_broker_timeout(result: Result<ri_agent_graph::command::NodeOutput, AgentGraphError>) {
+        assert!(matches!(
+            result,
+            Err(AgentGraphError::PayloadError(message)) if message == "broker timed out"
+        ));
+    }
+
+    fn broker_process_stopped(pid: libc::pid_t) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                return true;
+            };
+            matches!(
+                stat.rsplit_once(')')
+                    .and_then(|(_, remainder)| remainder.split_whitespace().next()),
+                Some("Z" | "X")
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let result = unsafe { libc::kill(pid, 0) };
+            result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timeout_covers_initialize_handshake() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let python = write_broker(
+            &temp,
+            r#"
+IFS= read -r init
+sleep 0.35
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r initialized
+IFS= read -r call
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"ok"}]}}'
+"#,
+        );
+        let state = AgentState::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            node(&temp, python, 80, context()).execute(&state, &GraphConfig::default()),
+        )
+        .await
+        .expect("ToolNode must return within the test bound");
+
+        assert_broker_timeout(result);
+        assert_eq!(
+            state
+                .get_opt::<serde_json::Value>("__tool_success__")
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timeout_covers_tools_call_response() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let python = write_broker(
+            &temp,
+            r#"
+IFS= read -r init
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r initialized
+IFS= read -r call
+sleep 0.35
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"ok"}]}}'
+"#,
+        );
+        let state = AgentState::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            node(&temp, python, 80, context()).execute(&state, &GraphConfig::default()),
+        )
+        .await
+        .expect("ToolNode must return within the test bound");
+
+        assert_broker_timeout(result);
+        assert_eq!(
+            state
+                .get_opt::<serde_json::Value>("__tool_success__")
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancellation_during_initialize_kills_broker_and_writes_no_success_state() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let python = write_broker(
+            &temp,
+            r#"
+IFS= read -r init
+printf '%s\n' "$$" > "$AGENT_GRAPH_LINEAGE_RECEIPT_DIR/pid"
+: > "$AGENT_GRAPH_LINEAGE_RECEIPT_DIR/ready"
+while [ ! -e "$AGENT_GRAPH_LINEAGE_RECEIPT_DIR/release" ]; do :; done
+: > "$AGENT_GRAPH_LINEAGE_RECEIPT_DIR/finished"
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{}}'
+IFS= read -r initialized
+IFS= read -r call
+printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"ok"}]}}'
+"#,
+        );
+        let state = AgentState::new();
+        let ctx = context();
+        let cancelled = ctx.cancelled.clone();
+        let cancellation = ctx.cancellation.clone();
+        let node = node(&temp, python, 2_000, ctx);
+        let task_state = state.clone();
+        let mut task =
+            tokio::spawn(async move { node.execute(&task_state, &GraphConfig::default()).await });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !temp.path().join("ready").exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("fixture broker reached initialize read");
+
+        cancelled.store(true, Ordering::SeqCst);
+        cancellation.notify_waiters();
+        let prompt_completion = tokio::time::timeout(Duration::from_millis(150), &mut task).await;
+        let cancelled_promptly = prompt_completion.is_ok();
+        if prompt_completion.is_err() {
+            // Release the fixture so a broken implementation cannot strand a
+            // child or a blocked test worker after the assertion fails.
+            std::fs::write(temp.path().join("release"), "release").expect("release fixture broker");
+        }
+        let joined = match prompt_completion {
+            Ok(joined) => joined,
+            Err(_) => tokio::time::timeout(Duration::from_secs(2), &mut task)
+                .await
+                .expect("fixture broker released"),
+        };
+
+        assert!(
+            cancelled_promptly,
+            "cancellation must terminate the child promptly"
+        );
+        assert!(matches!(joined, Ok(Err(AgentGraphError::Cancelled))));
+        let broker_pid = std::fs::read_to_string(temp.path().join("pid"))
+            .expect("fixture records its process id")
+            .trim()
+            .parse::<libc::pid_t>()
+            .expect("fixture pid is valid");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !broker_process_stopped(broker_pid) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("cancellation stops the broker process");
+        assert!(!temp.path().join("finished").exists());
+        for key in ["__tool_result__", "__tool_receipts__", "__tool_success__"] {
+            assert_eq!(
+                state.get_opt::<serde_json::Value>(key).await.unwrap(),
+                None,
+                "{key}"
+            );
+        }
     }
 }
 
